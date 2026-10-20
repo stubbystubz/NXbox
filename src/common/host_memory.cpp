@@ -54,9 +54,17 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <map>
 #include <mutex>
 #include <random>
+#include <set>
+#include <string_view>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -170,16 +178,12 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
 }
 
 #ifdef HOST_MEMORY_USE_FROM_APP
-// Demand-commit for the Xbox/UWP backing. The backing is PRIVATE memory reserved (MEM_RESERVE) but
-// not eagerly committed — an eager 4 GiB commit busts the Series-S dev-app commit budget, and only
-// MEM_PRIVATE pages can be committed on demand (a MEM_MAPPED section view cannot). The first access
-// to a reserved-but-uncommitted page faults; this vectored handler commits the faulting page's chunk
-// on demand, so only what the guest/kernel actually touches is charged — a tiny homebrew NRO needs a
-// few MiB, while the kernel's full 4 GiB memory-pool layout stays valid. (CORE: Series-S memory.)
-//
-// There is exactly one emulated-DRAM backing (Core::DeviceMemory), so a single file-scope range +
-// committer suffices; the handler is allocation-free and re-entrancy-safe (atomic loads + one commit).
+// The VEH first handles lazy regional sections (backing and aliases). If their probe
+// fails, it retains the existing private demand-commit backing for page-table accesses.
+// Dynarmic's generated-code fallback is separate: x64 uses SEH/unwind tables.
 namespace {
+void* g_section_owner{};
+bool (*g_section_fault)(void*, size_t, size_t){};
 std::atomic<u8*> g_backing_base{nullptr};
 std::atomic<size_t> g_backing_size{0};
 PFN_VirtualAllocFromApp g_pfn_virtual_alloc_from_app{nullptr};
@@ -193,6 +197,12 @@ LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
         ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
         ep->ExceptionRecord->NumberParameters < 2) {
         return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (g_section_fault) {
+        return g_section_fault(g_section_owner, ep->ExceptionRecord->ExceptionInformation[1],
+                               ep->ExceptionRecord->ExceptionInformation[0])
+                   ? EXCEPTION_CONTINUE_EXECUTION
+                   : EXCEPTION_CONTINUE_SEARCH;
     }
     u8* const base = g_backing_base.load(std::memory_order_acquire);
     const size_t size = g_backing_size.load(std::memory_order_acquire);
@@ -219,6 +229,7 @@ std::uint64_t HostMemoryCommittedBytes() {
 }
 #endif
 
+#ifndef HOST_MEMORY_USE_FROM_APP
 class HostMemory::Impl {
 public:
     explicit Impl(size_t backing_size_, size_t virtual_size_)
@@ -233,65 +244,12 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to load Kernelbase.dll");
             return false;
         }
-#ifdef HOST_MEMORY_USE_FROM_APP
-        GetFuncAddress(kernelbase_dll, "CreateFileMappingFromApp", pfn_CreateFileMappingFromApp);
-        GetFuncAddress(kernelbase_dll, "VirtualAlloc2FromApp", pfn_VirtualAlloc2);
-        GetFuncAddress(kernelbase_dll, "MapViewOfFile3FromApp", pfn_MapViewOfFile3);
-        GetFuncAddress(kernelbase_dll, "VirtualProtectFromApp", pfn_VirtualProtectFromApp);
-#else
         GetFuncAddress(kernelbase_dll, "CreateFileMapping2", pfn_CreateFileMapping2);
         GetFuncAddress(kernelbase_dll, "VirtualAlloc2", pfn_VirtualAlloc2);
         GetFuncAddress(kernelbase_dll, "MapViewOfFile3", pfn_MapViewOfFile3);
-#endif
         GetFuncAddress(kernelbase_dll, "UnmapViewOfFile2", pfn_UnmapViewOfFile2);
 
         // Allocate the linear DRAM backing.
-#ifdef HOST_MEMORY_USE_FROM_APP
-        // Xbox/UWP: back the emulated DRAM with demand-committable PRIVATE memory, not a file-mapping
-        // section. The section design exists only to alias the backing into virtual_base for fastmem
-        // — which is OFF on UWP (fastmem_arena is always null), so Map()/virtual_base are never used
-        // here (every Map/Unmap/VirtualBasePointer caller is fastmem- or NCE-gated, both off on UWP).
-        // Critically, ONLY MEM_PRIVATE pages can be committed on demand: VirtualAllocFromApp(MEM_COMMIT)
-        // cannot commit pages of a MEM_MAPPED section view in the AppContainer — that is why an earlier
-        // SEC_RESERVE section + demand-commit handler access-violated on-console. So reserve private
-        // address space now (no eager commit — a 4 GiB SEC_COMMIT busts the Series-S dev-app budget);
-        // the handler below commits 64 KiB chunks on first touch, charging only the touched working
-        // set while the full 4 GiB stays reserved (kernel memory-pool layout unchanged).
-        GetFuncAddress(kernelbase_dll, "VirtualAllocFromApp", g_pfn_virtual_alloc_from_app);
-        // Resolve the VEH APIs by name (see typedef note) so we do not hard-import the errorhandling
-        // api-set the Xbox loader lacks — a direct call there makes the app fail to activate on-console.
-        GetFuncAddress(kernelbase_dll, "AddVectoredExceptionHandler", g_pfn_add_veh);
-        GetFuncAddress(kernelbase_dll, "RemoveVectoredExceptionHandler", g_pfn_remove_veh);
-        if (g_pfn_virtual_alloc_from_app == nullptr || g_pfn_add_veh == nullptr ||
-            g_pfn_remove_veh == nullptr) {
-            // The UWP backing cannot work without these; there is no usable fallback in the sandbox.
-            throw std::bad_alloc{};
-        }
-        backing_base = static_cast<u8*>(
-            g_pfn_virtual_alloc_from_app(nullptr, backing_size, MEM_RESERVE, PAGE_READWRITE));
-        if (backing_base == nullptr) {
-            LOG_CRITICAL(HW_Memory, "Failed to reserve {} MiB of backing memory", backing_size >> 20);
-            throw std::bad_alloc{};
-        }
-        g_backing_base.store(backing_base, std::memory_order_release);
-        g_backing_size.store(backing_size, std::memory_order_release);
-        g_backing_veh = g_pfn_add_veh(/*first=*/1, BackingDemandCommitHandler);
-        if (g_backing_veh == nullptr) {
-            Release();
-            LOG_CRITICAL(HW_Memory, "Failed to install backing demand-commit handler");
-            throw std::bad_alloc{};
-        }
-        // No file-mapping section and no fastmem arena on UWP. VirtualBasePointer() returns null;
-        // that is tolerated by all callers (fastmem disabled).
-        backing_handle = nullptr;
-        virtual_base = nullptr;
-        LOG_INFO(HW_Memory,
-                 "NXBOX MEMORY mode=page_table fastmem=unavailable "
-                 "reason=private_demand_committed_backing VirtualAlloc2FromApp={} "
-                 "MapViewOfFile3FromApp={} backing_mib={}",
-                 pfn_VirtualAlloc2 != nullptr, pfn_MapViewOfFile3 != nullptr, backing_size >> 20);
-        return true;
-#else
         // Desktop: a file-mapping section aliased into both the linear backing and the fastmem arena.
         if (!pfn_CreateFileMapping2 || !pfn_VirtualAlloc2 || !pfn_MapViewOfFile3 || !pfn_UnmapViewOfFile2) {
             LOG_CRITICAL(HW_Memory, "Failed to find functions for virtual allocs");
@@ -326,7 +284,6 @@ public:
             return false;
         }
         return true;
-#endif
     }
 
     ~Impl() {
@@ -334,16 +291,7 @@ public:
     }
 
     void* Allocate(size_t size) {
-#ifdef HOST_MEMORY_USE_FROM_APP
-        // Plain VirtualAlloc is not usable in the AppContainer; go through the FromApp export when we
-        // managed to resolve it.
-        auto* ptr = g_pfn_virtual_alloc_from_app
-                        ? g_pfn_virtual_alloc_from_app(nullptr, size, MEM_RESERVE | MEM_COMMIT,
-                                                       PAGE_READWRITE)
-                        : VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#else
         auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-#endif
         if (ptr == nullptr) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, error {}", size, GetLastError());
         }
@@ -410,22 +358,6 @@ public:
 private:
     /// Release all resources in the object
     void Release() {
-#ifdef HOST_MEMORY_USE_FROM_APP
-        // UWP: private demand-committed backing, no section handle and no fastmem arena. Tear down the
-        // demand-commit handler first, then release the private reservation (committed pages included).
-        if (g_backing_veh != nullptr && g_pfn_remove_veh != nullptr) {
-            g_pfn_remove_veh(g_backing_veh);
-            g_backing_veh = nullptr;
-        }
-        g_backing_base.store(nullptr, std::memory_order_release);
-        g_backing_size.store(0, std::memory_order_release);
-        if (backing_base) {
-            if (!VirtualFree(backing_base, 0, MEM_RELEASE)) {
-                LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
-            }
-            backing_base = nullptr;
-        }
-#else
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -451,7 +383,6 @@ private:
         if (!CloseHandle(backing_handle)) {
             LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
         }
-#endif
     }
 
     /// Unmap one placeholder in the given range (partial unmaps are supported)
@@ -574,16 +505,503 @@ private:
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
-    PFN_CreateFileMappingFromApp pfn_CreateFileMappingFromApp{};
     PFN_VirtualAlloc2 pfn_VirtualAlloc2{};
     PFN_MapViewOfFile3 pfn_MapViewOfFile3{};
     PFN_UnmapViewOfFile2 pfn_UnmapViewOfFile2{};
-    PFN_VirtualProtect pfn_VirtualProtectFromApp{};
 
     std::mutex placeholder_mutex;                                 ///< Mutex for placeholders
     boost::icl::separate_interval_set<size_t> placeholders;       ///< Mapped placeholders
     ::Common::unordered_map<size_t, size_t> placeholder_host_pointers; ///< Placeholder backing offset
 };
+
+#else
+// UWP backing uses independent 64 KiB pagefile sections. A section is created only on
+// first access, so neither a guest mapping nor a zero-fill charges untouched DRAM.
+// Closing the last view/handle really releases commit (MEM_RESET/Discard do not).
+class HostMemory::Impl {
+    static constexpr size_t RegionSize = 64 * 1024;
+    struct Mapping {
+        size_t host;
+        size_t length;
+        std::array<DWORD, RegionSize / PageAlignment> protection{};
+        bool mapped{};
+        bool fault_disabled{};
+    };
+    struct Region {
+        HANDLE handle{};
+        std::set<size_t> aliases;
+    };
+
+public:
+    explicit Impl(size_t backing_size_, size_t virtual_size_)
+        : backing_size{backing_size_}, virtual_size{virtual_size_}, kernelbase_dll{"Kernelbase"},
+          regions((backing_size + RegionSize - 1) / RegionSize) {}
+
+    bool Init() {
+        GetFuncAddress(kernelbase_dll, "VirtualAllocFromApp", g_pfn_virtual_alloc_from_app);
+        GetFuncAddress(kernelbase_dll, "AddVectoredExceptionHandler", g_pfn_add_veh);
+        GetFuncAddress(kernelbase_dll, "RemoveVectoredExceptionHandler", g_pfn_remove_veh);
+        if (!g_pfn_virtual_alloc_from_app || !g_pfn_add_veh || !g_pfn_remove_veh) {
+            throw std::bad_alloc{};
+        }
+        GetFuncAddress(kernelbase_dll, "CreateFileMappingFromApp", create_section);
+        GetFuncAddress(kernelbase_dll, "VirtualAlloc2FromApp", reserve);
+        GetFuncAddress(kernelbase_dll, "MapViewOfFile3FromApp", map_view);
+        GetFuncAddress(kernelbase_dll, "UnmapViewOfFile2", unmap_view);
+        GetFuncAddress(kernelbase_dll, "VirtualProtectFromApp", protect);
+        const char* reason = "missing_from_app_export";
+        DWORD failure_error = GetLastError();
+        const char* option = std::getenv("NXBOX_FASTMEM");
+        if (option && std::string_view{option} == "0") {
+            reason = "NXBOX_FASTMEM=0";
+            failure_error = 0;
+        } else if (create_section && reserve && map_view && unmap_view && protect) {
+            bool ready{};
+            try {
+                ready = InitArena();
+            } catch (const std::bad_alloc&) {
+                ready = false;
+            }
+            if (ready) {
+                g_section_owner = this;
+                g_section_fault = [](void* owner, size_t address, size_t access) {
+                    return static_cast<Impl*>(owner)->Fault(address, access);
+                };
+                if (InstallHandler()) {
+                    LOG_INFO(HW_Memory,
+                             "NXBOX MEMORY mode=fastmem backing=regional_sections "
+                             "region_kib=64 arena_gib={} committed_mib=0 probe=passed veh=ready",
+                             virtual_size >> 30);
+                    return true;
+                }
+                g_section_fault = nullptr;
+                g_section_owner = nullptr;
+                reason = "veh_install_failed";
+            } else {
+                reason = probe_stage;
+            }
+            failure_error = GetLastError();
+            ReleaseArena();
+        }
+        LOG_WARNING(HW_Memory,
+                    "NXBOX MEMORY mode=page_table fastmem=unavailable reason={} error={}", reason,
+                    failure_error);
+        backing_base = static_cast<u8*>(
+            g_pfn_virtual_alloc_from_app(nullptr, backing_size, MEM_RESERVE, PAGE_READWRITE));
+        if (!backing_base) {
+            throw std::bad_alloc{};
+        }
+        g_backing_base.store(backing_base, std::memory_order_release);
+        g_backing_size.store(backing_size, std::memory_order_release);
+        if (!InstallHandler()) {
+            VirtualFree(backing_base, 0, MEM_RELEASE);
+            backing_base = nullptr;
+            g_backing_base.store(nullptr, std::memory_order_release);
+            g_backing_size.store(0, std::memory_order_release);
+            throw std::bad_alloc{};
+        }
+        return true;
+    }
+
+    ~Impl() {
+        if (g_backing_veh) {
+            g_pfn_remove_veh(g_backing_veh);
+            g_backing_veh = nullptr;
+        }
+        g_section_fault = nullptr;
+        g_section_owner = nullptr;
+        g_backing_base.store(nullptr, std::memory_order_release);
+        g_backing_size.store(0, std::memory_order_release);
+        if (virtual_base) {
+            ReleaseArena();
+        } else if (backing_base) {
+            VirtualFree(backing_base, 0, MEM_RELEASE);
+        }
+        g_backing_committed.store(0, std::memory_order_relaxed);
+    }
+
+    void* Allocate(size_t) {
+        return nullptr;
+    } // Init either supplies demand backing or throws.
+
+    void Map(size_t offset, size_t host, size_t length, MemoryPermission permissions) {
+        std::scoped_lock lock{mutex};
+        UnmapLocked(offset, length);
+        while (length) {
+            const size_t count = (std::min)(length, RegionSize - host % RegionSize);
+            auto next = mappings.lower_bound(offset);
+            const size_t hole_begin = next == mappings.begin()
+                                          ? 0
+                                          : std::prev(next)->first + std::prev(next)->second.length;
+            const size_t hole_end = next == mappings.end() ? virtual_size : next->first;
+            Split(virtual_base, hole_begin, hole_end, offset, count);
+            Mapping mapping{host, count};
+            const DWORD flags = True(permissions & MemoryPermission::Write)  ? PAGE_READWRITE
+                                : True(permissions & MemoryPermission::Read) ? PAGE_READONLY
+                                                                             : PAGE_NOACCESS;
+            mapping.protection.fill(flags);
+            mappings.emplace(offset, mapping);
+            regions[host / RegionSize].aliases.insert(offset);
+            offset += count;
+            host += count;
+            length -= count;
+        }
+    }
+
+    void Unmap(size_t offset, size_t length) {
+        std::scoped_lock lock{mutex};
+        UnmapLocked(offset, length);
+    }
+
+    void Protect(size_t offset, size_t length, bool read, bool write, bool) {
+        std::scoped_lock lock{mutex};
+        const DWORD flags = read ? (write ? PAGE_READWRITE : PAGE_READONLY) : PAGE_NOACCESS;
+        auto it = mappings.upper_bound(offset);
+        if (it != mappings.begin())
+            --it;
+        for (; it != mappings.end() && it->first < offset + length; ++it) {
+            auto& [start, mapping] = *it;
+            const size_t begin = (std::max)(start, offset);
+            const size_t end = (std::min)(start + mapping.length, offset + length);
+            for (size_t page = begin; page < end; page += PageAlignment) {
+                mapping.protection[(page - start) / PageAlignment] = flags;
+                if (mapping.mapped) {
+                    DWORD old{};
+                    if (!protect(virtual_base + page, PageAlignment, flags, &old)) {
+                        // An inaccessible placeholder is safe: SEH falls back through the page
+                        // table.
+                        LOG_WARNING(HW_Memory,
+                                    "NXBOX MEMORY alias_protect_failed error={} fallback=seh",
+                                    GetLastError());
+                        UnmapView(start, mapping);
+                    }
+                }
+            }
+        }
+    }
+
+    // Called while the kernel owns the physical region being cleared. Other physical
+    // regions retain their sections and aliases. Partial boundary chunks preserve bytes.
+    void Clear(size_t offset, size_t length, u32 value) {
+        std::scoped_lock lock{mutex};
+        if (!virtual_base) {
+            if (value == 0 && ((offset | length) & (PageAlignment - 1)) == 0 &&
+                VirtualFree(backing_base + offset, length, MEM_DECOMMIT))
+                return;
+            std::memset(backing_base + offset, value, length);
+            return;
+        }
+        while (length) {
+            const size_t index = offset / RegionSize;
+            const size_t count = (std::min)(length, RegionLength(index) - offset % RegionSize);
+            if (value == 0 && offset % RegionSize == 0 && count == RegionLength(index)) {
+                DropRegion(index);
+            } else if (regions[index].handle || value != 0) {
+                if (!EnsureRegion(index))
+                    throw std::bad_alloc{};
+                std::memset(backing_base + offset, value, count);
+            }
+            offset += count;
+            length -= count;
+        }
+        if (reclaimed_bytes - reported_reclaimed >= 64 * 1024 * 1024) {
+            reported_reclaimed = reclaimed_bytes;
+            LOG_INFO(HW_Memory,
+                     "NXBOX MEMORY backing=regional_sections committed_mib={} reclaimed_mib={} "
+                     "backing_faults={} alias_faults={} alias_failures={}",
+                     g_backing_committed.load(std::memory_order_relaxed) >> 20,
+                     reclaimed_bytes >> 20, backing_faults, alias_faults, alias_failures);
+        }
+    }
+
+    void EnableDirectMappedAddress() {
+        UNREACHABLE();
+    }
+    const size_t backing_size;
+    const size_t virtual_size;
+    u8* backing_base{};
+    u8* virtual_base{};
+
+private:
+    bool InstallHandler() {
+        g_backing_committed.store(0, std::memory_order_relaxed);
+        g_backing_veh = g_pfn_add_veh(1, BackingDemandCommitHandler);
+        return g_backing_veh != nullptr;
+    }
+
+    size_t RegionLength(size_t index) const {
+        return (std::min)(RegionSize, backing_size - index * RegionSize);
+    }
+
+    bool InitArena() {
+        probe_stage = "reserve_backing_failed";
+        backing_base = static_cast<u8*>(reserve(process, nullptr, backing_size,
+                                                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                PAGE_NOACCESS, nullptr, 0));
+        if (!backing_base)
+            return false;
+        probe_stage = "reserve_arena_failed";
+        virtual_base = static_cast<u8*>(reserve(process, nullptr, virtual_size,
+                                                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                PAGE_NOACCESS, nullptr, 0));
+        if (!virtual_base)
+            return false;
+        probe_stage = "split_backing_failed";
+        // Keep backing placeholder boundaries fixed. No allocation is needed in the VEH.
+        for (size_t offset = 0; offset + RegionSize < backing_size; offset += RegionSize) {
+            if (!VirtualFree(backing_base + offset, RegionSize,
+                             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+                return false;
+        }
+        // Exercise the actual section and alias APIs, including a 4 KiB section offset,
+        // protection, and destruction/recreation. The probe charges only one 64 KiB chunk.
+        if (!EnsureRegion(0))
+            return false;
+        probe_stage = "split_alias_failed";
+        if (!VirtualFree(virtual_base, RegionSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            return false;
+        if (!VirtualFree(virtual_base, PageAlignment, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            return false;
+        probe_stage = "map_alias_4k_failed";
+        backing_base[PageAlignment] = 0xA5;
+        void* alias = map_view(regions[0].handle, process, virtual_base, PageAlignment,
+                               PageAlignment, MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        if (alias != virtual_base)
+            return false;
+        probe_mapped = true;
+        DWORD old{};
+        probe_stage = "protect_alias_failed";
+        if (!protect(alias, PageAlignment, PAGE_READWRITE, &old))
+            return false;
+        if (static_cast<volatile u8*>(alias)[0] != 0xA5)
+            return false;
+        if (!protect(alias, PageAlignment, PAGE_READONLY, &old) ||
+            !protect(alias, PageAlignment, PAGE_READWRITE, &old))
+            return false;
+        probe_stage = "unmap_alias_failed";
+        if (!unmap_view(process, alias, MEM_PRESERVE_PLACEHOLDER))
+            return false;
+        probe_mapped = false;
+        probe_stage = "coalesce_alias_failed";
+        if (!VirtualFree(virtual_base, virtual_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
+            return false;
+        probe_stage = "reclaim_probe_failed";
+        DropRegion(0);
+        if (!EnsureRegion(0) || backing_base[PageAlignment] != 0)
+            return false;
+        DropRegion(0);
+        reclaimed_bytes = 0;
+        return true;
+    }
+
+    bool EnsureRegion(size_t index) {
+        auto& region = regions[index];
+        if (region.handle)
+            return true;
+        probe_stage = "create_section_failed";
+        HANDLE handle = create_section(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                       RegionLength(index), nullptr);
+        if (!handle)
+            return false;
+        probe_stage = "map_backing_failed";
+        void* view =
+            map_view(handle, process, backing_base + index * RegionSize, 0, RegionLength(index),
+                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
+        if (view != backing_base + index * RegionSize) {
+            CloseHandle(handle);
+            return false;
+        }
+        region.handle = handle;
+        g_backing_committed.fetch_add(RegionLength(index), std::memory_order_relaxed);
+        return true;
+    }
+
+    bool Fault(size_t address, size_t access) {
+        if (access != 0 && access != 1)
+            return false;
+        std::scoped_lock lock{mutex};
+        const size_t backing_offset = address - reinterpret_cast<size_t>(backing_base);
+        if (backing_offset < backing_size) {
+            const size_t index = backing_offset / RegionSize;
+            // Another core may have satisfied the same fault while we waited for the lock.
+            // The linear backing is always RW; only read/write faults within it are claimed.
+            ++backing_faults;
+            return EnsureRegion(index);
+        }
+        const size_t offset = address - reinterpret_cast<size_t>(virtual_base);
+        if (offset >= virtual_size)
+            return false;
+        auto it = mappings.upper_bound(offset);
+        if (it == mappings.begin())
+            return false;
+        auto& [start, mapping] = *--it;
+        if (offset - start >= mapping.length || mapping.fault_disabled)
+            return false;
+        const DWORD flags = mapping.protection[(offset - start) / PageAlignment];
+        if (flags == PAGE_NOACCESS || (access == 1 && flags != PAGE_READWRITE))
+            return false;
+        if (mapping.mapped)
+            return true; // Concurrent fault already satisfied.
+        if (!EnsureRegion(mapping.host / RegionSize))
+            return false;
+        if (map_view(regions[mapping.host / RegionSize].handle, process, virtual_base + start,
+                     mapping.host % RegionSize, mapping.length, MEM_REPLACE_PLACEHOLDER,
+                     PAGE_NOACCESS, nullptr, 0) != virtual_base + start) {
+            mapping.fault_disabled = true;
+            ++alias_failures;
+            return false;
+        }
+        // Publish no permissive window: another core may already be running in this view.
+        // Pages remain inaccessible until each intended permission has been installed.
+        mapping.mapped = true;
+        for (size_t page = 0; page < mapping.length; page += PageAlignment) {
+            DWORD old{};
+            if (!protect(virtual_base + start + page, PageAlignment,
+                         mapping.protection[page / PageAlignment], &old)) {
+                mapping.fault_disabled = true;
+                try {
+                    UnmapView(start, mapping);
+                } catch (const std::bad_alloc&) {
+                    // The partially protected view contains only intended permissions or
+                    // NOACCESS. Leave its section alive and route future faults to SEH.
+                    // Never throw a C++ exception out of a Windows VEH.
+                }
+                ++alias_failures;
+                return false;
+            }
+        }
+        ++alias_faults;
+        return true;
+    }
+
+    void UnmapView(size_t offset, Mapping& mapping) {
+        if (mapping.mapped) {
+            // Failure leaves live aliases: never close their section or claim reclaim succeeded.
+            if (!unmap_view(process, virtual_base + offset, MEM_PRESERVE_PLACEHOLDER)) {
+                throw std::bad_alloc{};
+            }
+            mapping.mapped = false;
+        }
+    }
+
+    void DropRegion(size_t index) {
+        auto& region = regions[index];
+        if (!region.handle)
+            return;
+        for (const size_t offset : region.aliases) {
+            UnmapView(offset, mappings.at(offset));
+        }
+        if (!unmap_view(process, backing_base + index * RegionSize, MEM_PRESERVE_PLACEHOLDER)) {
+            throw std::bad_alloc{};
+        }
+        CloseHandle(region.handle);
+        region.handle = nullptr;
+        g_backing_committed.fetch_sub(RegionLength(index), std::memory_order_relaxed);
+        reclaimed_bytes += RegionLength(index);
+    }
+
+    void Split(u8* base, size_t hole_begin, size_t hole_end, size_t begin, size_t length) {
+        if (begin != hole_begin && !VirtualFree(base + hole_begin, begin - hole_begin,
+                                                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            throw std::bad_alloc{};
+        if (begin + length != hole_end &&
+            !VirtualFree(base + begin, length, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
+            throw std::bad_alloc{};
+    }
+
+    void UnmapLocked(size_t offset, size_t length) {
+        const size_t end = offset + length;
+        auto it = mappings.upper_bound(offset);
+        if (it != mappings.begin())
+            --it;
+        while (it != mappings.end() && it->first < end) {
+            const size_t start = it->first;
+            Mapping mapping = it->second;
+            const size_t finish = start + mapping.length;
+            if (finish <= offset) {
+                ++it;
+                continue;
+            }
+            UnmapView(start, it->second);
+            regions[mapping.host / RegionSize].aliases.erase(start);
+            it = mappings.erase(it);
+            const size_t begin = (std::max)(start, offset);
+            const size_t stop = (std::min)(finish, end);
+            Split(virtual_base, start, finish, begin, stop - begin);
+            mapping.mapped = false;
+            if (start < begin) {
+                Mapping left = mapping;
+                left.length = begin - start;
+                mappings.emplace(start, left);
+                regions[left.host / RegionSize].aliases.insert(start);
+            }
+            if (stop < finish) {
+                Mapping right = mapping;
+                right.host += stop - start;
+                right.length = finish - stop;
+                std::copy(mapping.protection.begin() + (stop - start) / PageAlignment,
+                          mapping.protection.end(), right.protection.begin());
+                mappings.emplace(stop, right);
+                regions[right.host / RegionSize].aliases.insert(stop);
+            }
+        }
+        // Coalesce the cleared interval with adjacent free placeholders.
+        auto next = mappings.lower_bound(offset);
+        const size_t begin =
+            next == mappings.begin() ? 0 : std::prev(next)->first + std::prev(next)->second.length;
+        const size_t stop = next == mappings.end() ? virtual_size : next->first;
+        if (stop > begin && !VirtualFree(virtual_base + begin, stop - begin,
+                                         MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS)) {
+            // A single placeholder needs no coalescing; Windows may reject that no-op.
+            MEMORY_BASIC_INFORMATION info{};
+            if (!VirtualQuery(virtual_base + begin, &info, sizeof(info)) ||
+                info.RegionSize != stop - begin)
+                throw std::bad_alloc{};
+        }
+    }
+
+    void ReleaseArena() {
+        for (auto& [offset, mapping] : mappings)
+            UnmapView(offset, mapping);
+        mappings.clear();
+        for (auto& region : regions)
+            region.aliases.clear();
+        if (probe_mapped) {
+            unmap_view(process, virtual_base, MEM_PRESERVE_PLACEHOLDER);
+            probe_mapped = false;
+        }
+        for (size_t index = 0; index < regions.size(); ++index)
+            DropRegion(index);
+        for (auto* base : {virtual_base, backing_base}) {
+            if (!base)
+                continue;
+            const size_t size = base == virtual_base ? virtual_size : backing_size;
+            VirtualFree(base, size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+        virtual_base = backing_base = nullptr;
+    }
+
+    HANDLE process{GetCurrentProcess()};
+    DynamicLibrary kernelbase_dll;
+    PFN_CreateFileMappingFromApp create_section{};
+    PFN_VirtualAlloc2 reserve{};
+    PFN_MapViewOfFile3 map_view{};
+    PFN_UnmapViewOfFile2 unmap_view{};
+    PFN_VirtualProtect protect{};
+    std::vector<Region> regions;
+    std::map<size_t, Mapping> mappings;
+    // Clear may fault on the private fallback backing while holding this lock.
+    std::recursive_mutex mutex;
+    bool probe_mapped{};
+    const char* probe_stage = "section_alias_probe_failed";
+    size_t backing_faults{};
+    size_t alias_faults{};
+    size_t alias_failures{};
+    size_t reclaimed_bytes{};
+    size_t reported_reclaimed{};
+};
+#endif
 
 #elif defined(__OPENORBIS__) || defined(__managarm__)
 // None of the luxuries of POSIX, all of the suffering
@@ -976,18 +1394,15 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
 #ifdef HOST_MEMORY_USE_FROM_APP
-    // The Xbox/UWP backing is demand-committed (see BackingDemandCommitHandler): decommitting
-    // yields zero-filled pages on the next touch, exactly like the memset, without charging the
-    // 5 GiB app budget for memory the guest allocates but never uses (games clear their whole heap
-    // through here at startup).
-    constexpr size_t PageMask = 0xFFF;
-    if (fill_value == 0 && ((physical_offset | length) & PageMask) == 0 && length != 0) {
+    if (impl) {
 #ifdef YUZU_UWP_APPCONTAINER
-        NxboxStall::Scope stall_scope{NxboxStall::Kind::Decommit};
-#endif
-        if (VirtualFree(backing_base + physical_offset, length, MEM_DECOMMIT)) {
-            return;
+        std::optional<NxboxStall::Scope> stall_scope;
+        if (fill_value == 0) {
+            stall_scope.emplace(NxboxStall::Kind::Decommit);
         }
+#endif
+        impl->Clear(physical_offset, length, fill_value);
+        return;
     }
 #endif
     std::memset(backing_base + physical_offset, fill_value, length);

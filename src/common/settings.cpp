@@ -12,11 +12,12 @@
 #endif
 #include <compare>
 #include <cstddef>
+#include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <string_view>
 #include <type_traits>
-#include <deque>
 #include <fmt/core.h>
 
 #include "common/settings_enums.h"
@@ -180,14 +181,11 @@ bool IsGPUFenceBehaviorAccurate() {
 
 bool IsFastmemEnabled() {
 #ifdef YUZU_UWP_APPCONTAINER
-    // Xbox/UWP AppContainer (Phase 2): fastmem is always off. Its host-mapped arena and SEH
-    // page-fault path are not viable in the sandbox (no large pre-reserved arena fits the Series-S
-    // budget, and the fault handler is unproven there), so the JIT uses dynarmic's bounds-checked
-    // page-table memory accesses instead. This nulls the arena pointer in memory.cpp, which in turn
-    // disables fastmem exclusives in arm_dynarmic. Re-evaluate for Phase 4 once the *FromApp arena
-    // reservation is proven on-console and sized to the Series-S budget.
-    return false;
-#else
+    if (const char* option = std::getenv("NXBOX_FASTMEM");
+        option && std::string_view{option} == "0") {
+        return false;
+    }
+#endif
     if (values.cpu_accuracy.GetValue() == Settings::CpuAccuracy::Debugging)
         return bool(values.cpuopt_fastmem);
     else if (values.cpu_accuracy.GetValue() == CpuAccuracy::Unsafe)
@@ -200,7 +198,6 @@ bool IsFastmemEnabled() {
     return false;
 #else
     return true;
-#endif
 #endif
 }
 

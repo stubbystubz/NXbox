@@ -15,7 +15,7 @@
 namespace Common {
 
 #ifdef YUZU_UWP_APPCONTAINER
-// Bytes of the guest DRAM backing committed so far by demand faults (diagnostics).
+// Guest DRAM section commit currently held (private fallback reports cumulative demand commit).
 std::uint64_t HostMemoryCommittedBytes();
 #endif
 
@@ -75,7 +75,10 @@ public:
     }
 
     bool IsInVirtualRange(void* address) const noexcept {
-        return address >= virtual_base && address < virtual_base + virtual_size;
+        return virtual_base &&
+               reinterpret_cast<uintptr_t>(address) >= reinterpret_cast<uintptr_t>(virtual_base) &&
+               reinterpret_cast<uintptr_t>(address) - reinterpret_cast<uintptr_t>(virtual_base) <
+                   virtual_size;
     }
 
 private:

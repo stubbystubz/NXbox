@@ -86,7 +86,7 @@ struct Memory::Impl {
             mapping_log.push_back({&page_table, GetInteger(base), size, GetInteger(target)});
         }
 
-        if (current_page_table->fastmem_arena) {
+        if (page_table.fastmem_arena) {
             host_buffer->Map(GetInteger(base), GetInteger(target) - DramMemoryMap::Base, size, perms, separate_heap);
         }
     }
@@ -98,7 +98,7 @@ struct Memory::Impl {
         MapPages(page_table, base / YUZU_PAGESIZE, size / YUZU_PAGESIZE, 0,
                  Common::PageType::Unmapped);
 
-        if (current_page_table->fastmem_arena) {
+        if (page_table.fastmem_arena) {
             host_buffer->Unmap(GetInteger(base), size, separate_heap);
         }
     }

@@ -64,7 +64,7 @@ void ApplyOptOuts(Config& config) {
     if (Disabled("NXBOX_JIT_PAGE_TABLE")) {
         config.page_table = nullptr;
     }
-    if (Disabled("NXBOX_JIT_FASTMEM")) {
+    if (Disabled("NXBOX_FASTMEM") || Disabled("NXBOX_JIT_FASTMEM")) {
         config.fastmem_pointer = std::nullopt;
         config.fastmem_exclusive_access = false;
     }

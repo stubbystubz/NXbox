@@ -55,11 +55,14 @@ cannot be removed by JIT configuration.
   Changing NaN handling or reciprocal estimates can change game results. No
   supplied profile establishes their safety in BotW, MK8D or Odyssey. Existing
   `NXBOX_JIT_INACCURATE_NAN=0` and `NXBOX_JIT_REDUCED_ERROR_FP=0` disable them.
-- UWP AppContainer does not allocate a fastmem arena and
-  `Settings::IsFastmemEnabled()` returns false. A JIT flag cannot create an arena
-  or prove fault handling. The existing checked page-table path remains enabled;
-  `NXBOX_JIT_FASTMEM=0` and `NXBOX_JIT_FASTMEM_EXCLUSIVES=0` remain available on
-  builds that actually provide an arena. No unsupported host address is enabled.
+- UWP probes a placeholder arena and lazy 64 KiB pagefile sections through the
+  dynamically resolved `*FromApp` APIs. Only first touches create committed
+  sections; mappings and clears of untouched DRAM do not commit the guest heap.
+  Whole-region clears remove every alias and close the section to release commit.
+  Partial clears preserve neighboring bytes. `NXBOX_FASTMEM=0` keeps the private
+  demand-committed backing and checked page-table path. The existing
+  `NXBOX_JIT_FASTMEM=0` and `NXBOX_JIT_FASTMEM_EXCLUSIVES=0` opt-outs also remain.
+  UWP retains guest address bounds checks in Auto and Unsafe modes.
 - A64 UWP already uses 192 MiB/core (768 MiB for four cores), with
   `NXBOX_JIT_LARGE_CACHE=0` restoring 128 MiB/core. A32 stays at 128 MiB/core;
   null JIT stays at 8 MiB. The x64 backend evacuates its cache below 1 MiB free,
@@ -69,3 +72,57 @@ cannot be removed by JIT configuration.
 
 Run the focused regression with
 `python3 tests/port/test_jit_memory_context_policy.py -v`.
+
+## UWP fastmem console verification
+
+Run the allocator, selection, and unwind-registration regression on the host:
+
+```sh
+python3 tests/port/test_uwp_fastmem.py -v
+```
+
+The harness compiles the production UWP allocator and VEH against Windows API
+mocks, including shared section views, fault injection, partial unmaps, mirrors,
+protection changes, reclamation, and concurrent first touches. On Apple Silicon,
+aligned views use real shared mappings and Windows subpage views are emulated
+because macOS uses 16 KiB pages. These tests do not establish Xbox API support,
+real exception dispatch, or performance.
+
+For each console run, collect all of the following:
+
+- `NXBOX MEMORY mode=fastmem backing=regional_sections ... committed_mib=0
+  probe=passed veh=ready` confirms the section/4 KiB alias/protection/recreation
+  probe and VEH registration succeeded. The arena is reserved address space.
+- `NXBOX FASTMEM handler=seh unwind_registered=true fallback=none` must appear
+  for each x64 JIT code buffer. Failure disables fastmem emission through
+  `ExceptionHandler::SupportsFastmem()`, even if an arena was allocated.
+- `NXBOX FAULT CONFIG ... fastmem=true` confirms the A64 configuration requested
+  fastmem. Read it together with the unwind-registration result, not alone.
+- `SPARSE ... guest_backing_committed=...MiB` reports current section commit.
+  Reclamation summaries (at most one per 64 MiB reclaimed) include `committed_mib`,
+  `reclaimed_mib`, `backing_faults`, `alias_faults`, and `alias_failures`.
+  Successful alias faults demonstrate real VEH dispatch; expect zero failures.
+  Confirm commit falls after full-region clears and does not jump to full DRAM
+  size during a heap clear. Sections, handles, and mapping metadata have overhead
+  beyond the guest commit counter; also inspect total app memory on Series S.
+- Exercise a rasterizer-protected access that must leave fastmem: the x64 SEH
+  callback must return through the normal memory callback and continue correctly.
+  When stall profiling is enabled, its existing fastmem-fault counter can confirm
+  that path. An accepted unwind table alone does not prove real SEH dispatch.
+- Repeat the same workload with `NXBOX_FASTMEM=0`. Expect
+  `mode=page_table fastmem=unavailable reason=NXBOX_FASTMEM=0` and A64
+  `fastmem=false`. Compare frame time and app memory with identical game settings.
+
+Missing exports or a failed startup probe select private demand backing and log
+`mode=page_table fastmem=unavailable reason=<failed_stage> error=<win32_error>`.
+A failed runtime alias map/protect falls through to Dynarmic's SEH/page-table
+callback; unrecoverable reservation/unmap failures must not silently retain a
+stale guest alias. No 60 fps or console compatibility claim follows from host tests.
+
+The backing deliberately avoids a monolithic `SEC_COMMIT` section (eager guest
+commit), `SEC_RESERVE` plus commit-on-view (previously rejected on Xbox), and
+`DiscardVirtualMemory` (retains commit and leaves contents undefined). See the
+Microsoft contracts for [FromApp sections](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-createfilemappingfromapp),
+[placeholder view alignment](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3),
+[discard semantics](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-discardvirtualmemory),
+and [dynamic unwind registration](https://learn.microsoft.com/en-us/windows/win32/api/winnt/nf-winnt-rtladdfunctiontable).
