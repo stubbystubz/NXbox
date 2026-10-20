@@ -1496,6 +1496,60 @@ bool TextureCacheRuntime::ReinterpretOnGpu(Image& dst, Image& src,
     }
     return true;
 }
+// Depth/color aliases need guest bit packing, not a numeric color blit. The existing
+// raw CopyImage shaders implement exactly these layouts; keep other packed formats
+// on the reversible CPU path. Preflight the entire batch before recording any write.
+bool TextureCacheRuntime::ReinterpretDepthOnGpu(Image& dst, Image& src,
+                                                std::span<const VideoCommon::ImageCopy> copies) {
+    static const bool enabled = [] {
+        char value[2]{};
+        return !(GetEnvironmentVariableA("NXBOX_D3D12_GPU_DEPTH_REINTERPRET", value,
+                                         sizeof(value)) == 1 &&
+                 value[0] == '0');
+    }();
+    if (!enabled || BisectEnabled("NXBOX_D3D12_CPU_REINTERPRET") || &dst == &src ||
+        copies.empty() || !src.Handle() || !dst.Handle() || src.Handle() == dst.Handle() ||
+        src.IsRescaled() || dst.IsRescaled() || src.info.type != VideoCommon::ImageType::e2D ||
+        dst.info.type != VideoCommon::ImageType::e2D || src.info.num_samples != 1 ||
+        dst.info.num_samples != 1)
+        return false;
+    const auto depth = [](const FormatInfo& format) {
+        return format.name == "D24_UNORM_S8_UINT" || format.name == "S8_UINT_D24_UNORM";
+    };
+    const auto color = [](const FormatInfo& format) {
+        return format.name == "A8B8G8R8_UNORM" || format.name == "A8B8G8R8_SRGB";
+    };
+    if (!((depth(src.HostFormat()) && color(dst.HostFormat())) ||
+          (color(src.HostFormat()) && depth(dst.HostFormat()))))
+        return false;
+    const auto fits = [](const Image& image, const VideoCommon::SubresourceLayers& subresource,
+                         const VideoCommon::Offset3D& offset, const VideoCommon::Extent3D& extent) {
+        if (subresource.base_level < 0 || subresource.base_level >= image.info.resources.levels ||
+            subresource.base_layer < 0 || subresource.num_layers <= 0 ||
+            subresource.num_layers > image.info.resources.layers ||
+            subresource.base_layer > image.info.resources.layers - subresource.num_layers ||
+            offset.x < 0 || offset.y < 0 || offset.z != 0 || !extent.width || !extent.height ||
+            extent.depth != 1)
+            return false;
+        return u64{static_cast<u32>(offset.x)} + extent.width <=
+                   std::max(1u, image.info.size.width >> subresource.base_level) &&
+               u64{static_cast<u32>(offset.y)} + extent.height <=
+                   std::max(1u, image.info.size.height >> subresource.base_level);
+    };
+    u64 bytes{};
+    for (const auto& copy : copies) {
+        if (copy.src_subresource.num_layers != copy.dst_subresource.num_layers ||
+            !fits(src, copy.src_subresource, copy.src_offset, copy.extent) ||
+            !fits(dst, copy.dst_subresource, copy.dst_offset, copy.extent))
+            return false;
+        bytes += u64{copy.extent.width} * copy.extent.height *
+                 static_cast<u32>(copy.src_subresource.num_layers) * 4;
+    }
+    BlitHelpers().CopyImage({dst.Handle(), dst.HostFormat()}, {src.Handle(), src.HostFormat()},
+                            copies);
+    context.Profile().Count(FrameCount::GpuDepthReinterpretBytes, bytes);
+    return true;
+}
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
     return dst.HostFormat().resource_format != src.HostFormat().resource_format ||
            (dst.info.format != src.info.format &&
@@ -1513,6 +1567,8 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const bool native_raw_alias = src.info.num_samples == 1 && dst.info.num_samples == 1 &&
                                   VideoCore::Surface::BytesPerBlock(src.info.format) ==
                                       VideoCore::Surface::BytesPerBlock(dst.info.format);
+    if (ReinterpretDepthOnGpu(dst, src, copies))
+        return;
     if (native_raw_alias && ReinterpretOnGpu(dst, src, copies))
         return;
     if (native_raw_alias || dst.HostFormat().conversion != FormatConversion::None ||
@@ -1612,6 +1668,14 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
             }
             if (!total)
                 return;
+            context.Profile().Count(FrameCount::CpuReinterpretBytes, total);
+            // Bounded evidence for format/range attribution in console captures.
+            static u32 diagnostic_budget = 16;
+            if (context.Profile().Enabled() && diagnostic_budget) {
+                --diagnostic_budget;
+                Diagnostic(fmt::format("D3D12_CPU_REINTERPRET src={} dst={} bytes={}",
+                                       src.HostFormat().name, dst.HostFormat().name, total));
+            }
             auto staging = DownloadStagingBuffer(total);
             // Reserved guest X/padding bits have no host plane; initialize them.
             std::fill(staging.mapped_span.begin(), staging.mapped_span.end(), u8{0});

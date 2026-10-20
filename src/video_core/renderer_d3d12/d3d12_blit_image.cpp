@@ -89,13 +89,15 @@ float4 ReadFloat(float4 position, uint sampleIndex, out uint stencil) {
     }
 #endif
 #endif
-    if (conversion == 1) {
+    if (conversion == 1 || conversion == 6) {
         uint packed = (uint(round(saturate(value.r) * 16777215.0)) & 0xffffff)
                     | (ReadStencil(coord, sampleId) << 24);
+        if (conversion == 6) packed = (packed << 8) | (packed >> 24);
         value = float4(uint4(packed, packed >> 8, packed >> 16, packed >> 24) & 255) / 255.0;
-    } else if (conversion == 2) {
+    } else if (conversion == 2 || conversion == 7) {
         uint4 bytes = uint4(round(saturate(value) * 255.0));
         uint packed = bytes.r | (bytes.g << 8) | (bytes.b << 16) | (bytes.a << 24);
+        if (conversion == 7) packed = (packed >> 8) | (packed << 24);
         value.r = float(packed & 0xffffff) / 16777215.0;
         stencil = packed >> 24;
     } else if (conversion == 3) {
@@ -385,6 +387,7 @@ struct BlitImageHelper::Impl {
             throw std::invalid_argument("D3D12 unsupported compressed/integer blit conversion");
         if (dst.format.depth && !original_src.format.depth &&
             conversion != BlitConversion::RGBA8ToD24S8 &&
+            conversion != BlitConversion::RGBA8ToS8D24 &&
             conversion != BlitConversion::RGBA8ToD32F && dst.format.planes > 1)
             throw std::invalid_argument("D3D12 depth/stencil conversion requires stencil input");
         const auto dst_desc = dst.resource->handle->GetDesc();
@@ -630,9 +633,11 @@ void BlitImageHelper::ConvertImage(const BlitSurface& dst, const BlitSurface& sr
     case BlitConversion::Identity:
         valid = source_format == target_format;
         break;
+    case BlitConversion::S8D24ToRGBA8:
     case BlitConversion::D24S8ToRGBA8:
         valid = source_format == DXGI_FORMAT_R24G8_TYPELESS && target_rgba;
         break;
+    case BlitConversion::RGBA8ToS8D24:
     case BlitConversion::RGBA8ToD24S8:
         valid = source_rgba && target_format == DXGI_FORMAT_R24G8_TYPELESS;
         break;
@@ -755,10 +760,14 @@ void BlitImageHelper::CopyImage(const BlitSurface& dst, const BlitSurface& origi
                 BlitConversion conversion = BlitConversion::Identity;
                 if (s.format.resource_format == DXGI_FORMAT_R24G8_TYPELESS &&
                     d.format.resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
-                    conversion = BlitConversion::D24S8ToRGBA8;
+                    conversion = s.format.name == "S8_UINT_D24_UNORM"
+                                     ? BlitConversion::S8D24ToRGBA8
+                                     : BlitConversion::D24S8ToRGBA8;
                 else if (d.format.resource_format == DXGI_FORMAT_R24G8_TYPELESS &&
                          s.format.resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
-                    conversion = BlitConversion::RGBA8ToD24S8;
+                    conversion = d.format.name == "S8_UINT_D24_UNORM"
+                                     ? BlitConversion::RGBA8ToS8D24
+                                     : BlitConversion::RGBA8ToD24S8;
                 else if (s.format.resource_format == DXGI_FORMAT_R32_TYPELESS &&
                          d.format.resource_format == DXGI_FORMAT_R8G8B8A8_TYPELESS)
                     conversion = BlitConversion::D32FToRGBA8;

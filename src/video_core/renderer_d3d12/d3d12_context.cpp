@@ -755,7 +755,9 @@ void FrameProfile::EndFrame(bool presented) {
                                       "uniform_snapshot_new_resources",
                                       "forced_submits_flush_draws",
                                       "attachment_metadata_reuses",
-                                      "query_batch_dispatches"};
+                                      "query_batch_dispatches",
+                                      "gpu_depth_reinterpret_bytes",
+                                      "cpu_reinterpret_bytes"};
         static_assert(names.size() == static_cast<size_t>(FramePhase::Count));
         static_assert(counters.size() == static_cast<size_t>(FrameCount::Count));
         const double elapsed = static_cast<double>(wall - start_wall);
