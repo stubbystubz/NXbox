@@ -232,6 +232,16 @@ u64 GetCurrentProgramID() {
 }
 
 bool IsDockedMode() {
+#ifdef YUZU_UWP_APPCONTAINER
+    // Handheld renders at 720p instead of 1080p in most games: ~44% of the pixels, which
+    // matters on the Series S GPU. Lets us A/B it without touching the saved config.
+    if (const char* mode = std::getenv("NXBOX_CONSOLE_MODE")) {
+        if (std::string_view{mode} == "handheld")
+            return false;
+        if (std::string_view{mode} == "docked")
+            return true;
+    }
+#endif
     return values.use_docked_mode.GetValue() == Settings::ConsoleMode::Docked;
 }
 
