@@ -103,6 +103,8 @@ struct Maxwell3D {
     bool current_dirty{}, current_macro_dirty{};
     GPUVAddr current_dma_segment{};
     unsigned effects{}, bulk_calls{}, sink_calls{}, macro_calls{}, dispatch_calls{};
+    bool fail_dispatch{};
+    const bool method_batching{Tegra::MaxwellMethodBatchingEnabled()};
     bool captured_dirty{}, refresh{};
     std::vector<u32> captured;
     std::vector<std::pair<GPUVAddr, size_t>> captured_segments;
@@ -115,6 +117,7 @@ struct Maxwell3D {
     void ProcessDirtyRegisters(u32, u32);
     void ProcessDirtyRegistersImpl(u32, u32);
     void CallMethod(Core::System&, u32, u32, bool);
+    void CallMethodImpl(Core::System&, u32, u32, bool);
     void CallMultiMethod(Core::System&, u32, const u32*, u32, u32);
     void CallMultiMethod(Core::System&, u32, const u32*, u32);
     void ProcessMacro(Core::System&, u32, const u32*, u32, bool);
@@ -133,6 +136,8 @@ struct Maxwell3D {
         captured_dirty = current_macro_dirty;
     }
     void ProcessMethodCall(u32 method, u32, u32, bool) {
+        if (fail_dispatch)
+            throw 7;
         ++dispatch_calls;
         effects += execution_mask[method];
     }
@@ -301,6 +306,53 @@ int main() {
     engine.shadow_state.shadow_ram_control = Maxwell3D::Regs::ShadowRamControl::Replay;
     engine.CallMultiMethod(system, MAXWELL3D_REG_INDEX(draw_inline_index), values, 4, 4);
     assert(engine.bulk_calls == 1 && engine.effects == 8);
+
+    // One bulk boundary, even with executable words and exception unwinding.
+    {
+        Maxwell3D bulk;
+        Common::GpuProfile::sink = &owner;
+        Common::GpuProfile::recording_enabled = true;
+        auto before = owner.enters;
+        bulk.CallMultiMethod(system, draw, values, 4, 4);
+        assert(owner.enters == before + (bulk.method_batching ? 1 : 5) &&
+               owner.enters == owner.leaves);
+        bulk.fail_dispatch = true;
+        before = owner.enters;
+        try {
+            bulk.CallMultiMethod(system, draw, values, 4, 4);
+            assert(false);
+        } catch (int error) {
+            assert(error == 7);
+        }
+        assert(owner.enters == before + (bulk.method_batching ? 1 : 2) &&
+               owner.enters == owner.leaves);
+        Common::GpuProfile::recording_enabled = false;
+        Common::GpuProfile::sink = nullptr;
+    }
+    // Non-incrementing ordinary state must preserve intermediate dirty changes,
+    // not just the final register value. Compare independent scalar execution
+    // in every shadow mode and with both dirty-table entries sharing the same
+    // flag.
+    for (u32 mode = 0; mode < 4; ++mode) {
+        for (bool shared : {false, true}) {
+            Maxwell3D scalar, batch;
+            u32 reg = 0;
+            while (scalar.execution_mask[reg])
+                ++reg;
+            scalar.shadow_state.shadow_ram_control = batch.shadow_state.shadow_ram_control =
+                static_cast<Maxwell3D::Regs::ShadowRamControl>(mode);
+            scalar.dirty.tables[1][reg] = batch.dirty.tables[1][reg] =
+                shared ? scalar.dirty.tables[0][reg] : 93;
+            const u32 original = scalar.regs.reg_array[reg];
+            const u32 repeated[]{original, original + 1, original + 2, original};
+            for (u32 value : repeated)
+                scalar.CallMethod(system, reg, value, true);
+            batch.CallMultiMethod(system, reg, repeated, 4, 4);
+            assert(scalar.regs.reg_array == batch.regs.reg_array);
+            assert(scalar.shadow_state.reg_array == batch.shadow_state.reg_array);
+            assert(scalar.dirty.flags == batch.dirty.flags && batch.dirty.flags.any());
+        }
+    }
 
     // Repeated state writes skip dirty bits but still execute draw side effects.
     engine.shadow_state.shadow_ram_control = Maxwell3D::Regs::ShadowRamControl::Off;

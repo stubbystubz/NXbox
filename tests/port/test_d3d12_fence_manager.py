@@ -180,6 +180,8 @@ struct Manager : VideoCommon::FenceManager<AsyncParams> {
     using Base = VideoCommon::FenceManager<AsyncParams>;
     Manager(VideoCore::RasterizerInterface& r, Tegra::GPU& g, Cache& t, Cache& b, Cache& q)
         : Base(r, g, t, b, q) { submit_backstop = std::chrono::seconds(5); }
+    // Match the native manager: join before the derived vtable and members die.
+    ~Manager() override { StopFenceThread(); }
     std::atomic<bool> submitted{};
     mutable std::atomic<int> checks{};
     std::shared_ptr<Fence> CreateFence(bool stubbed) override {

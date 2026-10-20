@@ -3,6 +3,8 @@
 """Verify exclusive timing boundaries and the production macro variant dispatcher."""
 
 import re
+import subprocess
+import sys
 import unittest
 
 import test_gpu_frontend_hot_paths as frontend
@@ -13,6 +15,21 @@ method = frontend.method
 
 class MaxwellMethodBatchingTests(unittest.TestCase):
     compile_and_run = frontend.GpuFrontendHotPathTests.compile_and_run
+
+    def test_dma_maxwell_draw_replay_with_null_rasterizer(self):
+        subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "tools/nxbox/benchmarks/maxwell_methods.py"),
+                "--frames",
+                "2",
+                "--repeat",
+                "1",
+                "--sanitize",
+            ],
+            check=True,
+            timeout=60,
+        )
 
     def test_nested_phase_skips_clocks_and_restores_draw_and_macro(self):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
@@ -78,14 +95,75 @@ int main() {
 """.replace("// PRODUCTION", production)
         )
 
+    def test_macro_lookup_hits_misses_and_mutation_invalidation(self):
+        header = (ROOT / "src/video_core/macro.h").read_text()
+        lookup = header.split("    CacheInfo* FindCachedMacro", 1)[1].split("\n    }", 1)[0]
+        clear = header.split("    inline void ClearCode", 1)[1].split("\n    }", 1)[0]
+        source = (ROOT / "src/video_core/macro.cpp").read_text()
+        insertion = source.split("    last_macro = nullptr;", 1)[1].split("    ci.hash", 1)[0]
+        self.compile_and_run(
+            r"""
+#include <cassert>
+#include <unordered_map>
+using u32 = unsigned;
+struct Engine {
+    struct CacheInfo { unsigned program{}; };
+    struct Map : std::unordered_map<u32, CacheInfo> {
+        unsigned probes{};
+        auto find(u32 key) { ++probes; return std::unordered_map<u32, CacheInfo>::find(key); }
+    } macro_cache;
+    std::unordered_map<u32, unsigned> uploaded_macro_code;
+    bool cache_lookup = true;
+    u32 last_method{};
+    CacheInfo* last_macro{};
+    CacheInfo* FindCachedMacro// LOOKUP
+    }
+    void ClearCode// CLEAR
+    }
+    void Insert(u32 method) {
+        last_macro = nullptr;// INSERT
+        ci.program = method + 1;
+    }
+};
+int main() {
+    Engine e;
+    assert(!e.FindCachedMacro(0));
+    e.Insert(0);
+    assert(e.FindCachedMacro(0)->program == 1);
+    const auto probes = e.macro_cache.probes;
+    for (int i = 0; i < 10000; ++i) assert(e.FindCachedMacro(0)->program == 1);
+    assert(e.macro_cache.probes == probes);
+    assert(!e.FindCachedMacro(1234));
+    assert(e.FindCachedMacro(0)->program == 1);
+    for (u32 i = 1; i < 2000; ++i) {
+        e.Insert(i);
+        assert(!e.last_macro);
+        assert(e.FindCachedMacro(i)->program == i + 1);
+    }
+    e.ClearCode(0); // erasing any entry must invalidate the pointer
+    assert(!e.last_macro && !e.FindCachedMacro(0));
+    e.ClearCode(1999);
+    assert(!e.FindCachedMacro(1999));
+    e.Insert(1999);
+    assert(e.FindCachedMacro(1999)->program == 2000);
+    e.cache_lookup = false;
+    const auto before = e.macro_cache.probes;
+    for (int i = 0; i < 10; ++i) assert(e.FindCachedMacro(1999)->program == 2000);
+    assert(e.macro_cache.probes == before + 10);
+}
+""".replace("// LOOKUP", lookup)
+            .replace("// CLEAR", clear)
+            .replace("// INSERT", insertion)
+        )
+
     def test_macro_dispatch_all_alternatives_refresh_arguments_and_exceptions(self):
         source = (ROOT / "src/video_core/macro.cpp").read_text()
         start = source.index("    const auto execute_variant =")
-        end = source.index("    if (auto const it = macro_cache.find(method);", start)
+        end = source.index("    if (auto* cached = FindCachedMacro(method))", start)
         dispatch = source[start:end]
         header = (ROOT / "src/video_core/macro.h").read_text()
-        variant = re.search(r"using AnyCachedMacro = std::variant<.*?>;", header, re.S).group()
-        names = re.findall(r"^    (HLE_\w+|MacroInterpreterImpl),", variant, re.M)
+        variant = re.search(r"using AnyCachedMacro = std::variant<.*?>;", header, re.DOTALL).group()
+        names = re.findall(r"^    (HLE_\w+|MacroInterpreterImpl),", variant, re.MULTILINE)
         types = "\n".join(f"struct {name} : Program<{i}> {{}};" for i, name in enumerate(names))
         self.compile_and_run(
             r"""

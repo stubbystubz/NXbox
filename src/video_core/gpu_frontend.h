@@ -14,4 +14,12 @@ inline bool GpuFrontendFastPathEnabled() {
     }();
     return enabled;
 }
+// Keep a narrow rollback for bulk method profiling and the last-macro lookup.
+inline bool MaxwellMethodBatchingEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_MAXWELL_METHODS");
+        return GpuFrontendFastPathEnabled() && (!value || value[0] != '0' || value[1] != '\0');
+    }();
+    return enabled;
+}
 } // namespace Tegra

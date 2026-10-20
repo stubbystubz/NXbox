@@ -19,7 +19,7 @@ FIXTURES = ROOT / "tests/port/fixtures"
 def method(source, name, occurrence=0):
     matches = list(
         re.finditer(
-            rf"^[^\n]*\b{re.escape(name)}\([^\n]*\)[^\n]*\{{.*?^\}}",
+            rf"^[^\n]*\b{re.escape(name)}\([^;{{]*?\)[^\n]*\{{.*?^\}}",
             source,
             re.MULTILINE | re.DOTALL,
         )
@@ -68,6 +68,7 @@ class GpuFrontendHotPathTests(unittest.TestCase):
                 "ProcessDirtyRegistersImpl",
                 "ConsumeSinkImpl",
                 "CallMethod",
+                "CallMethodImpl",
                 "CallMultiMethod",
                 "CallCBDataIncrementing",
                 "ProcessCBMultiData",
@@ -124,11 +125,19 @@ class GpuFrontendHotPathTests(unittest.TestCase):
 int main() {
     const bool expected = std::getenv("NXBOX_GPU_FRONTEND_FASTPATH")[0] == '1';
     assert(Tegra::GpuFrontendFastPathEnabled() == expected);
+    const bool batching = expected && std::getenv("NXBOX_MAXWELL_METHODS")[0] == '1';
+    assert(Tegra::MaxwellMethodBatchingEnabled() == batching);
+    setenv("NXBOX_MAXWELL_METHODS", batching ? "0" : "1", 1);
+    assert(Tegra::MaxwellMethodBatchingEnabled() == batching);
     setenv("NXBOX_GPU_FRONTEND_FASTPATH", expected ? "0" : "1", 1);
     assert(Tegra::GpuFrontendFastPathEnabled() == expected);
 }
 """,
-            [dict(os.environ, NXBOX_GPU_FRONTEND_FASTPATH=value) for value in ("0", "1")],
+            [
+                dict(os.environ, NXBOX_GPU_FRONTEND_FASTPATH=value, NXBOX_MAXWELL_METHODS=batching)
+                for value in ("0", "1")
+                for batching in ("0", "1")
+            ],
         )
 
     def test_jit_zero_register_skip_preserves_result_and_live_carry(self):

@@ -1385,8 +1385,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
             },
             cached);
     };
-    if (auto const it = macro_cache.find(method); it != macro_cache.end()) {
-        execute_variant(it->second.program);
+    if (auto* cached = FindCachedMacro(method)) {
+        execute_variant(cached->program);
         return;
     }
 
@@ -1418,6 +1418,7 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
         code = macro_code->second;
     }
 
+    last_macro = nullptr;
     auto& ci = macro_cache[method];
     ci.hash = Common::HashRange(code.begin(), code.end());
     if (!Settings::values.disable_macro_hle) {
