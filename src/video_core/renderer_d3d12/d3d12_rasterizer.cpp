@@ -1613,6 +1613,73 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     auto& sampler_plan = draw_sampler_plan;
     view_plan.Reset({cbv_size, srv_size, uav_size});
     sampler_plan.Reset({sampler_size, 0, 0});
+    // Cache only immutable sampler keys, never heap handles, view IDs or resources.
+    // GetSamplerId above still reads the guest TSC every draw. Full entry bytes and
+    // comparison mode therefore cover CPU/DMA/GPU writes and channel/table changes.
+    // Image resolution cannot use this proof: it also needs lifetime/alias generations.
+    struct ResolvedSamplerPlan {
+        struct Input {
+            std::array<u8, sizeof(Tegra::Texture::TSCEntry)> entry{};
+            bool compares{};
+        };
+        std::vector<Input> inputs;
+        std::vector<DescriptorKey> keys;
+        u64 draws{}, hits{};
+    };
+    static thread_local ResolvedSamplerPlan resolved_sampler_plan;
+    static const bool resolved_samplers_enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_SAMPLER_PLAN_REUSE");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    // Keep this memo bounded, including for providers with unusual layouts.
+    const bool cache_sampler_plan =
+        resolved_samplers_enabled && totals.sampler != 0 && sampler_size <= 4096;
+    bool reuse_sampler_plan = false;
+    if (cache_sampler_plan) {
+        auto& cached = resolved_sampler_plan;
+        reuse_sampler_plan =
+            cached.inputs.size() == totals.sampler && cached.keys.size() == sampler_size;
+        cached.inputs.resize(totals.sampler);
+        u32 slot = 0;
+        for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
+            const Shader::Info* info = pipeline->StageInfo(stage);
+            if (!info)
+                continue;
+            for (const auto& desc : info->texture_descriptors) {
+                for (u32 i = 0; i < desc.count; ++i, ++slot) {
+                    const auto& entry = texture_cache.GetSampler(sampler_scratch[slot]).Entry();
+                    auto& input = cached.inputs[slot];
+                    reuse_sampler_plan &=
+                        input.compares == desc.is_depth &&
+                        std::memcmp(input.entry.data(), &entry, sizeof(entry)) == 0;
+                    // Min/max translation also depends on a mutable device policy in
+                    // MakeSamplerDesc; rebuild those plans through the normal writers.
+                    reuse_sampler_plan &=
+                        entry.reduction_filter != Tegra::Texture::SamplerReduction::Min &&
+                        entry.reduction_filter != Tegra::Texture::SamplerReduction::Max;
+                    std::memcpy(input.entry.data(), &entry, sizeof(entry));
+                    input.compares = desc.is_depth;
+                }
+            }
+        }
+        if (reuse_sampler_plan) {
+            sampler_plan.keys = cached.keys;
+            std::fill(sampler_plan.initialized.begin(), sampler_plan.initialized.end(), u8{1});
+            sampler_plan.sources.valid = false;
+            // FinishDrawTable will reuse the current
+            // recording's table or resolve keys against the current heap generation.
+            ++cached.hits;
+        } else {
+            // A failed/skipped draw must not pair new inputs with old keys.
+            cached.keys.clear();
+        }
+        if (++cached.draws % 65536 == 0) {
+            Diagnostic(fmt::format("D3D12_RESOLVED_SAMPLER_PLAN draws={} hits={} misses={}",
+                                   cached.draws, cached.hits, cached.draws - cached.hits));
+        }
+    }
+    const bool validate_sampler_plan =
+        reuse_sampler_plan && BisectEnabled("NXBOX_D3D12_VALIDATE_COMMANDS");
     DescriptorTable view_block{{}, {}, cbv_size + srv_size + uav_size, 0, &view_plan};
     auto cbv_table = view_block.Slice(0, cbv_size);
     auto srv_table = view_block.Slice(cbv_size, srv_size);
@@ -1741,7 +1808,8 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                         static_cast<int>(desc.type)));
                 }
                 const Sampler& sampler = texture_cache.GetSampler(*sampler_it++);
-                descriptors.WriteSampler(sampler_table, smp_i, sampler, desc.is_depth);
+                if (!reuse_sampler_plan || validate_sampler_plan)
+                    descriptors.WriteSampler(sampler_table, smp_i, sampler, desc.is_depth);
                 // Diagnostic: describe each distinct vertex-stage cube binding once.
                 static const bool vs_texture_trace = BisectEnabled("NXBOX_D3D12_VS_TEXTURE_TRACE");
                 if (vs_texture_trace && stage == 0 && !sampled &&
@@ -1872,8 +1940,14 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         descriptors.WriteNullSrv(srv_table, i, D3D12_SRV_DIMENSION_TEXTURE2D);
     for (u32 i = uav_i; i < uav_size; ++i)
         descriptors.WriteNullUav(uav_table, i);
-    for (u32 i = smp_i; i < sampler_table.count; ++i)
-        descriptors.WriteNullSampler(sampler_table, i);
+    if (!reuse_sampler_plan || validate_sampler_plan) {
+        for (u32 i = smp_i; i < sampler_table.count; ++i)
+            descriptors.WriteNullSampler(sampler_table, i);
+        if (validate_sampler_plan && sampler_plan.keys != resolved_sampler_plan.keys)
+            throw std::invalid_argument("resolved sampler plan differs from reconstruction");
+        if (cache_sampler_plan)
+            resolved_sampler_plan.keys = sampler_plan.keys;
+    }
 
     const auto predicate_trace = query_runtime.PreparePredicateTrace();
 
