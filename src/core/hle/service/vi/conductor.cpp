@@ -11,6 +11,7 @@
 #include "common/thread.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/core_timing_trace.h"
 #include "core/hle/service/vi/conductor.h"
 #include "core/hle/service/vi/container.h"
 #include "core/hle/service/vi/display_list.h"
@@ -96,6 +97,7 @@ void Conductor::UnlinkVsyncEvent(u64 display_id, Event* event) {
 void Conductor::SignalVsync() {
     std::scoped_lock lock{m_vsync_lock};
     for (auto& entry : m_vsync_managers) {
+        Core::Timing::Trace::Record(Core::Timing::Trace::Source::VsyncSignal, 0, 0, entry.first);
         entry.second.SignalVsync(m_system.Kernel());
     }
     if (VblankProfileEnabled()) {
@@ -118,6 +120,7 @@ void Conductor::ProcessVsync() {
         m_compose_speed_scale.store(speed_scale, std::memory_order_relaxed);
         if (!m_independent_vsync) {
             std::scoped_lock lock{m_vsync_lock};
+            Core::Timing::Trace::Record(Core::Timing::Trace::Source::VsyncSignal, 0, 0, display_id);
             manager.SignalVsync(m_system.Kernel());
         }
     }

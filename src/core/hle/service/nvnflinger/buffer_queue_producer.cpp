@@ -12,6 +12,7 @@
 #include "common/settings.h"
 #include "common/cpu_features.h"
 #include "core/core.h"
+#include "core/core_timing_trace.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/kernel.h"
@@ -515,6 +516,11 @@ Status BufferQueueProducer::QueueBuffer(s32 slot, const QueueBufferInput& input,
                      program_id, fmt::ptr(this), swap_interval, item.swap_interval);
         }
 #endif
+        // Sample every request so the timing flight recorder can correlate the
+        // guest's interval decision with report issue/publication on either side.
+        Core::Timing::Trace::Record(
+            Core::Timing::Trace::Source::SwapInterval, static_cast<u64>(swap_interval),
+            static_cast<u64>(item.swap_interval), reinterpret_cast<std::uintptr_t>(this));
         if (VI::VblankProfileEnabled()) {
             VI::vblank_timing.RecordSwapInterval(swap_interval);
         }
