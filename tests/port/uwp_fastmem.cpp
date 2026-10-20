@@ -4,10 +4,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -23,6 +25,7 @@
 
 using u8 = std::uint8_t;
 using u32 = std::uint32_t;
+using u64 = std::uint64_t;
 using DWORD = std::uint32_t;
 using LONG = long;
 using HANDLE = void*;
@@ -33,6 +36,8 @@ constexpr DWORD MEM_REPLACE_PLACEHOLDER = 0x4000, MEM_PRESERVE_PLACEHOLDER = 2;
 constexpr DWORD MEM_COALESCE_PLACEHOLDERS = 1, SEC_COMMIT = 0x8000000;
 constexpr DWORD EXCEPTION_ACCESS_VIOLATION = 0xc0000005;
 constexpr LONG EXCEPTION_CONTINUE_SEARCH = 0, EXCEPTION_CONTINUE_EXECUTION = -1;
+constexpr DWORD EXCEPTION_UNWINDING = 2, EXCEPTION_EXIT_UNWIND = 4;
+enum EXCEPTION_DISPOSITION { ExceptionContinueExecution, ExceptionContinueSearch };
 #define NTAPI
 #define INVALID_HANDLE_VALUE reinterpret_cast<HANDLE>(-1)
 #define UNREACHABLE() std::abort()
@@ -57,6 +62,14 @@ struct EXCEPTION_RECORD {
     DWORD ExceptionCode;
     unsigned NumberParameters;
     std::uintptr_t ExceptionInformation[2];
+    DWORD ExceptionFlags{};
+};
+struct CONTEXT {
+    u64 Rip, Rsp;
+};
+using PCONTEXT = CONTEXT*;
+struct FakeCall {
+    u64 call_rip, ret_rip;
 };
 struct EXCEPTION_POINTERS {
     EXCEPTION_RECORD* ExceptionRecord;
@@ -100,6 +113,8 @@ std::string fail_name;
 int fail_at{};
 size_t committed{}, sections{}, peak{};
 bool force_noaccess_alias{};
+bool reject_fault_maps{}, suppress_veh{}, in_handler{};
+unsigned probe_accesses{};
 DWORD last_error = 5;
 Handler handler{};
 bool Fail(const char* name) {
@@ -136,6 +151,8 @@ void Reset() {
     peak = 0;
     last_error = 5;
     force_noaccess_alias = false;
+    reject_fault_maps = suppress_veh = in_handler = false;
+    probe_accesses = 0;
     api_errors.clear();
     assert(!handler);
 }
@@ -176,7 +193,7 @@ void* Map(HANDLE handle, HANDLE process, void* base, std::uint64_t offset, size_
     assert(offset % 4096 == 0 && offset + length <= section->size);
     auto it = segments.find(reinterpret_cast<size_t>(base));
     assert(it != segments.end() && !it->second.section && it->second.length == length);
-    if (Fail("map"))
+    if (Fail("map") || (reject_fault_maps && in_handler))
         return nullptr;
     // macOS/arm64 has 16 KiB host pages. Native aligned views are real shared
     // mappings; subpage Windows views are emulated while retaining strict bounds.
@@ -260,6 +277,41 @@ unsigned Remove(void* token) {
     assert(token && handler);
     handler = nullptr;
     return 1;
+}
+
+bool Accessible(const volatile u8* address, bool write) {
+    const auto offset = reinterpret_cast<size_t>(address);
+    auto it = segments.upper_bound(offset);
+    if (it == segments.begin())
+        return false;
+    --it;
+    const auto& view = it->second;
+    return offset - it->first < view.length && view.section &&
+           (write ? view.mapping_protection == PAGE_READWRITE
+                  : view.mapping_protection != PAGE_NOACCESS);
+}
+
+// Model Windows' VEH-before-SEH dispatch, rather than unconditionally calling
+// Fault() before a native load/store (which hid unhandled host-code faults).
+bool ProbeMemoryAccess(volatile u8* address, bool write, u8& value) {
+    ++probe_accesses;
+    if (!Accessible(address, write)) {
+        EXCEPTION_RECORD record{
+            EXCEPTION_ACCESS_VIOLATION, 2, {write ? 1u : 0u, reinterpret_cast<size_t>(address)}};
+        EXCEPTION_POINTERS ep{&record};
+        assert(handler);
+        in_handler = true;
+        const auto disposition = suppress_veh ? EXCEPTION_CONTINUE_SEARCH : handler(&ep);
+        in_handler = false;
+        if (disposition != EXCEPTION_CONTINUE_EXECUTION)
+            return false;                   // The probe's SEH guard catches the unresolved AV.
+        assert(Accessible(address, write)); // Never retry an unresolved fault.
+    }
+    if (write)
+        *address = value;
+    else
+        value = *address;
+    return true;
 }
 } // namespace Mock
 
@@ -386,6 +438,8 @@ public:
 // PRODUCTION_HANDLER
 // PRODUCTION_ALLOCATOR
 } // namespace Common
+
+// PRODUCTION_SEH
 
 bool Fault(void* address, size_t access = 1) {
     EXCEPTION_RECORD record{
@@ -522,7 +576,12 @@ int main() { setenv("NXBOX_FASTMEM", "1", 1); // UWP fastmem is opt-in
             Mock::fail_at = failure;
             {
                 HostMemory::Impl memory(4 * region, 32 * region);
-                assert(memory.Init() && !memory.virtual_base);
+                assert(memory.Init());
+                // A rejected no-op coalesce is verified with VirtualQuery and
+                // may leave fastmem ready; other startup failures select fallback.
+                if (memory.virtual_base) {
+                    assert(std::string_view{api} == "free");
+                }
                 assert(Mock::committed == 0);
                 if (std::string_view{api} == "protect") {
                     assert(!api_errors.empty());
