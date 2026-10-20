@@ -27,7 +27,7 @@ enum D3D12_DESCRIPTOR_HEAP_TYPE { D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
 struct D3D12_CPU_DESCRIPTOR_HANDLE { SIZE_T ptr; };
 struct D3D12_CONSTANT_BUFFER_VIEW_DESC { u64 BufferLocation; };
 struct D3D12_SHADER_RESOURCE_VIEW_DESC { UINT ViewDimension, Format; };
-struct D3D12_UNORDERED_ACCESS_VIEW_DESC { u64 data; };
+struct D3D12_UNORDERED_ACCESS_VIEW_DESC { UINT Format; };
 struct D3D12_SAMPLER_DESC { u64 data; };
 struct Resource { struct { int* Get() const { return nullptr; } } handle; };
 using ResourcePtr = std::shared_ptr<Resource>;
@@ -64,6 +64,9 @@ struct FakeContext {
     u64 CurrentTick() const { return tick; }
     FakeDevice* Device() { return &device; }
     FakeProfile& Profile() { return profile; }
+    void ValidateViewFormat(const ResourcePtr& resource, UINT, const char*) {
+        assert(!resource); // Null descriptors have no resource format to validate.
+    }
 };
 namespace fmt {
     template<class... Args> std::string format(const char*, Args...) { return {}; }

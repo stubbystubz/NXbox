@@ -4,6 +4,7 @@
 #include <bitset>
 #include <cassert>
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <span>
 #include <tuple>
@@ -11,6 +12,7 @@
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 using ImageViewId = unsigned;
+using PixelFormat = unsigned;
 constexpr unsigned NUM_RT = 8;
 namespace Common::GpuProfile {
 enum class Phase { TextureCacheUpdate };
@@ -84,6 +86,7 @@ struct ImageViewInOut {
     unsigned index;
     bool blacklist;
     unsigned id{};
+    std::optional<PixelFormat> format_override{};
 };
 struct ImageViewBase {
     unsigned image_id;
@@ -93,6 +96,16 @@ struct Image {
     bool operator==(const Image&) const = default;
 };
 struct Cache {
+    struct Runtime {
+        bool CanViewFormat(const ImageViewBase&, PixelFormat) {
+            assert(false); // This differential trace has no format overrides.
+            return false;
+        }
+    } runtime;
+    ImageViewId ReinterpretImageView(ImageViewId, PixelFormat) {
+        assert(false);
+        return NULL_IMAGE_VIEW_ID;
+    }
     bool draw_state_fastpath = true;
     Tegra::Engines::Maxwell3D* maxwell3d{};
     Compute* kepler_compute{};

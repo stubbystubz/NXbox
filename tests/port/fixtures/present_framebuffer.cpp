@@ -1,6 +1,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -111,8 +112,8 @@ struct Runtime {
         return {};
     }
     ResourcePtr UploadFramebuffer(GuestMemory& memory, const Tegra::FramebufferConfig&) {
-        // A rejected cache alias still has newer GPU pixels. The fallback must see them.
-        assert(memory.pixel == 76);
+        // Only the opt-in download makes the newer GPU pixels visible in guest RAM.
+        assert(memory.pixel == (EXPECT_FALLBACK_DOWNLOAD ? 76u : 0u));
         auto result = std::make_shared<Resource>();
         result->pixel = memory.pixel;
         return result;
@@ -143,20 +144,24 @@ struct RasterizerD3D12 {
 };
 // PRODUCTION_METHOD
 int main() {
+    constexpr unsigned downloads_per_fallback = EXPECT_FALLBACK_DOWNLOAD;
+    constexpr unsigned expected_pixel = EXPECT_FALLBACK_DOWNLOAD ? 76 : 0;
     RasterizerD3D12 rasterizer;
     Tegra::FramebufferConfig config;
     auto fallback = rasterizer.FramebufferTexture(config);
-    assert(fallback.resource->pixel == 76 && rasterizer.texture_cache.downloads == 1);
+    assert(fallback.resource->pixel == expected_pixel);
+    assert(rasterizer.texture_cache.downloads == downloads_per_fallback);
     View cached;
     cached.resource = std::make_shared<Resource>();
     rasterizer.texture_cache.selected = &cached;
     auto direct = rasterizer.FramebufferTexture(config);
     assert(direct.resource == cached.resource);
-    assert(rasterizer.texture_cache.downloads == 1 && rasterizer.texture_cache.prepares == 1);
+    assert(rasterizer.texture_cache.downloads == downloads_per_fallback &&
+           rasterizer.texture_cache.prepares == 1);
     assert(rasterizer.texture_cache.snapshots == 1);
-    // An unsupported view takes the same synchronized fallback.
+    // A view without a resource takes the same opt-in fallback.
     cached.resource.reset();
     rasterizer.device_memory.pixel = 0;
-    assert(rasterizer.FramebufferTexture(config).resource->pixel == 76);
-    assert(rasterizer.texture_cache.downloads == 2);
+    assert(rasterizer.FramebufferTexture(config).resource->pixel == expected_pixel);
+    assert(rasterizer.texture_cache.downloads == 2 * downloads_per_fallback);
 }
