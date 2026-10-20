@@ -3222,6 +3222,8 @@ private:
 
     void ConsumeSinkImpl(Core::System& system) override;
 
+    const bool method_batching{MaxwellMethodBatchingEnabled()};
+    void CallMethodImpl(Core::System& system, u32 method, u32 method_argument, bool is_last_call);
     void ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call);
 
     /// Retrieves information about a specific TIC entry from the TIC buffer.

@@ -373,12 +373,10 @@ void Maxwell3D::ProcessDirtyRegistersImpl(u32 method, u32 argument) {
             dirty.flags[table[method]] = true;
         return;
     }
-    const auto flag0 = dirty.tables[0][method];
-    const auto flag1 = dirty.tables[1][method];
-    if (!dirty.flags[flag0])
-        dirty.flags[flag0] = true;
-    if (flag1 != flag0 && !dirty.flags[flag1])
-        dirty.flags[flag1] = true;
+    // Setting a bit is idempotent. Testing it first adds data-dependent branches
+    // and loads on precisely the common path where most flags are already set.
+    dirty.flags[dirty.tables[0][method]] = true;
+    dirty.flags[dirty.tables[1][method]] = true;
 }
 
 void Maxwell3D::ProcessMethodCall(u32 method, u32 argument, u32 nonshadow_argument, bool is_last_call) {
@@ -490,6 +488,11 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, const std::vec
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     const Common::GpuProfile::RecordingScope gpu_profile_scope{
         Common::GpuProfile::Phase::Maxwell3DMethods};
+    CallMethodImpl(system, method, method_argument, is_last_call);
+}
+
+void Maxwell3D::CallMethodImpl(Core::System& system, u32 method, u32 method_argument,
+                               bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
     // it has finished execution.
     if (executing_macro != 0 && method != executing_macro + 1) [[unlikely]] {
@@ -527,11 +530,13 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         ProcessMacro(system, method, base_start, amount, amount == methods_pending);
         return;
     }
-    // The sink uses this mask to identify writes with no method side effects. Repeated
-    // writes to the same such register only retain the final value, including shadow RAM.
+    // Ordinary repeated writes still dirty the register when an intermediate value
+    // changes and the final value restores it. There is no observer between these
+    // writes, but dirty flags must match scalar dispatch (also in Track/Replay).
     if (amount != 0 && executing_macro == 0 && !execution_mask[method]) {
-        const u32 argument = ProcessShadowRam(method, base_start[amount - 1]);
-        ProcessDirtyRegisters(method, argument);
+        for (u32 i = 0; i < amount; ++i) {
+            ProcessDirtyRegisters(method, ProcessShadowRam(method, base_start[i]));
+        }
         return;
     }
     switch (method) {
@@ -567,8 +572,15 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
         }
         [[fallthrough]];
     default:
+        if (!method_batching) {
+            for (u32 i = 0; i < amount; ++i) {
+                CallMethod(system, method, base_start[i], methods_pending - i <= 1);
+            }
+            break;
+        }
         for (u32 i = 0; i < amount; i++) {
-            CallMethod(system, method, base_start[i], methods_pending - i <= 1);
+            // The outer bulk call owns the profiling boundary, including exceptions.
+            CallMethodImpl(system, method, base_start[i], methods_pending - i <= 1);
         }
         break;
     }

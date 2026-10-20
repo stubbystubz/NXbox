@@ -10,9 +10,10 @@
 #include <span>
 #include <variant>
 #include <vector>
-#include "common/container/unordered_map.h"
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "common/container/unordered_map.h"
+#include "video_core/gpu_frontend.h"
 
 namespace Core {
 class System;
@@ -227,6 +228,8 @@ struct MacroEngine {
     }
     // Clear the code associated with a method.
     inline void ClearCode(u32 method) {
+        // unordered_flat_map may move other entries when erasing or rehashing.
+        last_macro = nullptr;
         macro_cache.erase(method);
         uploaded_macro_code.erase(method);
     }
@@ -237,6 +240,22 @@ struct MacroEngine {
         AnyCachedMacro program;
         u64 hash{};
     };
+    CacheInfo* FindCachedMacro(u32 method) {
+        if (cache_lookup && last_macro && last_method == method) {
+            return last_macro;
+        }
+        const auto it = macro_cache.find(method);
+        if (it == macro_cache.end()) {
+            return nullptr;
+        }
+        last_method = method;
+        return last_macro = &it->second;
+    }
+    // A repeated draw macro needs no hash probe or HLE lookup. Pointers are valid
+    // only until the next cache mutation; clear them before insertion or erasure.
+    const bool cache_lookup{MaxwellMethodBatchingEnabled()};
+    u32 last_method{};
+    CacheInfo* last_macro{};
     ::Common::unordered_map<u32, CacheInfo> macro_cache;
     ::Common::unordered_map<u32, std::vector<u32>> uploaded_macro_code;
     bool is_interpreted;
