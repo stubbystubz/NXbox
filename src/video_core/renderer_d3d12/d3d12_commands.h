@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "video_core/renderer_d3d12/d3d12_command_validation.h"
+#include "video_core/renderer_d3d12/d3d12_gpu_pass_profile.h"
 #include "video_core/renderer_d3d12/d3d12_parallel_record.h"
 #include "video_core/renderer_d3d12/d3d12_record_args.h"
 #include "video_core/renderer_d3d12/d3d12_recorded_state.h"
@@ -76,6 +77,7 @@ public:
     const bool reuse_graphics_root_cbvs{BisectEnabled("NXBOX_D3D12_ROOT_CBV_REUSE")};
     GraphicsRootCbvCache graphics_root_cbvs;
     CommandValidation validation;
+    GpuPassProfile* pass_profile{};
     ID3D12Device* device{};
     int32_t depth_bounds_status{}, independent_stencil_status{};
     RecordDescriptors* descriptors{};
@@ -172,6 +174,10 @@ public:
     D3D12_FORWARD_INLINE void ResolveQueryData(ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type,
                                                UINT start, UINT count, ID3D12Resource* destination,
                                                UINT64 offset) {
+        if (pass_profile) {
+            pass_profile->Target({});
+            pass_profile->Work(GpuPassKind::Copy);
+        }
         validation.Resolve(heap, type, start, count, destination, offset);
         if (!stream) {
             immediate->ResolveQueryData(heap, type, start, count, destination, offset);
@@ -187,6 +193,8 @@ public:
                                                     D3D12_CLEAR_FLAGS flags, FLOAT depth,
                                                     UINT8 stencil, UINT count,
                                                     const D3D12_RECT* rects) {
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Clear);
         if (!stream) {
             immediate->ClearDepthStencilView(handle, flags, depth, stencil, count, rects);
             return;
@@ -205,6 +213,8 @@ public:
     D3D12_FORWARD_INLINE void ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                                     const FLOAT* color, UINT count,
                                                     const D3D12_RECT* rects) {
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Clear);
         if (!stream) {
             immediate->ClearRenderTargetView(handle, color, count, rects);
             return;
@@ -222,6 +232,15 @@ public:
     D3D12_FORWARD_INLINE void CopyBufferRegion(ID3D12Resource* destination,
                                                UINT64 destination_offset, ID3D12Resource* source,
                                                UINT64 source_offset, UINT64 size) {
+        if (pass_profile) {
+            const auto desc = destination->GetDesc();
+            pass_profile->Target(
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                    ? GpuPassTarget{}
+                    : GpuPassTarget{static_cast<std::uint32_t>(desc.Width), desc.Height,
+                                    static_cast<std::uint32_t>(desc.Format), 0, 0});
+            pass_profile->Work(GpuPassKind::Copy);
+        }
         validation.BufferCopy(destination, destination_offset, source, source_offset, size);
         if (!stream) {
             immediate->CopyBufferRegion(destination, destination_offset, source, source_offset,
@@ -235,6 +254,15 @@ public:
         }>(*stream, destination, destination_offset, source, source_offset, size);
     }
     D3D12_FORWARD_INLINE void CopyResource(ID3D12Resource* destination, ID3D12Resource* source) {
+        if (pass_profile) {
+            const auto desc = destination->GetDesc();
+            pass_profile->Target(
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                    ? GpuPassTarget{}
+                    : GpuPassTarget{static_cast<std::uint32_t>(desc.Width), desc.Height,
+                                    static_cast<std::uint32_t>(desc.Format), 0, 0});
+            pass_profile->Work(GpuPassKind::Copy);
+        }
         if (!stream) {
             immediate->CopyResource(destination, source);
             return;
@@ -247,6 +275,15 @@ public:
                                                 UINT x, UINT y, UINT z,
                                                 const D3D12_TEXTURE_COPY_LOCATION* source,
                                                 const D3D12_BOX* box) {
+        if (pass_profile) {
+            const auto desc = destination->pResource->GetDesc();
+            pass_profile->Target(
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                    ? GpuPassTarget{}
+                    : GpuPassTarget{static_cast<std::uint32_t>(desc.Width), desc.Height,
+                                    static_cast<std::uint32_t>(desc.Format), 0, 0});
+            pass_profile->Work(GpuPassKind::Copy);
+        }
         validation.TextureCopy(device, destination, x, y, z, source, box);
         if (!stream) {
             immediate->CopyTextureRegion(destination, x, y, z, source, box);
@@ -259,6 +296,8 @@ public:
         }>(*stream, Snapshot(destination, 1), x, y, z, Snapshot(source, 1), Snapshot(box, 1));
     }
     D3D12_FORWARD_INLINE void Dispatch(UINT x, UINT y, UINT z) {
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Compute);
         if (!stream) {
             immediate->Dispatch(x, y, z);
             return;
@@ -269,6 +308,8 @@ public:
     }
     D3D12_FORWARD_INLINE void DrawIndexedInstanced(UINT indices, UINT instances, UINT first_index,
                                                    INT base_vertex, UINT first_instance) {
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Draw);
         if (!stream) {
             immediate->DrawIndexedInstanced(indices, instances, first_index, base_vertex,
                                             first_instance);
@@ -288,6 +329,8 @@ public:
     }
     D3D12_FORWARD_INLINE void DrawInstanced(UINT vertices, UINT instances, UINT first_vertex,
                                             UINT first_instance) {
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Draw);
         if (!stream) {
             immediate->DrawInstanced(vertices, instances, first_vertex, first_instance);
             return;
@@ -306,6 +349,9 @@ public:
     D3D12_FORWARD_INLINE void ExecuteIndirect(ID3D12CommandSignature* signature, UINT count,
                                               ID3D12Resource* arguments, UINT64 offset,
                                               ID3D12Resource* count_buffer, UINT64 count_offset) {
+        // The backend currently creates only DISPATCH indirect signatures.
+        if (pass_profile)
+            pass_profile->Work(GpuPassKind::Compute);
         if (!stream) {
             immediate->ExecuteIndirect(signature, count, arguments, offset, count_buffer,
                                        count_offset);
@@ -425,6 +471,8 @@ public:
                                                  const D3D12_CPU_DESCRIPTOR_HANDLE* handles,
                                                  BOOL contiguous,
                                                  const D3D12_CPU_DESCRIPTOR_HANDLE* depth) {
+        if (pass_profile)
+            pass_profile->Boundary();
         if (!stream) {
             immediate->OMSetRenderTargets(count, handles, contiguous, depth);
             return;
@@ -518,6 +566,15 @@ public:
                                                  UINT destination_subresource,
                                                  ID3D12Resource* source, UINT source_subresource,
                                                  DXGI_FORMAT format) {
+        if (pass_profile) {
+            const auto desc = destination->GetDesc();
+            pass_profile->Target(
+                desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER
+                    ? GpuPassTarget{}
+                    : GpuPassTarget{static_cast<std::uint32_t>(desc.Width), desc.Height,
+                                    static_cast<std::uint32_t>(desc.Format), 0, 0});
+            pass_profile->Work(GpuPassKind::Copy);
+        }
         if (!stream) {
             immediate->ResolveSubresource(destination, destination_subresource, source,
                                           source_subresource, format);

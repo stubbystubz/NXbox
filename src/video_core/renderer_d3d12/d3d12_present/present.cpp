@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2026 NSPX
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -183,6 +184,16 @@ struct Presenter::Impl {
         commands->RSSetViewports(1, &viewport);
         commands->RSSetScissorRects(1, &scissor);
         commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (auto* profile = context.PassProfile()) {
+            const bool preprocessing =
+                std::any_of(intermediate.begin(), intermediate.end(),
+                            [pipeline](const auto& pso) { return pso.Get() == pipeline; });
+            profile->Label("present blit");
+            profile->Target(
+                {static_cast<u32>(viewport.Width), static_cast<u32>(viewport.Height),
+                 static_cast<u32>(preprocessing ? IntermediateFormat : DXGI_FORMAT_R8G8B8A8_UNORM),
+                 0, 0});
+        }
         commands->DrawInstanced(3, 1, 0, 0);
     }
     ResourcePtr Preprocess(unsigned pass, unsigned scratch_index, const ResourcePtr& source,

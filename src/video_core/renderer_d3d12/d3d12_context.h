@@ -498,6 +498,10 @@ public:
     Context& operator=(const Context&) = delete;
     CommandFacade* Commands();
     void SimulateSeriesSFrame();
+    void GpuPassFrame();
+    GpuPassProfile* PassProfile() {
+        return pass_profile.get();
+    }
     void Acknowledge(u64 tick);
     // Every recording path outside the cached guest draw must invalidate before
     // recording. Resource barriers and predication do not change cached state.
@@ -625,6 +629,7 @@ private:
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
     std::unique_ptr<SimSeriesS> sim_series_s;
+    std::unique_ptr<GpuPassProfile> pass_profile;
     struct AllocatorSlot {
         ComPtr<ID3D12CommandAllocator> handle;
         u64 tick{};
