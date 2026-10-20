@@ -1,5 +1,116 @@
 # DBSZ: the 43.822-second presentation gap
 
+## Follow-up: all-thread AM/FS poll capture (40.743 seconds)
+
+Read-only source: `compat-2026-10-18/r-dbsz-poll/{eden,diag}.txt`, examined
+2026-10-20 with `NXBOX_AM_FS_POLL_TRACE=1`, `NXBOX_AM_FS_POLL_THREAD=0` and
+`NXBOX_WAIT_DIAG=1`. This supersedes the old statement below that no `r-dbsz*`
+capture was available. **The new capture identifies the repeated services, but
+does not establish a service defect or a fix for the whole gap.** No service
+result, event, timeout or scheduling policy was changed.
+
+The presentation completions at eden.txt:3667 and :13058 are 29.440924 and
+70.189923 seconds: 40.748999 seconds apart. diag.txt:1009 reports
+`worst_gap_ms=40743` at the frontend's measurement point. The interval contains
+4,671 paired requests (sequences 1718 through 6388), no unpaired request crossing
+either boundary, and no trace truncation. All return guest result and transport
+`0x00000000`, `has_result=true`, `deferred=false`.
+
+| Guest thread | Service / CMIF command | Meaning | Calls | Sum of handler elapsed_us | Maximum elapsed_us |
+| --- | --- | --- | ---: | ---: | ---: |
+| 102 / 0x66 | IStorage / 0 | Read | 4,337 | 3,915,235 | 107,389 |
+| 82 / 0x52 | IStorage / 0 | Read | 299 | 134,252 | 24,275 |
+| 82 | ICommonStateGetter / 5 | GetOperationMode | 25 | 53 | 5 |
+| 82 | IApplicationFunctions / 21 | GetDesiredLanguage | 3 | 1,578 | 833 |
+| 82 | ISelfController / 10 | SetScreenShotPermission | 3 | 7 | 3 |
+| 82 | IApplicationFunctions / 100 | InitializeApplicationCopyrightFrameBuffer | 1 | 15 | 15 |
+| 82 | IApplicationFunctions / 67 | SetGamePlayRecordingState | 1 | 9 | 9 |
+| 82 | ICommonStateGetter / 66 | SetCpuBoostMode | 1 | 12 | 12 |
+| 82 | ICommonStateGetter / 6 | GetPerformanceMode | 1 | 5 | 5 |
+
+These are completed elapsed scopes, including dispatch/serialization and lock
+acquisition; they are not CPU time or measurements of the physical disk alone.
+The read scopes sum to 4.049487 seconds and all AM/FS scopes to 4.051166 seconds.
+They can overlap, so their union is at most that large. The trace's surrounding
+logging and uninstrumented IPC/scheduler overhead are outside these scopes.
+Consequently this does not attribute the remaining time to a specific subsystem,
+but excludes a single 40-second request inside this AM/FS adapter.
+
+The strongest evidence against an AM/FS polling-result loop is the quiet interval:
+sequence 2448 finishes successfully at 48.429378 (eden.txt:5166), and sequence
+2449 only starts at 55.196181 (:5167). There is no outstanding AM/FS request
+through those 6.766803 seconds. The first request in the gap is not until
+33.975608 (:3669), 4.534684 seconds after the last presentation. The final
+copyright initialization at 68.610348 (:13004) is followed by normal display
+initialization and the next presentation, rather than a logged service failure.
+
+The wait recorder shows what thread 82 does between service calls:
+
+| diag.txt line | Token | SVC | Requested argument | Observed active age |
+| --- | ---: | --- | --- | ---: |
+| 304 | 237833 | 11 / SleepThread | 0x186a0 = 100,000 ns | 1 ms |
+| 414 | 615425 | 11 / SleepThread | 0x186a0 = 100,000 ns | 1 ms |
+| 524 | 718862 | 11 / SleepThread | 0x186a0 = 100,000 ns | 1 ms |
+| 634 | 775807 | 29 / SignalProcessWideKey | guest condition-variable key | 0 ms |
+| 747 | 856241 | 11 / SleepThread | 0x186a0 = 100,000 ns | 1 ms |
+
+Different tokens mean repeated short sleeps, not one outstanding 40-second
+SleepThread. Ages are samples, not a distribution of actual sleep durations.
+Thread 102's IStorage tokens also advance (diag.txt:347, :457, :567, :677,
+:790); these are completed calls or a newly active 10 ms call, not an unchanged
+blocked storage request. Thread 124 changes PCs and remains runnable in several
+samples (:404, :514, :624). The inference is that the main thread is waiting for
+guest work while workers continue; the work and completion condition are unknown.
+This does not prove a guest timeout, decompression, or a missing event signal.
+The GPU counters at :627-628 have no pending query or syncpoint; :629 reports
+no dropped wait records. Those counters do not cover every possible dependency.
+
+Source audit: `fsp/fs_i_storage.cpp::Read` validates the requested range, reads
+the backend synchronously, and returns success only for an exact-length read.
+`am/service/common_state_getter.cpp::GetOperationMode` returns the configured
+docked/handheld value, not readiness. Neither method waits for or signals a
+completion event. The trace intentionally omits IPC payloads, offsets, lengths,
+backend identity and filenames. Repeated command 0 therefore cannot establish
+repeated reads of the *same bytes*, an archive's size, or decompression cost.
+
+`service.cpp::InvokeRequest` has a conditional 600 us host sleep for IStorage
+reads when the owner has an active NVDEC channel. It is inside the measured
+scope. 3,492 of thread 102's 4,337 read scopes are shorter than 600 us, so this
+is not an unconditional delay on these reads; the capture does not show channel
+state. Removing it would not explain the 6.77-second interval without requests
+or establish a fix for the full gap. It was left unchanged.
+
+**Fix decision / expected effect:** no evidence-backed correction in
+`src/core/hle/service/**` was found. No runtime improvement is claimed and no
+regression test for an invented service failure was added. To distinguish guest
+decompression/work from a guest deadline or a lost notification, the missing
+evidence is the guest caller/worker stack or PC profile and the condition checked
+around LR `0x82ea50e8`, correlated with read offsets/lengths/backend and completion
+events. Changing a successful result or signaling an unrelated event would mask
+the unknown dependency rather than correct it.
+
+Related validation: the existing AM/FS trace tests (5), FSP exact-read test (1),
+wait diagnostic tests (4), and service runtime tests (2) pass. Full-suite results
+from the single `python3 -m unittest discover -s tests/port` run: 949 tests in
+540.800 seconds, **FAILED (failures=1, errors=4, skipped=44)**. The two allowed
+fontTools import errors are `test_button_layout` and `test_xbox_button_icons`.
+Three additional failures in unchanged renderer code/tests mean the requested
+acceptance criterion was **not met**:
+
+- `test_d3d12_root_binding_batch.test_production_batch_matches_individual_binds`
+  and `test_d3d12_vertex_binding_prefix.test_native_layout_replay_and_stream_size`:
+  `d3d12_record_stream.h:278` has a `destination` parameter shadowing its field,
+  rejected by `-Werror,-Wshadow`.
+- `test_d3d12_guest_visibility.test_query_counters_cover_completion_invalidation_and_immediate_payload`:
+  the extracted-method harness lacks `D3D12::QueryCacheParams` and
+  `Core::Timing::Trace` declarations. A targeted diagnostic rerun after the full
+  suite exposed the captured compiler stderr; it fails again with those errors.
+
+Full output: `/tmp/nxbox-dbsz-poll-full-suite.log`. Only this document was changed;
+no commit, service fix or new test was made in this follow-up.
+
+## Earlier capture
+
 Source: read-only `compat-2026-10-18/q-dbsz-np/{eden,diag,crash}.txt`,
 examined 2026-10-20. Window indices here are zero-based `GAME_PRESENT` indices.
 No console rerun was performed. This investigation does **not** establish a
