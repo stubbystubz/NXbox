@@ -9,13 +9,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <bit>
 #include <cstring>
 #include <vector>
 
 #include "common/assert.h"
-#include <bit>
 #include "common/common_types.h"
-
+#include "common/logging.h"
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/common/safe_ops.h"
@@ -234,19 +234,33 @@ struct ExceptionHandler::Impl final {
         rfuncs_w->EndAddress = static_cast<DWORD>(code.GetTotalCodeSize());
         rfuncs_w->UnwindData = static_cast<DWORD>(reinterpret_cast<u8*>(unwind_info) - code.getCode());
 
-        RtlAddFunctionTable(rfuncs, 1, reinterpret_cast<DWORD64>(code.getCode()));
+        registered = RtlAddFunctionTable(rfuncs, 1, reinterpret_cast<DWORD64>(code.getCode())) != 0;
+#ifdef YUZU_UWP_APPCONTAINER
+        LOG_INFO(Core_ARM, "NXBOX FASTMEM handler=seh unwind_registered={} fallback={}",
+                 registered, registered ? "none" : "page_table");
+#endif
+    }
+
+    bool IsRegistered() const noexcept {
+        return registered;
     }
 
     void SetCallback(std::function<FakeCall(u64)> new_cb) {
+        if (!registered) {
+            return;
+        }
         cb = new_cb;
         except_info->ExceptionHandler = cb ? exception_handler_with_cb_offset : exception_handler_without_cb_offset;
     }
 
     ~Impl() {
-        RtlDeleteFunctionTable(rfuncs);
+        if (registered) {
+            RtlDeleteFunctionTable(rfuncs);
+        }
     }
 
 private:
+    bool registered{};
     RUNTIME_FUNCTION* rfuncs;
     std::function<FakeCall(u64)> cb;
     UNW_EXCEPTION_INFO* except_info;
@@ -262,7 +276,7 @@ void ExceptionHandler::Register(BlockOfCode& code) {
 }
 
 bool ExceptionHandler::SupportsFastmem() const noexcept {
-    return static_cast<bool>(impl);
+    return impl && impl->IsRegistered();
 }
 
 void ExceptionHandler::SetFastmemCallback(std::function<FakeCall(u64)> cb) {

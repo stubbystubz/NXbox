@@ -434,6 +434,9 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
                               Settings::values.cpu_accuracy.GetValue() ==
                                       Settings::CpuAccuracy::Auto &&
                                   !m_system.DebuggerEnabled());
+    // UWP reserves the guest address space, not all host addresses. Keep guest
+    // bounds checks even in Auto/Unsafe so an invalid guest address cannot hit host memory.
+    config.fastmem_address_space_bits = std::uint32_t(address_space_bits);
     LOG_INFO(Core_ARM,
              "NXBOX FAULT CONFIG core={} accuracy={} optimizations={:#x} unsafe={} "
              "page_table={} fastmem={} fastmem_exclusives={} wall_clock={} "
