@@ -980,7 +980,10 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         for (const auto& desc : info->image_descriptors) {
             for (u32 i = 0; i < desc.count; ++i)
                 view_scratch.push_back(
-                    {.index = read_handle(desc, i).first, .blacklist = desc.is_written, .id = {}});
+                    {.index = read_handle(desc, i).first,
+                     .blacklist = desc.is_written,
+                     .id = {},
+                     .format_override = PixelFormatFromImageFormat(desc.format)});
         }
     }
     draw_phase.emplace(context.Profile(), FramePhase::ImageViews);
@@ -1855,9 +1858,12 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                         return;
                     }
                 }
-                descriptors.WriteImageUav(
-                    uav_table, uav_i, view,
-                    static_cast<DXGI_FORMAT>(MaxwellFormat(guest_format).view_format));
+                if (!descriptors.WriteImageUav(
+                        uav_table, uav_i, view,
+                        static_cast<DXGI_FORMAT>(MaxwellFormat(guest_format).view_format))) {
+                    SkipDraw("unsupported graphics storage image view");
+                    return;
+                }
                 need(view.ImageHandle(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
             }
         }
@@ -3046,6 +3052,7 @@ void RasterizerD3D12::DrawTexture() {
         const auto sampler_table = descriptors.AllocateSamplers(1);
         const auto rtv = descriptors.AllocateRtv(1);
         descriptors.WriteNullCbv(tables, 0);
+        context.ValidateViewFormat(sampled, description.Format, "CreateShaderResourceView");
         context.Device()->CreateShaderResourceView(sampled->handle.Get(), &description,
                                                    tables.Slot(1));
         TraceApiCall(context.Device(), "CreateShaderResourceView(copy)", sampled->handle.Get(),
@@ -3288,6 +3295,8 @@ void RasterizerD3D12::Clear(u32 layer_count) try {
                     desc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
                     desc.Texture2DArray = {mip, first + layer, 1};
                 }
+                context.ValidateViewFormat(attachment.resource, desc.Format,
+                                           "CreateDepthStencilView");
                 context.Device()->CreateDepthStencilView(attachment.resource->handle.Get(), &desc,
                                                          attachment.descriptor);
                 TraceApiCall(context.Device(), "CreateDepthStencilView(layer)",
@@ -3307,6 +3316,8 @@ void RasterizerD3D12::Clear(u32 layer_count) try {
                     desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                     desc.Texture2DArray = {mip, first + layer, 1, 0};
                 }
+                context.ValidateViewFormat(attachment.resource, desc.Format,
+                                           "CreateRenderTargetView");
                 context.Device()->CreateRenderTargetView(attachment.resource->handle.Get(), &desc,
                                                          attachment.descriptor);
                 TraceApiCall(context.Device(), "CreateRenderTargetView(layer)",
@@ -3400,9 +3411,15 @@ void RasterizerD3D12::DispatchCompute() try {
     };
     const auto gather = [&](const auto& descs, bool written) {
         for (const auto& desc : descs)
-            for (u32 i = 0; i < desc.count; ++i)
-                view_scratch.push_back(
-                    {.index = handle(desc, i).first, .blacklist = written, .id = {}});
+            for (u32 i = 0; i < desc.count; ++i) {
+                std::optional<VideoCore::Surface::PixelFormat> format;
+                if constexpr (requires { desc.format; })
+                    format = PixelFormatFromImageFormat(desc.format);
+                view_scratch.push_back({.index = handle(desc, i).first,
+                                        .blacklist = written,
+                                        .id = {},
+                                        .format_override = format});
+            }
     };
     gather(info.texture_buffer_descriptors, false);
     gather(info.image_buffer_descriptors, true);

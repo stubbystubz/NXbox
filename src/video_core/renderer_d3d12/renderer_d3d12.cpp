@@ -286,6 +286,8 @@ struct RendererD3D12::Impl {
             auto gpu_handle = srv_heap->GetGPUDescriptorHandleForHeapStart();
             cpu.ptr += static_cast<SIZE_T>(slot) * srv_stride;
             gpu_handle.ptr += static_cast<UINT64>(slot++) * srv_stride;
+            context.ValidateViewFormat(texture.resource, texture.view.Format,
+                                       "CreateShaderResourceView");
             context.Device()->CreateShaderResourceView(texture.resource->handle.Get(),
                                                        &texture.view, cpu);
             TraceApiCall(context.Device(), "CreateShaderResourceView(present)",

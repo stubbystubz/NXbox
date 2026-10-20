@@ -444,6 +444,7 @@ struct BlitImageHelper::Impl {
             srv.Texture2DArray.FirstArraySlice = src.layer;
             srv.Texture2DArray.ArraySize = 1;
         }
+        context.ValidateViewFormat(src.resource, srv.Format, "CreateShaderResourceView");
         context.Device()->CreateShaderResourceView(src.resource->handle.Get(), &srv, cpu);
         TraceApiCall(context.Device(), "CreateShaderResourceView(blit)", src.resource->handle.Get(),
                      &srv, sizeof(srv));
@@ -460,6 +461,8 @@ struct BlitImageHelper::Impl {
                 srv.Texture2DArray.FirstArraySlice = 0;
             }
         }
+        context.ValidateViewFormat(src.format.planes > 1 ? src.resource : nullptr, srv.Format,
+                                   "CreateShaderResourceView(stencil)");
         context.Device()->CreateShaderResourceView(
             src.format.planes > 1 ? src.resource->handle.Get() : nullptr, &srv, cpu);
         TraceApiCall(context.Device(), "CreateShaderResourceView(blit stencil)",
@@ -475,6 +478,7 @@ struct BlitImageHelper::Impl {
                 dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
                 dsv.Texture2DArray = {dst.level, dst.layer, 1};
             }
+            context.ValidateViewFormat(dst.resource, dsv.Format, "CreateDepthStencilView");
             context.Device()->CreateDepthStencilView(dst.resource->handle.Get(), &dsv, target);
             TraceApiCall(context.Device(), "CreateDepthStencilView(blit)", dst.resource->handle.Get(),
                          &dsv, sizeof(dsv));
@@ -488,6 +492,7 @@ struct BlitImageHelper::Impl {
                 rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
                 rtv.Texture2DArray = {dst.level, dst.layer, 1, 0};
             }
+            context.ValidateViewFormat(dst.resource, rtv.Format, "CreateRenderTargetView");
             context.Device()->CreateRenderTargetView(dst.resource->handle.Get(), &rtv, target);
             TraceApiCall(context.Device(), "CreateRenderTargetView(blit)", dst.resource->handle.Get(),
                          &rtv, sizeof(rtv));

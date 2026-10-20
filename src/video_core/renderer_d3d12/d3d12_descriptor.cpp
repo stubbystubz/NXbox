@@ -562,6 +562,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12DescriptorAllocator::ResolveDescriptor(
                     context.CurrentTick(), static_cast<UINT>(srv.ViewDimension),
                     static_cast<UINT>(srv.Format), words));
             }
+            context.ValidateViewFormat(resource, srv.Format, "CreateShaderResourceView");
             context.Device()->CreateShaderResourceView(resource ? resource->handle.Get() : nullptr,
                                                        &srv, handle);
             TraceApiCall(context.Device(), "CreateShaderResourceView",
@@ -571,6 +572,7 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12DescriptorAllocator::ResolveDescriptor(
         case 2: {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
             std::memcpy(&uav, desc, sizeof(uav));
+            context.ValidateViewFormat(resource, uav.Format, "CreateUnorderedAccessView");
             context.Device()->CreateUnorderedAccessView(resource ? resource->handle.Get() : nullptr,
                                                         nullptr, &uav, handle);
             TraceApiCall(context.Device(), "CreateUnorderedAccessView",
@@ -1015,6 +1017,7 @@ void D3D12DescriptorAllocator::CreateRtv(D3D12_CPU_DESCRIPTOR_HANDLE handle,
         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
         rtv.Texture2DArray = {level, layer, layers, 0};
     }
+    context.ValidateViewFormat(resource, rtv.Format, "CreateRenderTargetView");
     context.Device()->CreateRenderTargetView(resource->handle.Get(), &rtv, handle);
     TraceApiCall(context.Device(), "CreateRenderTargetView", resource->handle.Get(), &rtv, sizeof(rtv));
 }
@@ -1040,6 +1043,7 @@ void D3D12DescriptorAllocator::CreateDsv(D3D12_CPU_DESCRIPTOR_HANDLE handle, con
             static_cast<UINT>(view.range.base.level), static_cast<UINT>(view.range.base.layer),
             layer_count ? layer_count : static_cast<UINT>(view.range.extent.layers)};
     }
+    context.ValidateViewFormat(resource, dsv.Format, "CreateDepthStencilView");
     context.Device()->CreateDepthStencilView(resource->handle.Get(), &dsv, handle);
     TraceApiCall(context.Device(), "CreateDepthStencilView", resource->handle.Get(), &dsv, sizeof(dsv));
 }

@@ -903,7 +903,7 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo& inf
     }
     if (!view_info.Supported() ||
         (!VideoCore::Surface::IsPixelFormatASTC(info.format) &&
-         view_info.resource_format != image.HostFormat().resource_format)) {
+         !resource->SupportsViewFormat(static_cast<DXGI_FORMAT>(view_info.view_format)))) {
         UnsupportedImage(image.info, image.HostFormat(), "incompatible texture view cast");
         resource.reset();
         return;
@@ -1034,6 +1034,20 @@ void ImageView::LogUnsupported(std::string_view condition) const {
     info.num_samples = sample_count;
     info.type = image_type;
     UnsupportedImage(info, HostFormat(), condition);
+}
+bool TextureCacheRuntime::CanViewFormat(const ImageView& view,
+                                        VideoCore::Surface::PixelFormat format) const {
+    if (view.IsBuffer())
+        return true;
+    const auto resource = view.ImageHandle();
+    if (!resource || !(resource->Description().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return false;
+    const auto host = MaxwellFormat(format);
+    return host.Supported() &&
+           (format == view.format || (view.HostFormat().conversion == FormatConversion::None &&
+                                      !view.HostFormat().converted_astc &&
+                                      !VideoCore::Surface::IsPixelFormatASTC(view.format))) &&
+           resource->SupportsViewFormat(static_cast<DXGI_FORMAT>(host.view_format));
 }
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
     if (image.Handle())

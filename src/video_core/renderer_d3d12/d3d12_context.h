@@ -21,6 +21,7 @@
 #include <vector>
 #include "common/gpu_thread_profile.h"
 #include "video_core/renderer_d3d12/d3d12_flush_policy.h"
+#include "video_core/renderer_d3d12/d3d12_format_cast.h"
 #include "video_core/renderer_d3d12/d3d12_memory_budget.h"
 #include "video_core/renderer_d3d12/d3d12_recording_progress.h"
 
@@ -405,6 +406,10 @@ struct Resource {
         return *description;
     }
     mutable std::optional<D3D12_RESOURCE_DESC> description;
+    std::vector<std::uint32_t> castable_formats;
+    bool SupportsViewFormat(DXGI_FORMAT format) const {
+        return CompatibleViewFormat(Description().Format, format, castable_formats);
+    }
     D3D12_RESOURCE_STATES state{};
     // Empty means uniform; otherwise state is superseded by per-subresource states.
     std::vector<D3D12_RESOURCE_STATES> sub_states;
@@ -562,6 +567,8 @@ public:
     void AfterCompletion(std::function<void()> callback);
     ResourcePtr CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE heap,
                                D3D12_RESOURCE_STATES state);
+    void ValidateViewFormat(const ResourcePtr& resource, DXGI_FORMAT format,
+                            const char* call) const;
     ResourcePtr CreateBuffer(u64 size, D3D12_HEAP_TYPE heap);
     ID3D12Device* Device() const {
         return device.Get();
@@ -602,6 +609,9 @@ private:
     ComPtr<ID3D12GraphicsCommandList1> extended1;
     ComPtr<ID3D12GraphicsCommandList8> extended8;
     bool typed_uav_load_additional_formats{};
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    ComPtr<ID3D12Device10> casting_device;
+#endif
     void CrossListCopyBarrier(Resource& resource, u64 tick, u64 offset, u64 size);
 #ifndef NXBOX_UWP
     u64 device_local_memory{};

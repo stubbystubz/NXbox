@@ -31,6 +31,7 @@
 #include "video_core/renderer_d3d12/d3d12_completion.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 #include "video_core/renderer_d3d12/d3d12_footprint.h"
+#include "video_core/renderer_d3d12/d3d12_formats.h"
 #include "video_core/renderer_d3d12/d3d12_ring_allocator.h"
 
 namespace D3D12 {
@@ -905,6 +906,17 @@ Context::Context() {
     const bool minmax =
         have_options && options.TiledResourcesTier >= D3D12_TILED_RESOURCES_TIER_2;
     typed_uav_load_additional_formats = have_options && options.TypedUAVLoadAdditionalFormats;
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    D3D12_FEATURE_DATA_D3D12_OPTIONS12 options12{};
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, &options12,
+                                              sizeof(options12))) &&
+        options12.EnhancedBarriersSupported && options12.RelaxedFormatCastingSupported) {
+        device.As(&casting_device);
+    }
+    Diagnostic(fmt::format("D3D12 relaxed format casting={}", casting_device ? 1 : 0));
+#else
+    Diagnostic("D3D12 relaxed format casting=0 (SDK lacks ID3D12Device10)");
+#endif
     SetMinMaxFilteringSupported(minmax);
     Diagnostic(fmt::format("D3D12 tiled resources tier={} minmax_filtering={}",
                            have_options ? static_cast<int>(options.TiledResourcesTier) : -1,
@@ -1938,13 +1950,90 @@ ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_
     D3D12_HEAP_PROPERTIES properties{};
     properties.Type = heap;
     properties.CreationNodeMask = properties.VisibleNodeMask = 1;
-    auto result = device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state,
-                                                  nullptr, IID_PPV_ARGS(&resource->handle));
+    const auto create = [&]() -> HRESULT {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+        const auto layout =
+            state == D3D12_RESOURCE_STATE_COMMON          ? D3D12_BARRIER_LAYOUT_COMMON
+            : state == D3D12_RESOURCE_STATE_COPY_DEST     ? D3D12_BARRIER_LAYOUT_COPY_DEST
+            : state == D3D12_RESOURCE_STATE_COPY_SOURCE   ? D3D12_BARRIER_LAYOUT_COPY_SOURCE
+            : state == D3D12_RESOURCE_STATE_RENDER_TARGET ? D3D12_BARRIER_LAYOUT_RENDER_TARGET
+                                                          : D3D12_BARRIER_LAYOUT_UNDEFINED;
+        if (casting_device && heap == D3D12_HEAP_TYPE_DEFAULT &&
+            layout != D3D12_BARRIER_LAYOUT_UNDEFINED &&
+            desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && desc.SampleDesc.Count == 1 &&
+            !(desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) {
+            std::vector<DXGI_FORMAT> formats;
+            const auto storage = std::ranges::find(FormatTable, static_cast<u32>(desc.Format),
+                                                   &FormatInfo::resource_format);
+            if (storage != FormatTable.end() && storage->block_width == 1 &&
+                storage->block_height == 1 && !storage->depth) {
+                for (const auto& candidate : FormatTable) {
+                    if (candidate.depth || candidate.converted_astc ||
+                        candidate.conversion != FormatConversion::None ||
+                        candidate.block_width != 1 || candidate.block_height != 1 ||
+                        candidate.bytes_per_block != storage->bytes_per_block)
+                        continue;
+                    const auto format = static_cast<DXGI_FORMAT>(candidate.view_format);
+                    if (std::ranges::find(formats, format) != formats.end())
+                        continue;
+                    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{format};
+                    const auto dimension = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D
+                                               ? D3D12_FORMAT_SUPPORT1_TEXTURE1D
+                                           : desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+                                               ? D3D12_FORMAT_SUPPORT1_TEXTURE3D
+                                               : D3D12_FORMAT_SUPPORT1_TEXTURE2D;
+                    // Preserve native-family SRVs (notably sRGB on an UAV-capable
+                    // typeless resource); each descriptor still needs usage support.
+                    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                           sizeof(support))) ||
+                        !(support.Support1 & dimension) ||
+                        (FormatFamily(format) != FormatFamily(desc.Format) &&
+                         (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) &&
+                           !(support.Support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET)) ||
+                          ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) &&
+                           !(support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)))))
+                        continue;
+                    formats.push_back(format);
+                }
+            }
+            if (!formats.empty()) {
+                D3D12_RESOURCE_DESC1 extended{};
+                extended.Dimension = desc.Dimension;
+                extended.Alignment = desc.Alignment;
+                extended.Width = desc.Width;
+                extended.Height = desc.Height;
+                extended.DepthOrArraySize = desc.DepthOrArraySize;
+                extended.MipLevels = desc.MipLevels;
+                extended.Format = desc.Format;
+                extended.SampleDesc = desc.SampleDesc;
+                extended.Layout = desc.Layout;
+                extended.Flags = desc.Flags;
+                const auto result = casting_device->CreateCommittedResource3(
+                    &properties, D3D12_HEAP_FLAG_NONE, &extended, layout, nullptr, nullptr,
+                    static_cast<UINT32>(formats.size()), formats.data(),
+                    IID_PPV_ARGS(&resource->handle));
+                if (SUCCEEDED(result)) {
+                    resource->castable_formats.assign(formats.begin(), formats.end());
+                    return result;
+                }
+                // A driver can reject a particular list even with OPTIONS12 support.
+                // Keep the legacy resource and let the cache select synchronized aliases.
+                if (result != E_INVALIDARG && result != DXGI_ERROR_UNSUPPORTED)
+                    return result;
+                Check(device->GetDeviceRemovedReason(), "format casting device removed",
+                      device.Get());
+                resource->handle.Reset();
+            }
+        }
+#endif
+        return device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state,
+                                               nullptr, IID_PPV_ARGS(&resource->handle));
+    };
+    auto result = create();
     if (result == E_OUTOFMEMORY) {
         Finish(FrameCount::ForcedSubmitAllocationRetry);
         BufferPool(budget)->Trim();
-        result = device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state,
-                                                 nullptr, IID_PPV_ARGS(&resource->handle));
+        result = create();
     }
     Check(result, "CreateCommittedResource after fence retirement", device.Get());
     resource->heap = heap;
@@ -1960,6 +2049,23 @@ ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_
         resource->mapped = {static_cast<u8*>(mapped), static_cast<size_t>(desc.Width)};
     }
     return resource;
+}
+void Context::ValidateViewFormat(const ResourcePtr& resource, DXGI_FORMAT format,
+                                 const char* call) const {
+    // Buffer descriptors use structured/raw/typed rules instead of texture families.
+    if (!resource || resource->Description().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ||
+        resource->SupportsViewFormat(format))
+        return;
+    facade.validation.ViewFormat(call, resource->Description().Format, format,
+                                 resource->castable_formats);
+    const auto message =
+        fmt::format("D3D12_VALIDATION invalid tick={} call={} resource_format={} view_format={} "
+                    "resource_family={} view_family={} castable_count={}",
+                    CurrentTick(), call, static_cast<u32>(resource->Description().Format),
+                    static_cast<u32>(format), FormatFamily(resource->Description().Format),
+                    FormatFamily(format), resource->castable_formats.size());
+    // Never send a known-invalid descriptor to the runtime, even with validation off.
+    throw std::invalid_argument(message);
 }
 ResourcePtr Context::CreateBuffer(u64 size, D3D12_HEAP_TYPE heap) {
     D3D12_RESOURCE_DESC desc{};

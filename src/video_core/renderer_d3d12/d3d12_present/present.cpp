@@ -169,6 +169,7 @@ struct Presenter::Impl {
         auto gpu = srv_heap->GetGPUDescriptorHandleForHeapStart();
         cpu.ptr += static_cast<SIZE_T>(cursor) * srv_stride;
         gpu.ptr += static_cast<UINT64>(cursor++) * srv_stride;
+        context.ValidateViewFormat(source, view.Format, "CreateShaderResourceView");
         context.Device()->CreateShaderResourceView(source->handle.Get(), &view, cpu);
         context.InvalidateRecordedState();
         auto* commands = context.Commands();
