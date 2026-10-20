@@ -27,12 +27,14 @@
 #include <dxgi1_4.h>
 #endif
 #include "common/logging.h"
+#include "common/nxbox_sim_series_s.h"
 #include "common/thread.h"
 #include "video_core/renderer_d3d12/d3d12_completion.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 #include "video_core/renderer_d3d12/d3d12_footprint.h"
 #include "video_core/renderer_d3d12/d3d12_formats.h"
 #include "video_core/renderer_d3d12/d3d12_ring_allocator.h"
+#include "video_core/renderer_d3d12/d3d12_sim_series_s.h"
 
 namespace D3D12 {
 // Second list and its allocator ring are exclusively mutated by the second recorder.
@@ -1015,7 +1017,10 @@ Context::Context() {
         record_descriptors = std::make_unique<RecordDescriptors>();
         record_descriptors->Initialize(device.Get());
         facade.descriptors = record_descriptors.get();
-        facade.parallel_enabled = BisectEnabled("NXBOX_D3D12_PARALLEL_RECORD");
+        // Timestamp segments must bracket all work in a submission. Parallel recording
+        // executes its second list after the first list's closing timestamp.
+        facade.parallel_enabled =
+            BisectEnabled("NXBOX_D3D12_PARALLEL_RECORD") && !NxboxSimSeriesS::Settings().enabled;
         if (facade.parallel_enabled) {
             facade.parallel_descriptors = std::make_shared<RecordDescriptors>();
             facade.parallel_descriptors->Initialize(device.Get());
@@ -1042,6 +1047,19 @@ Context::Context() {
     } else {
         InitializeLists();
         facade.immediate = commands.Get();
+    }
+    if (NxboxSimSeriesS::Settings().enabled) {
+        try {
+            sim_series_s = std::make_unique<SimSeriesS>(*this);
+        } catch (...) {
+            // Context's destructor will not run if opt-in shader/resource creation fails.
+            // Stop the recorder before unwinding its joinable std::thread member.
+            if (recorder.joinable()) {
+                stream->Close();
+                recorder.join();
+            }
+            throw;
+        }
     }
 }
 void Context::InitializeLists() {
@@ -1446,6 +1464,8 @@ CommandFacade* Context::Commands() {
         }
     }
     // A completion callback may have started the next command list.
+    if (!recording && sim_series_s)
+        sim_series_s->PrepareFrame();
     if (!recording) {
         if (deferred) {
             CheckRecorder();
@@ -1474,8 +1494,14 @@ CommandFacade* Context::Commands() {
                 static_cast<UINT>(
                     (deferred ? (CurrentTick() - 1) % allocators.size() : allocator_index) * 2));
         }
+        if (sim_series_s)
+            sim_series_s->BeginSegment(facade);
     }
     return &facade;
+}
+void Context::SimulateSeriesSFrame() {
+    if (sim_series_s)
+        sim_series_s->EndFrame();
 }
 void Context::MarkWork(std::string_view label) {
     Commands();
@@ -1512,6 +1538,8 @@ u64 Context::Submit(FrameCount reason) {
     } failure_flag{submit_failed};
     if (before_submit)
         before_submit();
+    if (sim_series_s && recording)
+        sim_series_s->EndSegment(facade);
     const FrameProfile::Scope profile_submit{profile, FramePhase::Submit};
     if (deferred) {
         try {

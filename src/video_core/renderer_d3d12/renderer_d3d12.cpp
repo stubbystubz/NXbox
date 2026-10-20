@@ -415,6 +415,7 @@ struct RendererD3D12::Impl {
         const UINT index = swapchain->GetCurrentBackBufferIndex();
         Draw(layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
+        context.SimulateSeriesSFrame();
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
