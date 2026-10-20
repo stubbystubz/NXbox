@@ -122,10 +122,16 @@ std::chrono::milliseconds PsoWaitBudget() {
     return budget;
 }
 
+bool NonBlockingPsoEnabled() {
+    // Explicit opt-in: small draws and dispatches can bake persistent textures only once.
+    // Keep the established compatibility policy until full-async rendering is verified per game.
+    const char* value = std::getenv("NXBOX_D3D12_ASYNC_PSO");
+    return value && std::string_view{value} == "1";
+}
+
 bool FrameBoundedPsoEnabled() {
-    // Opt in: timing out protected one-time draws sooner can leave persistent textures missing.
-    static const bool enabled = BisectEnabled("NXBOX_D3D12_PSO_FRAME_BUDGET");
-    return enabled;
+    // Also moves compute translation off the GPU thread in the explicit async mode.
+    return NonBlockingPsoEnabled() || BisectEnabled("NXBOX_D3D12_PSO_FRAME_BUDGET");
 }
 
 size_t RuntimePsoThreads() {
@@ -1036,16 +1042,16 @@ std::shared_ptr<GraphicsPipeline> BuildAsyncGraphics(
     u32 guest_topology, const Maxwell& regs, const Pso::FramebufferFormats& formats,
     const std::array<u64, 6>& guest_hashes,
     std::array<std::unique_ptr<Shader::Environment>, 6>& environments,
-    const GraphicsPipelineKey& request) {
+    const GraphicsPipelineKey& request, bool profile_build) {
     const u64 request_hash = Pso::HashBytes(&request, sizeof(request));
     // Async jobs that never return jam the worker pool; this shows the phase each one is stuck in.
     static const bool trace = BisectEnabled("NXBOX_D3D12_PSO_TRACE");
     PsoBuildStats trace_stats;
     std::optional<ScopedPsoBuildStats> collect;
-    if (trace)
+    if (trace || profile_build)
         collect.emplace(trace_stats);
-    const auto compile_start =
-        trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto compile_start = trace || profile_build ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
     const auto mark = [&](std::string_view phase) {
         if (trace) {
             const auto elapsed = std::chrono::duration<double, std::milli>(
@@ -1168,6 +1174,8 @@ std::shared_ptr<GraphicsPipeline> BuildAsyncGraphics(
     if (PsoNormalizeEnabled())
         Pso::NormalizeGraphicsState(state);
 
+    const auto translation_end = trace || profile_build ? std::chrono::steady_clock::now()
+                                                        : std::chrono::steady_clock::time_point{};
     thread_local DxcCache compiler;
     std::vector<StageProgram> compiled;
     DescriptorCounts total;
@@ -1196,11 +1204,19 @@ std::shared_ptr<GraphicsPipeline> BuildAsyncGraphics(
                                            native_key, recipe, stream_output.Description(state));
     pipeline->SetRootCbvs(UseRootCbvs(total.cbv));
     mark("done");
-    if (trace)
-        Diagnostic(fmt::format("PSO_BUILD_COST request={:016x} driver_builds={} dxc_ms={:.3f} "
-                               "root_signature_ms={:.3f} driver_ms={:.3f}",
-                               request_hash, trace_stats.driver_builds, trace_stats.dxc_us / 1000.0,
-                               trace_stats.root_us / 1000.0, trace_stats.driver_us / 1000.0));
+    if (trace || profile_build)
+        Diagnostic(fmt::format(
+            "PSO_BUILD_COST request={:016x} kind=graphics driver_builds={} "
+            "translation_emit_ms={:.3f} dxc_ms={:.3f} root_signature_ms={:.3f} driver_ms={:.3f} "
+            "wall_ms={:.3f} dxil_disk_hits={} dxil_disk_misses={} dxil_memory_hits={}",
+            request_hash, trace_stats.driver_builds,
+            std::chrono::duration<double, std::milli>(translation_end - compile_start).count(),
+            trace_stats.dxc_us / 1000.0, trace_stats.root_us / 1000.0,
+            trace_stats.driver_us / 1000.0,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                      compile_start)
+                .count(),
+            trace_stats.disk_hits, trace_stats.disk_misses, trace_stats.memory_hits));
     ReportSlowPso(native_key, native_start, signature.Get(), total, stages, compiled);
     if (feedback)
         pipeline->SetTransformFeedback(*feedback);
@@ -1218,8 +1234,9 @@ std::shared_ptr<GraphicsPipeline> BuildAsyncGraphics(
                 WriteInfo(metadata, *info);
         }
         WriteFeedback(metadata, pipeline->TransformFeedbackInfo());
-        disk->RememberPipeline({DiskRecordKind::Graphics, native_key, recipe, RequestBytes(request),
-                                std::move(metadata)});
+        if (!disk->RememberPipeline({DiskRecordKind::Graphics, native_key, recipe,
+                                     RequestBytes(request), std::move(metadata)}))
+            Diagnostic(fmt::format("D3D12 PSO recipe write failed request={:016x}", request_hash));
     }
     return pipeline;
 }
@@ -1353,12 +1370,28 @@ void PipelineCache::RecordGraphicsDraw(u64 frame) {
     rt_draw_history.Record(rt0.Address(), frame);
 }
 
+std::unique_ptr<PipelineCache::AsyncCache> PipelineCache::CreateAsyncCache() {
+    // Raise scheduling priority without adding another DXC instance on memory-limited UWP.
+    // Preserve user overrides and the pool's temporary ABOVE_NORMAL boost for waiters.
+    return std::make_unique<AsyncCache>(RuntimePsoThreads(), 4, std::chrono::seconds{5}, 4,
+                                        [](AsyncCache::NativeHandle handle, int priority) {
+                                            if (priority == THREAD_PRIORITY_BELOW_NORMAL &&
+                                                !std::getenv("NXBOX_D3D12_PSO_WORKER_PRIORITY"))
+                                                priority = THREAD_PRIORITY_NORMAL;
+                                            AsyncCache::SetPriority(handle, priority);
+                                        });
+}
+
 void PipelineCache::TickFrame() {
     std::scoped_lock lock{pipeline_mutex};
     pso_frame_budget.Reset();
 }
 
 std::chrono::steady_clock::duration PipelineCache::PendingPsoWaitBudget() {
+    // An explicit async-PSO opt-in drops every pending draw/dispatch immediately. Keep
+    // compiling its immutable snapshot; later requests install the completed pipeline.
+    if (NonBlockingPsoEnabled())
+        return std::chrono::steady_clock::duration::zero();
     return FrameBoundedPsoEnabled() ? pso_frame_budget.Remaining(PsoWaitBudget()) : PsoWaitBudget();
 }
 
@@ -1584,7 +1617,7 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
     if (AsyncPsoEnabled()) {
         try {
             if (!async)
-                async = std::make_unique<AsyncCache>(RuntimePsoThreads());
+                async = CreateAsyncCache();
             const u64 request_hash = Pso::HashBytes(&request, sizeof(request));
             if (CheckStalled(request, request_hash)) {
                 StoreGuestGraphics(request, nullptr);
@@ -1667,19 +1700,21 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
                     request,
                     [device, disk_cache = disk.get(), state, d3d_topology = topology.topology,
                      guest_topology = static_cast<u32>(maxwell3d->draw_manager.draw_state.topology),
-                     regs = maxwell3d->regs, formats, hashes = guest_hashes, snapshots, request] {
+                     regs = maxwell3d->regs, formats, hashes = guest_hashes, snapshots, request,
+                     profile_build = context.Profile().Enabled()] {
                         SetThreadDescription(GetCurrentThread(), L"D3D12 PSO compiler");
                         auto result = std::make_shared<AsyncResult>();
-                        result->graphics = BuildAsyncGraphics(device.Get(), disk_cache, state,
-                                                              d3d_topology, guest_topology, regs,
-                                                              formats, hashes, *snapshots, request);
+                        result->graphics = BuildAsyncGraphics(
+                            device.Get(), disk_cache, state, d3d_topology, guest_topology, regs,
+                            formats, hashes, *snapshots, request, profile_build);
                         return result;
                     },
                     false, !may_skip);
                 context.Profile().Count(FrameCount::GuestPipelineMisses);
             }
             if (!may_skip && pso_waited.insert(request_hash).second) {
-                static const bool trace_wait = BisectEnabled("NXBOX_D3D12_PSO_TRACE");
+                const bool trace_wait =
+                    context.Profile().Enabled() || BisectEnabled("NXBOX_D3D12_PSO_TRACE");
                 const auto wait_start = trace_wait ? std::chrono::steady_clock::now()
                                                    : std::chrono::steady_clock::time_point{};
                 const auto settled = async->WaitFor(request, PendingPsoWaitBudget());
@@ -1700,10 +1735,15 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
                         rt0.width, rt0.height, drawn_count, depth_tested));
                 }
                 if (settled.status == AsyncCache::Status::Ready) {
-                    if (settled.prewarmed && disk)
-                        disk->RememberFirstUse(RequestBytes(request));
+                    if (settled.prewarmed) {
+                        if (disk)
+                            disk->RememberFirstUse(RequestBytes(request));
+                        prewarmed_graphics.insert(request);
+                        context.Profile().Count(FrameCount::PrewarmedPsoHits);
+                    } else {
+                        context.Profile().Count(FrameCount::PsoCompiles);
+                    }
                     StoreGuestGraphics(request, settled.result->graphics.get());
-                    context.Profile().Count(FrameCount::PsoCompiles);
                     return settled.result->graphics.get();
                 }
             }
@@ -1893,7 +1933,7 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
     if (AsyncPsoEnabled()) {
         try {
             if (!async)
-                async = std::make_unique<AsyncCache>(RuntimePsoThreads());
+                async = CreateAsyncCache();
             GraphicsPipelineKey async_key{};
             async_key.stage_hashes[0] = request;
             async_key.state.sample_count =
@@ -1963,11 +2003,17 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
                 if (disk)
                     disk->RememberFirstUse(RequestBytes(async_key));
                 auto job = [device, disk_cache = disk.get(), snapshot, prepared,
-                            skip_global_fallback, shader_hash = shader->unique_hash, request] {
+                            skip_global_fallback, shader_hash = shader->unique_hash, request,
+                            profile_build = context.Profile().Enabled()] {
                     SetThreadDescription(GetCurrentThread(), L"D3D12 PSO compiler");
                     static const bool trace = BisectEnabled("NXBOX_D3D12_PSO_TRACE");
-                    const auto trace_start = trace ? std::chrono::steady_clock::now()
-                                                   : std::chrono::steady_clock::time_point{};
+                    PsoBuildStats build_stats;
+                    std::optional<ScopedPsoBuildStats> collect;
+                    if (trace || profile_build)
+                        collect.emplace(build_stats);
+                    const auto trace_start = trace || profile_build
+                                                 ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
                     const auto mark = [&](std::string_view phase) {
                         if (trace)
                             Diagnostic(fmt::format(
@@ -2005,6 +2051,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
                                            shader_hash,
                                            source,
                                            {counts.cbv, counts.srv, counts.uav, counts.sampler}};
+                    const auto translation_end = trace || profile_build
+                                                     ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
                     thread_local DxcCache compiler;
                     auto dxil =
                         compiler.Compile(source, Shader::Stage::Compute, request, disk_cache);
@@ -2030,10 +2079,29 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
                         key.state.sample_count = 0; // Same key as CurrentComputePipeline.
                         DiskBytes metadata;
                         WriteInfo(metadata, program.info);
-                        disk_cache->RememberPipeline({DiskRecordKind::Compute, native_key, recipe,
-                                                      RequestBytes(key), std::move(metadata)});
+                        if (!disk_cache->RememberPipeline({DiskRecordKind::Compute, native_key,
+                                                           recipe, RequestBytes(key),
+                                                           std::move(metadata)}))
+                            Diagnostic(fmt::format("D3D12 PSO recipe write failed request={:016x}",
+                                                   request));
                     }
                     mark("done");
+                    if (trace || profile_build)
+                        Diagnostic(fmt::format(
+                            "PSO_BUILD_COST request={:016x} kind=compute driver_builds={} "
+                            "translation_emit_ms={:.3f} dxc_ms={:.3f} root_signature_ms={:.3f} "
+                            "driver_ms={:.3f} wall_ms={:.3f} dxil_disk_hits={} dxil_disk_misses={} "
+                            "dxil_memory_hits={}",
+                            request, build_stats.driver_builds,
+                            std::chrono::duration<double, std::milli>(translation_end - trace_start)
+                                .count(),
+                            build_stats.dxc_us / 1000.0, build_stats.root_us / 1000.0,
+                            build_stats.driver_us / 1000.0,
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - trace_start)
+                                .count(),
+                            build_stats.disk_hits, build_stats.disk_misses,
+                            build_stats.memory_hits));
                     return result;
                 };
                 // Dispatches always get their one wait, so they are always queued.
@@ -2041,7 +2109,8 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
                 context.Profile().Count(FrameCount::GuestPipelineMisses);
             }
             if (pso_waited.insert(request).second) {
-                static const bool trace_wait = BisectEnabled("NXBOX_D3D12_PSO_TRACE");
+                const bool trace_wait =
+                    context.Profile().Enabled() || BisectEnabled("NXBOX_D3D12_PSO_TRACE");
                 const auto wait_start = trace_wait ? std::chrono::steady_clock::now()
                                                    : std::chrono::steady_clock::time_point{};
                 const auto settled = async->WaitFor(async_key, PendingPsoWaitBudget());
@@ -2058,10 +2127,15 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() try {
                         request, elapsed, static_cast<int>(settled.status), GetCurrentThreadId()));
                 }
                 if (settled.status == AsyncCache::Status::Ready) {
-                    if (settled.prewarmed && disk)
-                        disk->RememberFirstUse(RequestBytes(async_key));
+                    if (settled.prewarmed) {
+                        if (disk)
+                            disk->RememberFirstUse(RequestBytes(async_key));
+                        prewarmed_compute.insert(request);
+                        context.Profile().Count(FrameCount::PrewarmedPsoHits);
+                    } else {
+                        context.Profile().Count(FrameCount::PsoCompiles);
+                    }
                     guest_compute.emplace(request, settled.result->compute.get());
-                    context.Profile().Count(FrameCount::PsoCompiles);
                     return settled.result->compute.get();
                 }
             }
@@ -2180,6 +2254,12 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     disk = std::make_unique<DiskPipelineCache>(
         Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id, *identity,
         context.Device());
+    Diagnostic(
+        fmt::format("D3D12_PSO_CACHE path={} runtime_threads={} frame_budget={} explicit_async={}",
+                    (Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) / "d3d12_cache" /
+                     fmt::format("{:016x}", title_id))
+                        .string(),
+                    RuntimePsoThreads(), FrameBoundedPsoEnabled(), NonBlockingPsoEnabled()));
     stalled_path =
         Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) /
         fmt::format("{:016x}_d3d12_stalled_pso_v{}.txt", title_id, PsoNormalizeEnabled() ? 3 : 2);
@@ -2209,7 +2289,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         return;
     }
     if (async_warmup && !async)
-        async = std::make_unique<AsyncCache>(RuntimePsoThreads());
+        async = CreateAsyncCache();
     // Background callbacks own only this state, never frontend loading-scope captures.
     struct PreloadProgress {
         std::mutex mutex;
