@@ -182,7 +182,7 @@ bool IsGPUFenceBehaviorAccurate() {
 bool IsFastmemEnabled() {
 #ifdef YUZU_UWP_APPCONTAINER
     if (const char* option = std::getenv("NXBOX_FASTMEM");
-        option && std::string_view{option} == "0") {
+        !option || std::string_view{option} != "1") {
         return false;
     }
 #endif

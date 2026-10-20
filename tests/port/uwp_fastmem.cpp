@@ -405,7 +405,7 @@ bool Fault(void* address, size_t access = 1) {
     return handled;
 }
 
-int main() {
+int main() { setenv("NXBOX_FASTMEM", "1", 1); // UWP fastmem is opt-in
     using Common::g_backing_committed;
     using Common::HostMemory;
     using Common::MemoryPermission;

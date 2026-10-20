@@ -35,6 +35,7 @@ class UwpFastmemTests(unittest.TestCase):
         native_test = self.allocator_source().split("int main() {", 1)[0]
         native_test += r"""
 int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
     Mock::Reset();
     Mock::force_noaccess_alias = true;
     {
@@ -82,13 +83,13 @@ int main() {
         values.cpu_accuracy.value = accuracy;
         values.cpuopt_fastmem = values.cpuopt_unsafe_host_mmu = true;
         unsetenv("NXBOX_FASTMEM");
-        assert(IsFastmemEnabled());
+        assert(!IsFastmemEnabled()); // opt-in on UWP
         setenv("NXBOX_FASTMEM", "0", 1);
         assert(!IsFastmemEnabled());
         setenv("NXBOX_FASTMEM", "1", 1);
         assert(IsFastmemEnabled());
     }
-    unsetenv("NXBOX_FASTMEM");
+    setenv("NXBOX_FASTMEM", "1", 1);
     values.cpu_accuracy.value = CpuAccuracy::Debugging;
     values.cpuopt_fastmem = false;
     assert(!IsFastmemEnabled());

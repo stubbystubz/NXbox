@@ -552,8 +552,10 @@ public:
         const char* reason = "missing_from_app_export";
         DWORD failure_error = GetLastError();
         const char* option = std::getenv("NXBOX_FASTMEM");
-        if (option && std::string_view{option} == "0") {
-            reason = "NXBOX_FASTMEM=0";
+        // Opt-in until lazy views stop faulting host code on Series X (MK8D/Odyssey/Wonder
+        // crash at boot with the probe passing).
+        if (!option || std::string_view{option} != "1") {
+            reason = "NXBOX_FASTMEM!=1";
             failure_error = 0;
         } else if (create_section && reserve && map_view && unmap_view && protect) {
             bool ready{};
