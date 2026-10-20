@@ -487,6 +487,7 @@ namespace D3D12 {
 
 // One direct queue, bounded in-flight allocators. Every referenced resource is retained
 // until completion, including resources evicted from the shared caches.
+class SimSeriesS;
 class Context {
 public:
     Context();
@@ -494,6 +495,7 @@ public:
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
     CommandFacade* Commands();
+    void SimulateSeriesSFrame();
     void Acknowledge(u64 tick);
     // Every recording path outside the cached guest draw must invalidate before
     // recording. Resource barriers and predication do not change cached state.
@@ -620,6 +622,7 @@ private:
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
+    std::unique_ptr<SimSeriesS> sim_series_s;
     struct AllocatorSlot {
         ComPtr<ID3D12CommandAllocator> handle;
         u64 tick{};

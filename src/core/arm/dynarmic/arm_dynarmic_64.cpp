@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/nxbox_jit_cache.h"
+#include "common/nxbox_sim_series_s.h"
 #include "common/nxbox_stall.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -496,7 +497,9 @@ HaltReason ArmDynarmic64::RunThread(Kernel::KThread* thread) {
     };
 #endif
     m_jit->ClearExclusiveState();
+    const NxboxSimSeriesS::CpuTimeslice sim_timeslice;
     const auto result = m_jit->Run();
+    sim_timeslice.Finish();
 #ifdef NXBOX_UWP
     if (m_cb->m_profile.enabled) {
         m_cb->m_profile.Poll(

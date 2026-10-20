@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/nxbox_sim_series_s.h"
 #include "common/settings.h"
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_32.h"
@@ -355,7 +356,9 @@ bool ArmDynarmic32::IsInThumbMode() const {
 
 HaltReason ArmDynarmic32::RunThread(Kernel::KThread* thread) {
     m_jit->ClearExclusiveState();
+    const NxboxSimSeriesS::CpuTimeslice sim_timeslice;
     const auto result = m_jit->Run();
+    sim_timeslice.Finish();
 #ifdef NXBOX_UWP
     if (m_cb->m_profile.enabled) {
         m_cb->m_profile.Poll(
