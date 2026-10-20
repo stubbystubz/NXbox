@@ -181,6 +181,12 @@ inline bool BisectEnabled(const char* name) {
 inline void Diagnostic(const std::string&) {}
 }
 #include "video_core/renderer_d3d12/d3d12_commands.h"
+// Transport tests run with profiling off. Any sink invocation is an off-path regression.
+namespace D3D12 {
+void GpuPassProfile::Work(GpuPassKind) { std::abort(); }
+void GpuPassProfile::Boundary() { std::abort(); }
+void GpuPassProfile::Target(GpuPassTarget) { std::abort(); }
+}
 using namespace D3D12;
 int main() {
     ID3D12Resource resource;

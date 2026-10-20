@@ -547,6 +547,11 @@ struct BlitImageHelper::Impl {
             commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
         commands->SetPipelineState(Pipeline(dst, src, 0).Get());
         commands->SetGraphicsRoot32BitConstants(0, 16, &constants, 0);
+        if (auto* profile = context.PassProfile()) {
+            profile->Label("image blit");
+            profile->Target(
+                {Width(dst), Height(dst), dst.format.RtvFormat(), dst.format.DsvFormat(), 0});
+        }
         commands->DrawInstanced(3, 1, 0, 0);
         if (dst.format.depth && dst.format.planes > 1 && !state->stencil_export) {
             // Portable stencil export: write both zero and one for each bit,

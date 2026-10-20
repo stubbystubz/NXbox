@@ -179,6 +179,14 @@ bool ClearRenderer::Execute(const ClearOperations::Selection& selection, const C
         values.color_type != ClearColorType::Sint)
         throw std::invalid_argument("Invalid clear color type");
     impl->context.MarkWork("guest clears");
+    if (auto* profile = impl->context.PassProfile()) {
+        const auto* target = color ? color : depth_stencil;
+        profile->Boundary();
+        if (target)
+            profile->Target({target->width, target->height,
+                             color ? static_cast<u32>(color->format) : 0,
+                             depth_stencil ? static_cast<u32>(depth_stencil->format) : 0, 0});
+    }
     bool drawn{};
     if (color && color->resource && selection.color_mask) {
         const auto rect = Rectangle(*color, clip);

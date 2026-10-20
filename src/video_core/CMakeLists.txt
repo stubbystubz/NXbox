@@ -505,6 +505,8 @@ if (WIN32 AND (ENABLE_D3D12 OR CMAKE_SYSTEM_NAME STREQUAL "WindowsStore"))
         renderer_d3d12/d3d12_parallel_record.cpp
         renderer_d3d12/d3d12_parallel_record.h
         renderer_d3d12/d3d12_context.cpp
+        renderer_d3d12/d3d12_gpu_pass_profile.cpp
+        renderer_d3d12/d3d12_gpu_pass_profile.h
         renderer_d3d12/d3d12_sim_series_s.cpp
         renderer_d3d12/d3d12_sim_series_s.h
         renderer_d3d12/d3d12_state_cache.h

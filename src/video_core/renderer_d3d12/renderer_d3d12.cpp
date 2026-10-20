@@ -255,6 +255,11 @@ struct RendererD3D12::Impl {
         }
         context.MarkWork(layers.empty() ? "init present clear" : "frame present clear/compositor");
         auto* commands = context.Commands();
+        if (auto* profile = context.PassProfile()) {
+            const auto desc = render_target->handle->GetDesc();
+            profile->Target(
+                {static_cast<u32>(desc.Width), desc.Height, static_cast<u32>(desc.Format), 0, 0});
+        }
         context.Transition(render_target, D3D12_RESOURCE_STATE_RENDER_TARGET);
         commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
         constexpr float Black[]{0, 0, 0, 1};
@@ -416,6 +421,7 @@ struct RendererD3D12::Impl {
         Draw(layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
         context.SimulateSeriesSFrame();
+        context.GpuPassFrame();
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);

@@ -2361,6 +2361,11 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
             }
         }
         context.MarkWork("guest draws");
+        if (auto* profile = context.PassProfile()) {
+            const auto size = framebuffer->Size();
+            profile->Target({size.width, size.height, formats.colors[0], formats.depth,
+                             native_pipeline->PixelGuestHash()});
+        }
         u64 trace_draw = 0;
         if (draw_trace_enabled) {
             if (texture_cache.CaptureFrame() == draw_trace_frame && draw_trace_lines < 3000) {
@@ -3182,6 +3187,8 @@ void RasterizerD3D12::DrawTexture() {
                                   maxwell3d->regs.zpass_pixel_count_enable != 0);
         query_runtime.BeginDraw(false);
         context.MarkWork("DrawTexture blit");
+        if (auto* profile = context.PassProfile())
+            profile->Target({size.width, size.height, target->HostFormat().view_format, 0, 0});
         VideoCommon::SubmissionTrace::Log("host_draw_texture src_gpu={:x} dst_gpu={:x}",
                                           source.GpuAddr(), target->GpuAddr());
         commands->DrawInstanced(4, 1, 0, 0);

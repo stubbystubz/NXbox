@@ -995,6 +995,8 @@ Context::Context() {
     queue->SetName(L"NXbox direct queue");
     Check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence",
           device.Get());
+    if (GpuPassProfile::Enabled())
+        pass_profile = std::make_unique<GpuPassProfile>(*this);
     facade.device = device.Get();
     facade.reuse_draw_state = BisectEnabled("NXBOX_D3D12_RECORD_STATE");
     {
@@ -1021,8 +1023,8 @@ Context::Context() {
         facade.descriptors = record_descriptors.get();
         // Timestamp segments must bracket all work in a submission. Parallel recording
         // executes its second list after the first list's closing timestamp.
-        facade.parallel_enabled =
-            BisectEnabled("NXBOX_D3D12_PARALLEL_RECORD") && !NxboxSimSeriesS::Settings().enabled;
+        facade.parallel_enabled = BisectEnabled("NXBOX_D3D12_PARALLEL_RECORD") &&
+                                  !NxboxSimSeriesS::Settings().enabled && !pass_profile;
         if (facade.parallel_enabled) {
             facade.parallel_descriptors = std::make_shared<RecordDescriptors>();
             facade.parallel_descriptors->Initialize(device.Get());
@@ -1183,6 +1185,8 @@ u64 Context::SealRecording(FrameCount reason) {
     if (!recording)
         return sealed;
     const auto tick = CurrentTick();
+    if (pass_profile)
+        pass_profile->EndSubmission();
     if (gpu_time_heap && profile.Enabled()) {
         const auto first = static_cast<UINT>(((tick - 1) % allocators.size()) * 2);
         facade.EndQuery(gpu_time_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first + 1);
@@ -1498,8 +1502,14 @@ CommandFacade* Context::Commands() {
         }
         if (sim_series_s)
             sim_series_s->BeginSegment(facade);
+        if (pass_profile)
+            pass_profile->BeginSubmission(facade);
     }
     return &facade;
+}
+void Context::GpuPassFrame() {
+    if (pass_profile)
+        pass_profile->EndFrame();
 }
 void Context::SimulateSeriesSFrame() {
     if (sim_series_s)
@@ -1507,6 +1517,8 @@ void Context::SimulateSeriesSFrame() {
 }
 void Context::MarkWork(std::string_view label) {
     Commands();
+    if (facade.pass_profile)
+        facade.pass_profile->Label(label);
     // Copies, uploads and queries never touch graphics pipeline state; every other
     // non-draw path may (compute shares the current PSO, clears and blits draw).
     // Do this even for a label already seen on this recording.
@@ -1559,6 +1571,8 @@ u64 Context::Submit(FrameCount reason) {
         return submitted;
     if (recording) {
         LogInfoQueue();
+        if (pass_profile)
+            pass_profile->EndSubmission();
         if (gpu_time_heap && profile.Enabled()) {
             const auto first = static_cast<UINT>(allocator_index * 2);
             commands->EndQuery(gpu_time_heap.Get(), D3D12_QUERY_TYPE_TIMESTAMP, first + 1);
