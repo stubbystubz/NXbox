@@ -219,8 +219,8 @@ struct FakeCommands {
         }
     }
 };
-enum class FrameCount { StagingCopyBytes, ForcedSubmitTextureDownload };
-struct FrameProfile { void Count(FrameCount, u64) {} };
+enum class FrameCount { StagingCopyBytes, ForcedSubmitTextureDownload, CpuReinterpretBytes };
+struct FrameProfile { bool Enabled() const { return false; } void Count(FrameCount, u64) {} };
 struct Context {
     FrameProfile profile; FrameProfile& Profile() { return profile; }
     FakeDevice device; FakeCommands commands; std::vector<std::function<void()>> pending;
@@ -299,6 +299,10 @@ int main() {
 
 
 ALIAS_SUPPORT = r"""
+namespace fmt {
+template<class... Args> int format(const char*, Args&&...) { return 0; }
+}
+void Diagnostic(int) {}
 void Image::UploadMemory(const StagingBufferRef& map,std::span<const VideoCommon::BufferImageCopy> copies) {
     if(host_format.conversion!=FormatConversion::None) { assert(TransferConverted(map,copies,false)); return; }
     const auto bytes=VideoCore::Surface::BytesPerBlock(info.format);
@@ -491,7 +495,7 @@ class D3D12FormatCoverageTests(unittest.TestCase):
         driver = driver.replace("struct ImageInfo {", "struct ImageInfo { u32 num_samples{1};")
         driver = driver.replace(
             "struct TextureCacheRuntime {",
-            "struct Image;\nstruct BlitSurface { ResourcePtr resource; FormatInfo format; };\nstruct FakeBlit { void CopyImage(const BlitSurface&,const BlitSurface&,std::span<const VideoCommon::ImageCopy>) { assert(false); } };\nstruct TextureCacheRuntime {\n    bool CanDownloadImage(const Image&) const { return true; }\n    bool ReinterpretOnGpu(Image&,Image&,std::span<const VideoCommon::ImageCopy>) { return false; }\n    bool ShouldReinterpret(Image&,Image&);\n    void ReinterpretImage(Image&,Image&,std::span<const VideoCommon::ImageCopy>);\n    void CopyImage(Image&,Image&,std::span<const VideoCommon::ImageCopy>);\n    void CopyImageMSAA(Image&,Image&,std::span<const VideoCommon::ImageCopy>) { assert(false); }\n    FakeBlit blit; FakeBlit& BlitHelpers() { return blit; }",
+            "struct Image;\nstruct BlitSurface { ResourcePtr resource; FormatInfo format; };\nstruct FakeBlit { void CopyImage(const BlitSurface&,const BlitSurface&,std::span<const VideoCommon::ImageCopy>) { assert(false); } };\nstruct TextureCacheRuntime {\n    bool CanDownloadImage(const Image&) const { return true; }\n    bool ReinterpretDepthOnGpu(Image&,Image&,std::span<const VideoCommon::ImageCopy>) { return false; }\n    bool ReinterpretOnGpu(Image&,Image&,std::span<const VideoCommon::ImageCopy>) { return false; }\n    bool ShouldReinterpret(Image&,Image&);\n    void ReinterpretImage(Image&,Image&,std::span<const VideoCommon::ImageCopy>);\n    void CopyImage(Image&,Image&,std::span<const VideoCommon::ImageCopy>);\n    void CopyImageMSAA(Image&,Image&,std::span<const VideoCommon::ImageCopy>) { assert(false); }\n    FakeBlit blit; FakeBlit& BlitHelpers() { return blit; }",
         )
         driver = driver.replace(
             "struct Image {",

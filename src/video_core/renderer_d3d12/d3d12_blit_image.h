@@ -32,6 +32,8 @@ enum class BlitConversion : u32 {
     D32FToRGBA8,
     RGBA8ToD32F,
     SwapRedBlue,
+    S8D24ToRGBA8,
+    RGBA8ToS8D24,
 };
 
 class BlitImageHelper {
