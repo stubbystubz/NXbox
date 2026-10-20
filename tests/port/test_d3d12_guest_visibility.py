@@ -160,7 +160,9 @@ int main() {
         )
         driver = driver[: driver.index("int main()")]
         run_cpp(
-            driver.replace("__COUNTER_REPORT__", method)
+            '#include "core/core_timing_trace.h"\n'
+            + "namespace D3D12 { struct QueryCacheParams; }\n"
+            + driver.replace("__COUNTER_REPORT__", method)
             + r"""
 int main() {
     using namespace VideoCommon;

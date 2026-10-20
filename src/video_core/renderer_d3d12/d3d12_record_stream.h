@@ -275,8 +275,8 @@ private:
             chunk.used.notify_one();
         }
     }
-    bool Read(void* destination, size_t size) {
-        auto* bytes = static_cast<std::byte*>(destination);
+    bool Read(void* output, size_t size) {
+        auto* bytes = static_cast<std::byte*>(output);
         while (size) {
             if (!Readable())
                 return false;
