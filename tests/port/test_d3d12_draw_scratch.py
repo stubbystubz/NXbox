@@ -19,6 +19,7 @@ MOCK = (
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 using D3D12::DescriptorSources;
 using D3D12::BoundHandleTableCache;
+using D3D12::DescriptorCopyRanges;
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -30,6 +31,8 @@ using D3D12::BoundHandleTableCache;
 using u8 = std::uint8_t;
 using u32 = std::uint32_t;
 using u64 = std::uint64_t;
+using UINT = unsigned;
+using SIZE_T = std::size_t;
 using ResourcePtr = std::shared_ptr<int>;
 bool validation_enabled = false;
 bool BisectEnabled(const char* name) {
@@ -66,9 +69,12 @@ struct Context {
 };
 void TraceApiCall(Context*, const char*, void*, const void*, std::size_t) {}
 struct D3D12DescriptorAllocator {
+    explicit D3D12DescriptorAllocator(bool ranges = true) : descriptor_ranges{ranges} {}
     bool descriptor_fastpath = false;
+    bool descriptor_ranges;
+    bool persistent_null_descriptors = true;
     bool handle_table_reuse = false;
-    std::array<BoundHandleTableCache<DescriptorTable>, 2> handle_table_cache;
+    std::array<BoundHandleTableCache<DescriptorTable, 64, 128, 4>, 2> handle_table_cache;
     bool descriptor_table_cache = false;
     struct DescriptorKeyHash {
         size_t operator()(const DescriptorKey& key) const { return key.kind; }
@@ -79,7 +85,12 @@ struct D3D12DescriptorAllocator {
     };
     std::array<D3D12::DescriptorSetCache<DescriptorKey, CachedDrawTable, DescriptorKeyHash>, 2>
         draw_table_cache;
-    struct Cache { u64 generation = 1; } view_cache, sampler_cache;
+    struct Cache {
+        u64 generation = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
+        u32 stride = 1, capacity = 0;
+    } view_cache, sampler_cache, null_view_cache;
+    __IS_NULL_DESCRIPTOR_HANDLE__
     void RefreshCaches() {}
     struct CopyBatch {};
     struct PreviousDrawTable {
@@ -103,10 +114,10 @@ struct D3D12DescriptorAllocator {
 };
 """
 DRIVER = r"""
-int main() {
+void Run(bool ranges) {
     // Production Reset must mark every slot unwritten, including retained keys.
     validation_enabled = true;
-    D3D12DescriptorAllocator validation_allocator;
+    D3D12DescriptorAllocator validation_allocator{ranges};
     DescriptorPlan checked{{0, 1, 0}};
     checked.keys[0].kind = 1;
     checked.initialized[0] = 1;
@@ -121,7 +132,7 @@ int main() {
     validation_allocator.FinishDrawTable(checked);
     assert(validation_allocator.allocations == 1);
     validation_enabled = false;
-    D3D12DescriptorAllocator allocator;
+    D3D12DescriptorAllocator allocator{ranges};
     DescriptorPlan plan{{0, 0, 0}};
     auto resource = std::make_shared<int>(42);
     std::weak_ptr<int> lifetime = resource;
@@ -182,7 +193,7 @@ int main() {
     assert(lifetime.expired());
     // Execute the production bulk-copy branch, then prove that an identical
     // source array reuses only within its recording tick.
-    D3D12DescriptorAllocator fast;
+    D3D12DescriptorAllocator fast{ranges};
     fast.descriptor_fastpath = true;
     auto sources = [&] {
         plan.Reset({1, 2, 1});
@@ -202,7 +213,7 @@ int main() {
     assert(fast.context.copies == 2);
     // Nonconsecutive handle sets use the production bounded cache, with the
     // semantic map disabled. A changed CPU generation forces fresh GPU tables.
-    D3D12DescriptorAllocator handles;
+    D3D12DescriptorAllocator handles{ranges};
     handles.descriptor_fastpath = true;
     handles.handle_table_reuse = true;
     auto handle_build = [&](u32 kind, bool sampler = false) {
@@ -225,7 +236,7 @@ int main() {
     // Run both production copy branches with the set cache enabled. Revisited
     // tables must avoid allocation/writes; submissions and heap domains cannot alias.
     for (bool bulk : {false, true}) {
-        D3D12DescriptorAllocator cached;
+        D3D12DescriptorAllocator cached{ranges};
         cached.descriptor_table_cache = true;
         cached.descriptor_fastpath = bulk;
         auto build = [&](u32 kind, bool sampler = false) {
@@ -260,6 +271,10 @@ int main() {
         assert(cached.allocations == 6);
     }
 }
+int main() {
+    Run(false);
+    Run(true);
+}
 """
 
 
@@ -267,6 +282,10 @@ class DrawScratchTests(unittest.TestCase):
     def test_plan_storage_and_tick_lifetime(self):
         header = (NATIVE / "d3d12_descriptor.h").read_text()
         source = (NATIVE / "d3d12_descriptor.cpp").read_text()
+        allocator = ALLOCATOR.replace(
+            "__IS_NULL_DESCRIPTOR_HANDLE__",
+            function(header, "bool IsNullDescriptorHandle("),
+        )
         structs = header.split("struct DescriptorKey {", 1)[1].split("struct DescriptorTable {", 1)[
             0
         ]
@@ -284,7 +303,7 @@ class DrawScratchTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="nxbox-draw-scratch-") as temp:
             cpp = Path(temp) / "scratch.cpp"
             binary = Path(temp) / "scratch"
-            cpp.write_text(MOCK + "struct DescriptorKey {" + structs + ALLOCATOR + methods + DRIVER)
+            cpp.write_text(MOCK + "struct DescriptorKey {" + structs + allocator + methods + DRIVER)
             subprocess.run(
                 [
                     "clang++",
