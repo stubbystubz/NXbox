@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class UwpFastmemTests(unittest.TestCase):
-    def test_allocator_with_mock_windows_apis(self):
+    def allocator_source(self):
         source = (ROOT / "src/common/host_memory.cpp").read_text()
         allocator = source.split("// UWP backing uses independent", 1)[1].split(
             "\n#endif\n\n#elif defined(__OPENORBIS__)", 1
@@ -26,6 +26,30 @@ class UwpFastmemTests(unittest.TestCase):
         native_test = native_test.replace(
             "// PRODUCTION_HANDLER", "namespace {\nvoid* g_section_owner" + handler + "}\n"
         ).replace("// PRODUCTION_ALLOCATOR", "// UWP backing uses independent" + allocator)
+        return native_test
+
+    def test_allocator_rejects_incompatible_view_protection_with_error_87(self):
+        self.compile_and_run(self.allocator_source())
+
+    def test_probe_error_87_logs_exact_call_and_releases_arena(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+int main() {
+    Mock::Reset();
+    Mock::force_noaccess_alias = true;
+    {
+        Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+        assert(memory.Init() && !memory.virtual_base);
+        assert(Mock::committed == 0 && Common::g_backing_committed == 0);
+        assert(api_errors.size() == 1);
+        const auto& error = api_errors.front();
+        assert(error.api == "VirtualProtectFromApp" && error.address);
+        assert(error.size == 4096 && error.protection == PAGE_READONLY && error.error == 87);
+        assert(Fault(memory.backing_base));
+    }
+    Mock::Reset();
+}
+"""
         self.compile_and_run(native_test)
 
     def test_uwp_settings_gate_and_opt_out(self):

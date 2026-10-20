@@ -36,6 +36,18 @@ constexpr LONG EXCEPTION_CONTINUE_SEARCH = 0, EXCEPTION_CONTINUE_EXECUTION = -1;
 #define NTAPI
 #define INVALID_HANDLE_VALUE reinterpret_cast<HANDLE>(-1)
 #define UNREACHABLE() std::abort()
+struct ApiError {
+    std::string api;
+    void* address;
+    size_t size;
+    DWORD protection;
+    DWORD error;
+};
+std::vector<ApiError> api_errors;
+void TestLog(const char*, const char*, const char* api, void* address, size_t size,
+             DWORD protection, DWORD error) {
+    api_errors.push_back({api, address, size, protection, error});
+}
 template <typename... T>
 void TestLog(const char*, T&&...) {}
 #define HW_Memory 0
@@ -78,6 +90,7 @@ struct Segment {
     size_t length;
     Section* section{};
     size_t offset{};
+    DWORD mapping_protection{};
 };
 std::map<size_t, Segment> segments;
 std::map<void*, size_t> reservations;
@@ -86,10 +99,16 @@ std::map<std::string, int> calls;
 std::string fail_name;
 int fail_at{};
 size_t committed{}, sections{}, peak{};
+bool force_noaccess_alias{};
+DWORD last_error = 5;
 Handler handler{};
 bool Fail(const char* name) {
     const int call = ++calls[name];
-    return fail_name == name && call == fail_at;
+    if (fail_name == name && call == fail_at) {
+        last_error = 87;
+        return true;
+    }
+    return false;
 }
 int Protection(DWORD flags) {
     return flags == PAGE_READWRITE  ? PROT_READ | PROT_WRITE
@@ -115,6 +134,9 @@ void Reset() {
     fail_name.clear();
     fail_at = 0;
     peak = 0;
+    last_error = 5;
+    force_noaccess_alias = false;
+    api_errors.clear();
     assert(!handler);
 }
 void* Reserve(HANDLE process, void* base, size_t size, DWORD type, DWORD flags, void*, unsigned) {
@@ -147,7 +169,9 @@ HANDLE Create(HANDLE file, void*, DWORD flags, std::uint64_t size, const wchar_t
 void* Map(HANDLE handle, HANDLE process, void* base, std::uint64_t offset, size_t length,
           DWORD type, DWORD flags, void*, unsigned) {
     assert(process == GetCurrentProcess() && type == MEM_REPLACE_PLACEHOLDER &&
-           (flags == PAGE_READWRITE || flags == PAGE_NOACCESS));
+           (flags == PAGE_READWRITE || flags == PAGE_READONLY || flags == PAGE_NOACCESS));
+    if (force_noaccess_alias && offset == 4096)
+        flags = PAGE_NOACCESS;
     auto* section = static_cast<Section*>(handle);
     assert(offset % 4096 == 0 && offset + length <= section->size);
     auto it = segments.find(reinterpret_cast<size_t>(base));
@@ -172,6 +196,7 @@ void* Map(HANDLE handle, HANDLE process, void* base, std::uint64_t offset, size_
     }
     it->second.section = section;
     it->second.offset = offset;
+    it->second.mapping_protection = flags;
     ++section->views;
     return base;
 }
@@ -188,12 +213,26 @@ int Unmap(HANDLE process, void* base, DWORD flags) {
 int Protect(void* base, size_t size, DWORD flags, DWORD* old) {
     if (Fail("protect"))
         return false;
-    *old = PAGE_READWRITE;
-    (void)base;
-    (void)size;
-    (void)flags;
-    return true; // Per-Windows-page permissions are checked by production Fault().
+    const size_t address = reinterpret_cast<size_t>(base);
+    auto it = segments.upper_bound(address);
+    if (it == segments.begin()) {
+        last_error = 87;
+        return false;
+    }
+    --it;
+    const auto& view = it->second;
+    // FromApp cannot widen beyond the access granted at mapping time, or span
+    // views.
+    if (!view.section || size > view.length || address - it->first > view.length - size ||
+        (Protection(flags) & ~Protection(view.mapping_protection)) != 0) {
+        last_error = 87;
+        return false;
+    }
+    *old = view.mapping_protection;
+    return true; // Host 16 KiB pages cannot enforce individual Windows 4 KiB
+                 // permissions.
 }
+
 void* PrivateAlloc(void* base, size_t size, DWORD flags, DWORD protection) {
     assert(protection == PAGE_READWRITE);
     if (Fail("private"))
@@ -225,7 +264,7 @@ unsigned Remove(void* token) {
 } // namespace Mock
 
 DWORD GetLastError() {
-    return 5;
+    return Mock::last_error;
 }
 int CloseHandle(HANDLE handle) {
     auto* section = static_cast<Mock::Section*>(handle);
@@ -353,7 +392,17 @@ bool Fault(void* address, size_t access = 1) {
         EXCEPTION_ACCESS_VIOLATION, 2, {access, reinterpret_cast<size_t>(address)}};
     EXCEPTION_POINTERS ep{&record};
     assert(Mock::handler);
-    return Mock::handler(&ep) == EXCEPTION_CONTINUE_EXECUTION;
+    const bool handled = Mock::handler(&ep) == EXCEPTION_CONTINUE_EXECUTION;
+    if (handled) {
+        auto it = Mock::segments.upper_bound(reinterpret_cast<size_t>(address));
+        assert(it != Mock::segments.begin());
+        const auto& view = std::prev(it)->second;
+        if (view.section) {
+            assert(view.mapping_protection != PAGE_NOACCESS);
+            assert(access != 1 || view.mapping_protection == PAGE_READWRITE);
+        }
+    }
+    return handled;
 }
 
 int main() {
@@ -361,6 +410,23 @@ int main() {
     using Common::HostMemory;
     using Common::MemoryPermission;
     constexpr size_t region = 65536;
+    Mock::Reset();
+    // Verify the strict mock reproduces the Xbox error for the original probe
+    // pattern.
+    {
+        void* base =
+            Mock::Reserve(GetCurrentProcess(), nullptr, region,
+                          MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+        auto handle = Mock::Create(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
+                                   region, nullptr);
+        assert(Mock::Map(handle, GetCurrentProcess(), base, 0, region, MEM_REPLACE_PLACEHOLDER,
+                         PAGE_NOACCESS, nullptr, 0) == base);
+        DWORD old{};
+        assert(!Mock::Protect(base, 4096, PAGE_READWRITE, &old) && GetLastError() == 87);
+        assert(Mock::Unmap(GetCurrentProcess(), base, MEM_PRESERVE_PLACEHOLDER));
+        CloseHandle(handle);
+        assert(VirtualFree(base, 0, MEM_RELEASE));
+    }
     Mock::Reset();
     {
         HostMemory::Impl memory(4 * region, 32 * region);
@@ -411,6 +477,14 @@ int main() {
         assert(Mock::committed == 0 && g_backing_committed == 0);
         memory.Unmap(0, 32 * region);
         assert(!Fault(arena));
+        memory.Map(0, 4096, 4096, MemoryPermission::ReadWrite);
+        memory.Map(8192, region, 4096, MemoryPermission::Read);
+        memory.Protect(0, 12288, false, false, false);
+        assert(!Fault(arena, 0) && !Fault(arena + 4096, 0) && !Fault(arena + 8192, 0));
+        memory.Protect(0, 12288, true, true, false);
+        assert(Fault(arena) && !Fault(arena + 4096) && Fault(arena + 8192));
+        memory.Unmap(0, 32 * region);
+        memory.Clear(0, 4 * region, 0);
         // Nonzero fill retains byte semantics of the previous memset path.
         memory.Clear(region, 3 * region, 0x1234);
         assert(Mock::committed == 3 * region);
@@ -450,12 +524,21 @@ int main() {
                 HostMemory::Impl memory(4 * region, 32 * region);
                 assert(memory.Init() && !memory.virtual_base);
                 assert(Mock::committed == 0);
+                if (std::string_view{api} == "protect") {
+                    assert(!api_errors.empty());
+                    const auto& failure_log = api_errors.back();
+                    assert(failure_log.api == "VirtualProtectFromApp");
+                    assert(failure_log.address && failure_log.size == 4096);
+                    assert(failure_log.protection ==
+                           (failure == 1 ? PAGE_READONLY : PAGE_READWRITE));
+                    assert(failure_log.error == 87);
+                }
                 assert(Fault(memory.backing_base));
             }
             Mock::Reset();
         }
     }
-    for (const char* api : {"create", "map", "protect"}) {
+    for (const char* api : {"create", "map"}) {
         {
             HostMemory::Impl memory(4 * region, 32 * region);
             assert(memory.Init());
@@ -464,22 +547,30 @@ int main() {
             // For map, allow the backing view and fail the alias view.
             Mock::fail_at = Mock::calls[api] + (std::string_view{api} == "map" ? 2 : 1);
             assert(!Fault(memory.virtual_base));
-            // A failed alias operation leaves page-table access to the backing available.
+            // A failed alias operation leaves page-table access to the backing
+            // available.
             assert(Fault(memory.backing_base + 4096));
-            // Failed alias APIs disable this view; a new guest mapping can try again.
+            // Failed alias APIs disable this view; a new guest mapping can try
+            // again.
             if (std::string_view{api} != "create")
                 assert(!Fault(memory.virtual_base));
             memory.Map(0, 4096, 8192, MemoryPermission::ReadWrite);
             assert(Fault(memory.virtual_base));
             Mock::Store(memory.virtual_base, 33);
             assert(memory.backing_base[4096] == 33);
-            Mock::fail_name = "protect";
-            Mock::fail_at = Mock::calls["protect"] + 1;
             memory.Protect(0, 8192, true, false, false);
             assert(!Fault(memory.virtual_base));
             assert(!Fault(memory.virtual_base + 4096));
             assert(Fault(memory.virtual_base, 0));
             assert(memory.virtual_base[0] == 33);
+            // A RO view must be remapped before a later permission upgrade.
+            const int maps = Mock::calls["map"];
+            memory.Protect(0, 4096, true, true, false);
+            assert(Fault(memory.virtual_base));
+            assert(Mock::calls["map"] > maps);
+            assert(!Fault(memory.virtual_base + 4096));
+            assert(Fault(memory.virtual_base + 4096, 0));
+            assert(Mock::calls["protect"] == 2); // Only compatible probe transitions.
         }
         Mock::Reset();
     }

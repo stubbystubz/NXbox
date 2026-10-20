@@ -523,7 +523,7 @@ class HostMemory::Impl {
     struct Mapping {
         size_t host;
         size_t length;
-        std::array<DWORD, RegionSize / PageAlignment> protection{};
+        DWORD protection{};
         bool mapped{};
         bool fault_disabled{};
     };
@@ -580,7 +580,7 @@ public:
             } else {
                 reason = probe_stage;
             }
-            failure_error = GetLastError();
+            failure_error = ready ? GetLastError() : probe_error;
             ReleaseArena();
         }
         LOG_WARNING(HW_Memory,
@@ -639,7 +639,7 @@ public:
             const DWORD flags = True(permissions & MemoryPermission::Write)  ? PAGE_READWRITE
                                 : True(permissions & MemoryPermission::Read) ? PAGE_READONLY
                                                                              : PAGE_NOACCESS;
-            mapping.protection.fill(flags);
+            mapping.protection = flags;
             mappings.emplace(offset, mapping);
             regions[host / RegionSize].aliases.insert(offset);
             offset += count;
@@ -656,27 +656,36 @@ public:
     void Protect(size_t offset, size_t length, bool read, bool write, bool) {
         std::scoped_lock lock{mutex};
         const DWORD flags = read ? (write ? PAGE_READWRITE : PAGE_READONLY) : PAGE_NOACCESS;
+        const size_t limit = offset + length;
         auto it = mappings.upper_bound(offset);
         if (it != mappings.begin())
             --it;
-        for (; it != mappings.end() && it->first < offset + length; ++it) {
-            auto& [start, mapping] = *it;
+        while (it != mappings.end() && it->first < limit) {
+            const auto [start, mapping] = *it;
             const size_t begin = (std::max)(start, offset);
-            const size_t end = (std::min)(start + mapping.length, offset + length);
-            for (size_t page = begin; page < end; page += PageAlignment) {
-                mapping.protection[(page - start) / PageAlignment] = flags;
-                if (mapping.mapped) {
-                    DWORD old{};
-                    if (!protect(virtual_base + page, PageAlignment, flags, &old)) {
-                        // An inaccessible placeholder is safe: SEH falls back through the page
-                        // table.
-                        LOG_WARNING(HW_Memory,
-                                    "NXBOX MEMORY alias_protect_failed error={} fallback=seh",
-                                    GetLastError());
-                        UnmapView(start, mapping);
-                    }
-                }
+            const size_t end = (std::min)(start + mapping.length, limit);
+            if (begin >= end || mapping.protection == flags) {
+                ++it;
+                continue;
             }
+            // A FromApp view cannot gain access beyond its original mapping protection.
+            // Replace the affected interval lazily with its final permission. Splitting
+            // preserves uniform permissions per view without a permissive mapping window.
+            const size_t host = mapping.host + begin - start;
+            const auto permissions = write && read ? MemoryPermission::ReadWrite
+                                     : read        ? MemoryPermission::Read
+                                                   : static_cast<MemoryPermission>(0);
+            try {
+                Map(begin, host, end - begin, permissions);
+            } catch (const std::bad_alloc&) {
+                // Placeholder split/coalesce failed: stop serving this interval through the
+                // fault handler so accesses fall back to the page table instead of crashing.
+                auto failed = mappings.upper_bound(begin);
+                if (failed != mappings.begin())
+                    (--failed)->second.fault_disabled = true;
+                ++alias_failures;
+            }
+            it = mappings.lower_bound(end);
         }
     }
 
@@ -726,11 +735,20 @@ private:
     bool InstallHandler() {
         g_backing_committed.store(0, std::memory_order_relaxed);
         g_backing_veh = g_pfn_add_veh(1, BackingDemandCommitHandler);
-        return g_backing_veh != nullptr;
+        return g_backing_veh != nullptr || ApiFailure("AddVectoredExceptionHandler", nullptr, 0, 0);
     }
 
     size_t RegionLength(size_t index) const {
         return (std::min)(RegionSize, backing_size - index * RegionSize);
+    }
+
+    bool ApiFailure(const char* api, void* address, size_t size, DWORD protection) {
+        probe_error = GetLastError();
+        LOG_WARNING(HW_Memory,
+                    "NXBOX MEMORY api_failed stage={} api={} address={} size={:#x} "
+                    "protection={:#x} error={}",
+                    probe_stage, api, address, size, protection, probe_error);
+        return false;
     }
 
     bool InitArena() {
@@ -739,19 +757,19 @@ private:
                                                 MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                                 PAGE_NOACCESS, nullptr, 0));
         if (!backing_base)
-            return false;
+            return ApiFailure("VirtualAlloc2FromApp", nullptr, backing_size, PAGE_NOACCESS);
         probe_stage = "reserve_arena_failed";
         virtual_base = static_cast<u8*>(reserve(process, nullptr, virtual_size,
                                                 MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
                                                 PAGE_NOACCESS, nullptr, 0));
         if (!virtual_base)
-            return false;
+            return ApiFailure("VirtualAlloc2FromApp", nullptr, virtual_size, PAGE_NOACCESS);
         probe_stage = "split_backing_failed";
         // Keep backing placeholder boundaries fixed. No allocation is needed in the VEH.
         for (size_t offset = 0; offset + RegionSize < backing_size; offset += RegionSize) {
             if (!VirtualFree(backing_base + offset, RegionSize,
                              MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-                return false;
+                return ApiFailure("VirtualFree", backing_base + offset, RegionSize, 0);
         }
         // Exercise the actual section and alias APIs, including a 4 KiB section offset,
         // protection, and destruction/recreation. The probe charges only one 64 KiB chunk.
@@ -759,32 +777,32 @@ private:
             return false;
         probe_stage = "split_alias_failed";
         if (!VirtualFree(virtual_base, RegionSize, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-            return false;
+            return ApiFailure("VirtualFree", virtual_base, RegionSize, 0);
         if (!VirtualFree(virtual_base, PageAlignment, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-            return false;
+            return ApiFailure("VirtualFree", virtual_base, PageAlignment, 0);
         probe_stage = "map_alias_4k_failed";
         backing_base[PageAlignment] = 0xA5;
         void* alias = map_view(regions[0].handle, process, virtual_base, PageAlignment,
-                               PageAlignment, MEM_REPLACE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0);
+                               PageAlignment, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
         if (alias != virtual_base)
-            return false;
+            return ApiFailure("MapViewOfFile3FromApp", virtual_base, PageAlignment, PAGE_READWRITE);
         probe_mapped = true;
         DWORD old{};
-        probe_stage = "protect_alias_failed";
-        if (!protect(alias, PageAlignment, PAGE_READWRITE, &old))
-            return false;
+        probe_stage = "verify_alias_failed";
         if (static_cast<volatile u8*>(alias)[0] != 0xA5)
             return false;
-        if (!protect(alias, PageAlignment, PAGE_READONLY, &old) ||
-            !protect(alias, PageAlignment, PAGE_READWRITE, &old))
-            return false;
+        probe_stage = "protect_alias_failed";
+        if (!protect(alias, PageAlignment, PAGE_READONLY, &old))
+            return ApiFailure("VirtualProtectFromApp", alias, PageAlignment, PAGE_READONLY);
+        if (!protect(alias, PageAlignment, PAGE_READWRITE, &old))
+            return ApiFailure("VirtualProtectFromApp", alias, PageAlignment, PAGE_READWRITE);
         probe_stage = "unmap_alias_failed";
         if (!unmap_view(process, alias, MEM_PRESERVE_PLACEHOLDER))
-            return false;
+            return ApiFailure("UnmapViewOfFile2", alias, PageAlignment, 0);
         probe_mapped = false;
         probe_stage = "coalesce_alias_failed";
         if (!VirtualFree(virtual_base, virtual_size, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS))
-            return false;
+            return ApiFailure("VirtualFree", virtual_base, virtual_size, 0);
         probe_stage = "reclaim_probe_failed";
         DropRegion(0);
         if (!EnsureRegion(0) || backing_base[PageAlignment] != 0)
@@ -802,12 +820,15 @@ private:
         HANDLE handle = create_section(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                        RegionLength(index), nullptr);
         if (!handle)
-            return false;
+            return ApiFailure("CreateFileMappingFromApp", nullptr, RegionLength(index),
+                              PAGE_READWRITE | SEC_COMMIT);
         probe_stage = "map_backing_failed";
         void* view =
             map_view(handle, process, backing_base + index * RegionSize, 0, RegionLength(index),
                      MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
         if (view != backing_base + index * RegionSize) {
+            ApiFailure("MapViewOfFile3FromApp", backing_base + index * RegionSize,
+                       RegionLength(index), PAGE_READWRITE);
             CloseHandle(handle);
             return false;
         }
@@ -837,7 +858,7 @@ private:
         auto& [start, mapping] = *--it;
         if (offset - start >= mapping.length || mapping.fault_disabled)
             return false;
-        const DWORD flags = mapping.protection[(offset - start) / PageAlignment];
+        const DWORD flags = mapping.protection;
         if (flags == PAGE_NOACCESS || (access == 1 && flags != PAGE_READWRITE))
             return false;
         if (mapping.mapped)
@@ -846,30 +867,12 @@ private:
             return false;
         if (map_view(regions[mapping.host / RegionSize].handle, process, virtual_base + start,
                      mapping.host % RegionSize, mapping.length, MEM_REPLACE_PLACEHOLDER,
-                     PAGE_NOACCESS, nullptr, 0) != virtual_base + start) {
+                     mapping.protection, nullptr, 0) != virtual_base + start) {
             mapping.fault_disabled = true;
             ++alias_failures;
             return false;
         }
-        // Publish no permissive window: another core may already be running in this view.
-        // Pages remain inaccessible until each intended permission has been installed.
         mapping.mapped = true;
-        for (size_t page = 0; page < mapping.length; page += PageAlignment) {
-            DWORD old{};
-            if (!protect(virtual_base + start + page, PageAlignment,
-                         mapping.protection[page / PageAlignment], &old)) {
-                mapping.fault_disabled = true;
-                try {
-                    UnmapView(start, mapping);
-                } catch (const std::bad_alloc&) {
-                    // The partially protected view contains only intended permissions or
-                    // NOACCESS. Leave its section alive and route future faults to SEH.
-                    // Never throw a C++ exception out of a Windows VEH.
-                }
-                ++alias_failures;
-                return false;
-            }
-        }
         ++alias_faults;
         return true;
     }
@@ -892,6 +895,8 @@ private:
             UnmapView(offset, mappings.at(offset));
         }
         if (!unmap_view(process, backing_base + index * RegionSize, MEM_PRESERVE_PLACEHOLDER)) {
+            ApiFailure("UnmapViewOfFile2", backing_base + index * RegionSize, RegionLength(index),
+                       0);
             throw std::bad_alloc{};
         }
         CloseHandle(region.handle);
@@ -939,8 +944,6 @@ private:
                 Mapping right = mapping;
                 right.host += stop - start;
                 right.length = finish - stop;
-                std::copy(mapping.protection.begin() + (stop - start) / PageAlignment,
-                          mapping.protection.end(), right.protection.begin());
                 mappings.emplace(stop, right);
                 regions[right.host / RegionSize].aliases.insert(stop);
             }
@@ -994,6 +997,7 @@ private:
     // Clear may fault on the private fallback backing while holding this lock.
     std::recursive_mutex mutex;
     bool probe_mapped{};
+    DWORD probe_error{};
     const char* probe_stage = "section_alias_probe_failed";
     size_t backing_faults{};
     size_t alias_faults{};
