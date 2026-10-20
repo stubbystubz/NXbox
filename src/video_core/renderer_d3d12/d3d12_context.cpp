@@ -1831,8 +1831,8 @@ struct BufferHeapPool {
     }
     ResourcePtr Allocate(ID3D12Device* device, const std::shared_ptr<MemoryBudget>& budget,
                          const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE type,
-                         D3D12_RESOURCE_STATES state,
-                         const std::shared_ptr<BufferHeapPool>& owner) {
+                         D3D12_RESOURCE_STATES state, const std::shared_ptr<BufferHeapPool>& owner,
+                         bool allow_growth = true) {
         const auto allocation = device->GetResourceAllocationInfo(0, 1, &desc);
         if (allocation.SizeInBytes == UINT64_MAX || allocation.SizeInBytes > BufferHeapPage::Size)
             return {};
@@ -1854,6 +1854,8 @@ struct BufferHeapPool {
                 break;
             }
         }
+        if (!page && !allow_growth)
+            return {};
         if (!page) {
             page = std::make_shared<BufferHeapPage>();
             page->budget = budget;
@@ -1979,16 +1981,29 @@ ResourcePtr Context::CreateBuffer(u64 size, D3D12_HEAP_TYPE heap) {
                                                           : D3D12_RESOURCE_STATE_COMMON;
     auto pool = BufferPool(budget);
     Collect();
-    if (budget->used >= NativeBufferMemoryTarget(budget->used)) {
-        Finish(FrameCount::ForcedSubmitMemoryPressure);
-        pool->Trim();
-    }
+    static const bool pressure_reuse = [] {
+        char value[2]{};
+        return !(GetEnvironmentVariableA("NXBOX_D3D12_BUFFER_PRESSURE_REUSE", value,
+                                         sizeof(value)) == 1 &&
+                 value[0] == '0');
+    }();
     try {
         // Diagnostic: committed buffers only, to rule out placed-heap aliasing.
         static const bool no_placed = BisectEnabled("NXBOX_D3D12_NO_PLACED");
-        if (auto resource = no_placed ? ResourcePtr{}
-                                      : pool->Allocate(device.Get(), budget, desc, heap, state,
-                                                       pool)) {
+        // Free slots already have backing memory and no outstanding resource lease.
+        // Reusing them cannot grow the budget, even when live caches exceed its target.
+        auto resource = pressure_reuse && !no_placed
+                            ? pool->Allocate(device.Get(), budget, desc, heap, state, pool, false)
+                            : ResourcePtr{};
+        if (!resource) {
+            if (budget->used >= NativeBufferMemoryTarget(budget->used)) {
+                Finish(FrameCount::ForcedSubmitMemoryPressure);
+                pool->Trim();
+            }
+            if (!no_placed)
+                resource = pool->Allocate(device.Get(), budget, desc, heap, state, pool);
+        }
+        if (resource) {
             const FrameProfile::Scope profile_alias{profile, FramePhase::Barriers};
             D3D12_RESOURCE_BARRIER barrier{};
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_ALIASING;
