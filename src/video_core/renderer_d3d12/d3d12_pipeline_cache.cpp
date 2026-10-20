@@ -1371,11 +1371,12 @@ void PipelineCache::RecordGraphicsDraw(u64 frame) {
 }
 
 std::unique_ptr<PipelineCache::AsyncCache> PipelineCache::CreateAsyncCache() {
-    // Raise scheduling priority without adding another DXC instance on memory-limited UWP.
+    // Explicit async mode raises priority without another DXC instance on memory-limited UWP.
     // Preserve user overrides and the pool's temporary ABOVE_NORMAL boost for waiters.
     return std::make_unique<AsyncCache>(RuntimePsoThreads(), 4, std::chrono::seconds{5}, 4,
                                         [](AsyncCache::NativeHandle handle, int priority) {
-                                            if (priority == THREAD_PRIORITY_BELOW_NORMAL &&
+                                            if (NonBlockingPsoEnabled() &&
+                                                priority == THREAD_PRIORITY_BELOW_NORMAL &&
                                                 !std::getenv("NXBOX_D3D12_PSO_WORKER_PRIORITY"))
                                                 priority = THREAD_PRIORITY_NORMAL;
                                             AsyncCache::SetPriority(handle, priority);

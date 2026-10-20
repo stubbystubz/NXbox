@@ -27,7 +27,9 @@ POLICY_DRIVER = r"""
 #include <cassert>
 #include <cstdlib>
 #include <future>
+#include <functional>
 #include <string_view>
+#include <unordered_set>
 #include "video_core/renderer_d3d12/d3d12_async_pso.h"
 #include "video_core/renderer_d3d12/d3d12_pso_frame_budget.h"
 using namespace std::chrono_literals;
@@ -36,9 +38,48 @@ bool BisectEnabled(const char* name) {
     return value && std::string_view{value} == "1";
 }
 using D3D12::PsoFrameBudget;
+using D3D12::RuntimePsoThreadCount;
+constexpr int THREAD_PRIORITY_BELOW_NORMAL = -1;
+constexpr int THREAD_PRIORITY_NORMAL = 0;
+// Capture the production factory's pool settings and priority hook without Windows APIs.
+struct AsyncCache {
+    enum class Status { Pending, Missing };
+    struct Entry { Status status; };
+    Status status = Status::Pending;
+    int waits = 0;
+    std::chrono::steady_clock::duration last_timeout{};
+    Entry WaitFor(int, std::chrono::steady_clock::duration timeout) {
+        ++waits;
+        last_timeout = timeout;
+        return {status};
+    }
+    using NativeHandle = int;
+    using PriorityHook = std::function<void(NativeHandle, int)>;
+    static inline int applied_priority = 99;
+    static void SetPriority(NativeHandle, int priority) { applied_priority = priority; }
+    AsyncCache(size_t threads_, size_t capacity_, std::chrono::seconds stall_,
+               size_t maximum_, PriorityHook hook_)
+        : threads{threads_}, capacity{capacity_}, stall{stall_}, maximum{maximum_}, hook{hook_} {}
+    size_t threads, capacity;
+    std::chrono::seconds stall;
+    size_t maximum;
+    PriorityHook hook;
+};
 struct PipelineCache {
+    using AsyncCache = ::AsyncCache;
+    struct Profile {
+        bool Enabled() const { return false; }
+    };
+    struct Context {
+        Profile Profile() const { return {}; }
+    } context;
+    std::unordered_set<int> pso_waited;
+    AsyncCache* async = nullptr;
     PsoFrameBudget pso_frame_budget;
     std::chrono::steady_clock::duration PendingPsoWaitBudget();
+    std::unique_ptr<AsyncCache> CreateAsyncCache();
+    void GraphicsWait(bool may_skip, int request_hash);
+    void ComputeWait(int request);
 };
 // Insert the actual production policy definitions here, without Windows/D3D12 dependencies.
 POLICY
@@ -46,9 +87,47 @@ int main(int argc, char** argv) {
     assert(argc == 2);
     PipelineCache cache;
     const std::string_view mode{argv[1]};
+    assert(NonBlockingPsoEnabled() == (mode == "async"));
+    const auto workers = cache.CreateAsyncCache();
+    cache.async = workers.get();
+    assert(workers->threads == RuntimePsoThreadCount(
+        BisectEnabled("NXBOX_D3D12_PSO_PARALLEL_DXC")));
+    assert(workers->capacity == 4 && workers->stall == 5s && workers->maximum == 4);
+    for (const int priority : {-2, -1, 0, 1}) {
+        workers->hook(0, priority);
+        const bool promote = mode == "async" && priority == THREAD_PRIORITY_BELOW_NORMAL &&
+                             !std::getenv("NXBOX_D3D12_PSO_WORKER_PRIORITY");
+        assert(AsyncCache::applied_priority == (promote ? THREAD_PRIORITY_NORMAL : priority));
+    }
+    // Execute the actual admission/wait/retry prefix from each production skip path.
+    // Repeated protected draws and dispatches spend their wait only once per key.
+    cache.GraphicsWait(true, 1);
+    assert(workers->waits == 0 && cache.pso_waited.empty());
+    for (int repeat = 0; repeat < 3; ++repeat) {
+        cache.GraphicsWait(false, 1);
+        cache.ComputeWait(2);
+    }
+    assert(workers->waits == 2 && cache.pso_waited.size() == 2);
+    if (mode == "async") assert(workers->last_timeout == 0ms);
+    workers->status = AsyncCache::Status::Missing;
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        cache.GraphicsWait(false, 3);
+        cache.ComputeWait(4);
+    }
+    assert(workers->waits == 6 && cache.pso_waited.size() == 2);
+    workers->status = AsyncCache::Status::Pending;
+    cache.GraphicsWait(false, 3);
+    cache.ComputeWait(4);
+    assert(workers->waits == 8 && cache.pso_waited.size() == 4);
+    cache.pso_frame_budget.Reset();
     if (mode == "compatibility") {
         assert(!FrameBoundedPsoEnabled());
-        assert(cache.PendingPsoWaitBudget() == 5s);
+        const auto* custom = std::getenv("NXBOX_D3D12_PSO_WAIT_MS");
+        const auto expected = custom ? std::chrono::milliseconds{std::strtol(custom, nullptr, 10)}
+                                     : 5s;
+        // Repeated requests keep the original per-request budget unless explicitly bounded.
+        for (int request = 0; request < 4; ++request)
+            assert(cache.PendingPsoWaitBudget() == expected);
         return 0;
     }
     assert(FrameBoundedPsoEnabled());
@@ -133,9 +212,32 @@ class TotkPsoLatencyTests(unittest.TestCase):
                 "std::chrono::milliseconds PsoWaitBudget()",
                 "bool NonBlockingPsoEnabled()",
                 "bool FrameBoundedPsoEnabled()",
+                "size_t RuntimePsoThreads()",
+                "std::unique_ptr<PipelineCache::AsyncCache> PipelineCache::CreateAsyncCache()",
                 "std::chrono::steady_clock::duration PipelineCache::PendingPsoWaitBudget()",
             )
         )
+        for method, parameters, variables, guard in (
+            (
+                "GraphicsWait",
+                "bool may_skip, int request_hash",
+                "const int request = request_hash;",
+                "if (!may_skip && pso_waited.insert(",
+            ),
+            (
+                "ComputeWait",
+                "int request",
+                "const int async_key = request;",
+                "if (pso_waited.insert(",
+            ),
+        ):
+            # Exclude only diagnostics and result installation, which require D3D12 objects.
+            # Keep the production guard, WaitFor call, budget and Missing retry unchanged.
+            prefix = guard + cls.source.split(guard, 1)[1].split("if (trace_wait) {", 1)[0]
+            definitions += (
+                f"\nvoid PipelineCache::{method}({parameters}) {{\n{variables}\n"
+                f"{prefix}\n(void)wait_start;\n}}\n}}\n"
+            )
         for name, driver, extra in (
             ("policy", POLICY_DRIVER.replace("\nPOLICY\n", "\n" + definitions + "\n"), []),
             ("disk", DISK_DRIVER, [str(D3D12 / "d3d12_disk_pipeline_cache.cpp")]),
@@ -168,14 +270,21 @@ class TotkPsoLatencyTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def test_wait_modes_and_async_completion(self):
-        for mode in ("compatibility", "bounded", "async"):
-            with self.subTest(mode=mode):
+        cases = (
+            ("compatibility", {}),
+            ("compatibility", {"ASYNC_PSO": "0"}),
+            ("compatibility", {"ASYNC_PSO": ""}),
+            ("compatibility", {"ASYNC_PSO": "true", "PSO_WAIT_MS": "37"}),
+            ("bounded", {"PSO_FRAME_BUDGET": "1"}),
+            ("async", {"ASYNC_PSO": "1", "PSO_FRAME_BUDGET": "0"}),
+            ("async", {"ASYNC_PSO": "1", "PSO_FRAME_BUDGET": "1"}),
+            ("async", {"ASYNC_PSO": "1", "PSO_WORKER_PRIORITY": "below_normal"}),
+            ("async", {"ASYNC_PSO": "1", "PSO_PARALLEL_DXC": "1"}),
+        )
+        for mode, overrides in cases:
+            with self.subTest(mode=mode, overrides=overrides):
                 env = {k: v for k, v in os.environ.items() if not k.startswith("NXBOX_D3D12_")}
-                if mode == "bounded":
-                    env["NXBOX_D3D12_PSO_FRAME_BUDGET"] = "1"
-                if mode == "async":
-                    env["NXBOX_D3D12_ASYNC_PSO"] = "1"
-                    env["NXBOX_D3D12_PSO_FRAME_BUDGET"] = "0"
+                env.update({f"NXBOX_D3D12_{key}": value for key, value in overrides.items()})
                 subprocess.run(
                     [str(self.directory / "policy"), mode], env=env, check=True, timeout=10
                 )

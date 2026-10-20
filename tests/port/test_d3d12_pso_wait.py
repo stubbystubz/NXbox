@@ -13,22 +13,39 @@ CACHE = ROOT / "src/video_core/renderer_d3d12/d3d12_pipeline_cache.cpp"
 POOL = ROOT / "src/video_core/renderer_d3d12/d3d12_async_pso.h"
 
 
+def skip_path(source, kind):
+    """Scope to the pending-request path, independent of diagnostic text length."""
+    signature, counter = {
+        "graphics": ("IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(", "Draws"),
+        "compute": ("ComputePipeline* PipelineCache::CurrentComputePipeline()", "Dispatches"),
+    }[kind]
+    body = source.split(signature, 1)[1].split("\n}", 1)[0]
+    return body.rsplit(
+        "if (!may_skip && pso_waited.insert(" if kind == "graphics" else "if (pso_waited.insert(", 1
+    )[1].split(f"Count(FrameCount::{counter}SkippedPendingPso)", 1)[0]
+
+
 class PsoWait(unittest.TestCase):
     def test_both_skip_paths_wait_once_first(self):
         source = CACHE.read_text()
-        for counter in ("DrawsSkippedPendingPso", "DispatchesSkippedPendingPso"):
-            skip = source.rindex(f"Count(FrameCount::{counter})")
-            before = source[skip - 2200 : skip]
-            self.assertIn("pso_waited.insert(", before)
-            self.assertIn("async->WaitFor(", before)
+        for kind, key in (("graphics", "request_hash"), ("compute", "request")):
+            with self.subTest(kind=kind):
+                before = skip_path(source, kind)
+                self.assertTrue(before.startswith(f"{key}).second) {{"))
+                self.assertEqual(before.count("async->WaitFor("), 1)
+                self.assertIn("PendingPsoWaitBudget()", before)
+                # A completed first-use PSO is installed and returned before the skip counter.
+                wait = before.index("async->WaitFor(")
+                ready = before.index("if (settled.status == AsyncCache::Status::Ready)")
+                self.assertLess(wait, ready)
+                self.assertIn(f"return settled.result->{kind}.get();", before[ready:])
 
     def test_unadmitted_requests_keep_their_wait(self):
         # E2 (Wonder): 28 of 50 waits came back Missing because the pool was full; the
         # draw spent its only wait without waiting and was skipped for good afterwards.
         source = CACHE.read_text()
-        for counter in ("DrawsSkippedPendingPso", "DispatchesSkippedPendingPso"):
-            skip = source.rindex(f"Count(FrameCount::{counter})")
-            before = source[skip - 2600 : skip]
+        for kind in ("graphics", "compute"):
+            before = skip_path(source, kind)
             wait = before.index("async->WaitFor(")
             self.assertIn("if (settled.status == AsyncCache::Status::Missing)", before[wait:])
             self.assertIn("pso_waited.erase(", before[wait:])

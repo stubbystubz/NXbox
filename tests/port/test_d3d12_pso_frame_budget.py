@@ -96,7 +96,18 @@ class PsoFrameBudgetTests(unittest.TestCase):
         self.assertIn("pso_frame_budget.Remaining(PsoWaitBudget())", source)
         self.assertIn("async->WaitFor(request, PendingPsoWaitBudget())", source)
         self.assertIn("async->WaitFor(async_key, PendingPsoWaitBudget())", source)
-        self.assertEqual(source.count("std::make_unique<AsyncCache>(RuntimePsoThreads())"), 3)
+        # Graphics, compute and disk warmup must all use the runtime worker policy.
+        for signature in (
+            "IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(",
+            "ComputePipeline* PipelineCache::CurrentComputePipeline()",
+            "void PipelineCache::LoadDiskResources(",
+        ):
+            with self.subTest(signature=signature):
+                body = source.split(signature, 1)[1].split("\n}", 1)[0]
+                self.assertIn("async = CreateAsyncCache();", body)
+                self.assertNotIn("std::make_unique<AsyncCache>", body)
+        factory = source.split("PipelineCache::CreateAsyncCache()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("std::make_unique<AsyncCache>(RuntimePsoThreads(),", factory)
         self.assertNotIn("SetWorkerTarget(2)", source)
         tick = source.split("void PipelineCache::TickFrame()", 1)[1].split("\n}", 1)[0]
         self.assertIn("pso_frame_budget.Reset()", tick)
