@@ -9,6 +9,7 @@
 #include <string>
 
 #include <fmt/format.h>
+#include "video_core/renderer_d3d12/d3d12_format_cast.h"
 
 namespace D3D12 {
 constexpr bool ValidCopyRange(std::uint64_t width, std::uint64_t offset, std::uint64_t size) {
@@ -47,6 +48,16 @@ public:
             fmt::format("D3D12_VALIDATION invalid tick={} call={} {}", tick, call, args);
         Diagnostic(message);
         throw std::invalid_argument(message);
+    }
+    void ViewFormat(const char* call, std::uint32_t resource, std::uint32_t view,
+                    std::span<const std::uint32_t> castable = {}) const {
+        if (!enabled)
+            return;
+        Require(CompatibleViewFormat(resource, view, castable), call,
+                fmt::format("resource_format={} view_format={} resource_family={} view_family={} "
+                            "castable_count={}",
+                            resource, view, FormatFamily(resource), FormatFamily(view),
+                            castable.size()));
     }
     void Root(const char* call, UINT index, std::uint64_t address, bool cbv) {
         if (!enabled)

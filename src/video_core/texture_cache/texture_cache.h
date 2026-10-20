@@ -291,6 +291,37 @@ void TextureCache<P>::MarkModification(ImageId id) noexcept {
 }
 
 template <class P>
+ImageViewId TextureCache<P>::ReinterpretImageView(ImageViewId view_id, PixelFormat format) {
+    const auto& view = slot_image_views[view_id];
+    if (view_id == NULL_IMAGE_VIEW_ID || view.IsBuffer())
+        return view_id;
+    // Copy all metadata before insertion: growing the slot maps can invalidate references.
+    const auto& image = slot_images[view.image_id];
+    auto info = image.info;
+    const auto address = image.gpu_addr;
+    ImageViewInfo view_info(view.type, format, view.range);
+    if (BytesPerBlock(info.format) != BytesPerBlock(format) ||
+        DefaultBlockWidth(info.format) != DefaultBlockWidth(format) ||
+        DefaultBlockHeight(info.format) != DefaultBlockHeight(format))
+        return NULL_IMAGE_VIEW_ID;
+    info.format = format;
+    // Use the normal alias graph, preparation and modification tracking in both
+    // directions. An ephemeral copy would lose UAV writes on the next TIC lookup.
+    const auto image_id = FindOrInsertImage(info, address, RelaxedOptions::ForceBrokenViews);
+    if (!image_id)
+        return NULL_IMAGE_VIEW_ID;
+    if (const auto base = slot_images[image_id].TryFindBase(address)) {
+        view_info.range.base.level += base->level;
+        view_info.range.base.layer += base->layer;
+    } else {
+        return NULL_IMAGE_VIEW_ID;
+    }
+    const auto result = FindOrEmplaceImageView(image_id, view_info);
+    PrepareImageView(result, false, false);
+    return result;
+}
+
+template <class P>
 void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compute, bool blacklist) {
     const Common::GpuProfile::PhaseScope gpu_profile_scope{
         Common::GpuProfile::Phase::TextureCacheUpdate};
@@ -302,6 +333,14 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         }
         for (ImageViewInOut& view : views) {
             view.id = VisitImageView(view.index, compute);
+            if constexpr (requires {
+                              runtime.CanViewFormat(slot_image_views[view.id], PixelFormat{});
+                          }) {
+                if (view.format_override && view.id != NULL_IMAGE_VIEW_ID &&
+                    !runtime.CanViewFormat(slot_image_views[view.id], *view.format_override)) {
+                    view.id = ReinterpretImageView(view.id, *view.format_override);
+                }
+            }
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];

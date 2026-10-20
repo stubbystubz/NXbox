@@ -107,6 +107,7 @@ public:
         // create format-specific aliases and synchronize their guest bit patterns.
         return true;
     }
+    bool CanViewFormat(const ImageView& view, VideoCore::Surface::PixelFormat format) const;
     bool HasNativeBgr() const {
         return true;
     }

@@ -11,6 +11,7 @@
 #include <deque>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -62,6 +63,7 @@ struct ImageViewInOut {
     u32 index{};
     bool blacklist{};
     ImageViewId id{};
+    std::optional<PixelFormat> format_override{};
 };
 
 struct AsyncDecodeContext {
@@ -310,6 +312,8 @@ public:
     std::recursive_mutex mutex;
 
 private:
+    ImageViewId ReinterpretImageView(ImageViewId view_id, PixelFormat format);
+
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachCPUPage(DAddr addr, size_t size, Func&& func) {
