@@ -37,7 +37,20 @@ public:
         chunks = std::make_unique<Chunk[]>(capacity);
     }
     RecordStream(const RecordStream&) = delete;
+    // Producer only. A cut publishes the old segment before routing any bytes of
+    // the next packet. The original consumer continues reading only this queue.
+    // Restore nullptr before encoding the ordered submission on the first queue.
+    void RouteWritesTo(RecordStream* next) {
+        if (next == this || (next && next->destination))
+            throw std::invalid_argument("invalid D3D12 recording route");
+        Flush();
+        destination = next;
+    }
     void Write(const void* source, size_t size) {
+        if (destination) {
+            destination->Write(source, size);
+            return;
+        }
         repeat_replay = nullptr;
         auto* bytes = static_cast<const std::byte*>(source);
         while (size) {
@@ -63,6 +76,10 @@ public:
         }
     }
     void Flush() {
+        if (destination) {
+            destination->Flush();
+            return;
+        }
         repeat_replay = nullptr;
         if (!write_offset)
             return;
@@ -129,6 +146,10 @@ public:
     // the batch, so draws never cross state, query, barrier or submission commands.
     template <class Command>
     void Repeat(const Command& command) {
+        if (destination) {
+            destination->Repeat(command);
+            return;
+        }
         if (direct_replay)
             RepeatPacket<Command, 16>(command);
         else
@@ -271,6 +292,7 @@ private:
         std::atomic<size_t> used{};
         alignas(16) std::array<std::byte, ChunkSize> data;
     };
+    RecordStream* destination{}; // Producer only; destination outlives the route.
     std::unique_ptr<Chunk[]> chunks;
     const size_t active_chunks;
     size_t write_index{}, write_offset{}, read_index{}, read_offset{}, read_limit{};
