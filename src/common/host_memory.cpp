@@ -192,6 +192,31 @@ PFN_RemoveVectoredExceptionHandler g_pfn_remove_veh{nullptr};
 void* g_backing_veh{nullptr};
 std::atomic<std::uint64_t> g_backing_committed{0};
 
+// Keep SEH in a leaf function: MSVC cannot mix __try with C++ object unwinding.
+// A failed demand-map must reject fastmem, rather than kill the process in its probe.
+bool ProbeMemoryAccess(volatile u8* address, bool write, u8& value) {
+#if defined(_MSC_VER)
+    __try {
+        if (write) {
+            *address = value;
+        } else {
+            value = *address;
+        }
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER
+                                                                 : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+#else
+    // The UWP fault probe requires a compiler with Windows SEH support. Reject
+    // fastmem on other toolchains rather than issuing an unguarded native load.
+    (void)address;
+    (void)write;
+    (void)value;
+    return false;
+#endif
+}
+
 LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
     if (ep == nullptr || ep->ExceptionRecord == nullptr ||
         ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
@@ -552,8 +577,7 @@ public:
         const char* reason = "missing_from_app_export";
         DWORD failure_error = GetLastError();
         const char* option = std::getenv("NXBOX_FASTMEM");
-        // Opt-in until lazy views stop faulting host code on Series X (MK8D/Odyssey/Wonder
-        // crash at boot with the probe passing).
+        // Retain opt-in while the fault-driven path is validated on Series X.
         if (!option || std::string_view{option} != "1") {
             reason = "NXBOX_FASTMEM!=1";
             failure_error = 0;
@@ -569,16 +593,28 @@ public:
                 g_section_fault = [](void* owner, size_t address, size_t access) {
                     return static_cast<Impl*>(owner)->Fault(address, access);
                 };
-                if (InstallHandler()) {
+                bool faults_ready{};
+                try {
+                    faults_ready = InstallHandler() && ProbeFaultHandling();
+                } catch (const std::bad_alloc&) {
+                    faults_ready = false;
+                }
+                if (faults_ready) {
                     LOG_INFO(HW_Memory,
                              "NXBOX MEMORY mode=fastmem backing=regional_sections "
-                             "region_kib=64 arena_gib={} committed_mib=0 probe=passed veh=ready",
-                             virtual_size >> 30);
+                             "region_kib=64 arena_gib={} committed_mib=0 probe=passed veh=ready "
+                             "fault_probe=passed backing_base={} arena_base={}",
+                             virtual_size >> 30, static_cast<void*>(backing_base),
+                             static_cast<void*>(virtual_base));
                     return true;
+                }
+                if (g_backing_veh) {
+                    g_pfn_remove_veh(g_backing_veh);
+                    g_backing_veh = nullptr;
                 }
                 g_section_fault = nullptr;
                 g_section_owner = nullptr;
-                reason = "veh_install_failed";
+                reason = probe_stage;
             } else {
                 reason = probe_stage;
             }
@@ -735,9 +771,49 @@ public:
 
 private:
     bool InstallHandler() {
+        probe_stage = "veh_install_failed";
         g_backing_committed.store(0, std::memory_order_relaxed);
         g_backing_veh = g_pfn_add_veh(1, BackingDemandCommitHandler);
         return g_backing_veh != nullptr || ApiFailure("AddVectoredExceptionHandler", nullptr, 0, 0);
+    }
+
+    bool ProbeFaultHandling() {
+        // InitArena only tested explicit API calls. Exercise the installed VEH from
+        // host code, including the JIT -> native fallback sequence on a RO alias.
+        // The leaf SEH guard catches a fault the VEH cannot resolve.
+        probe_stage = "host_backing_fault_failed";
+        u8 value = 0x5A;
+        if (!ProbeMemoryAccess(backing_base + PageAlignment, true, value) || !backing_faults)
+            return false;
+        Map(0, PageAlignment, PageAlignment, MemoryPermission::ReadWrite);
+        probe_stage = "lazy_alias_fault_failed";
+        value = 0;
+        if (!ProbeMemoryAccess(virtual_base, false, value) || value != 0x5A || !alias_faults)
+            return false;
+        probe_stage = "protect_probe_alias_failed";
+        Protect(0, PageAlignment, true, false, false);
+        if (alias_failures)
+            return false;
+        DropRegion(0);
+        probe_stage = "protected_alias_fault_claimed";
+        value = 0xA5;
+        if (ProbeMemoryAccess(virtual_base, true, value))
+            return false;
+        probe_stage = "native_fallback_fault_failed";
+        const size_t previous_backing_faults = backing_faults;
+        if (!ProbeMemoryAccess(backing_base + PageAlignment, true, value) ||
+            backing_faults != previous_backing_faults)
+            return false;
+        Unmap(0, PageAlignment);
+        DropRegion(0);
+        // Reclamation must preserve the ability to resolve a later host-code fault.
+        probe_stage = "reclaimed_backing_fault_failed";
+        value = 0xFF;
+        if (!ProbeMemoryAccess(backing_base + PageAlignment, false, value) || value != 0)
+            return false;
+        DropRegion(0);
+        backing_faults = alias_faults = reclaimed_bytes = 0;
+        return true;
     }
 
     size_t RegionLength(size_t index) const {
@@ -858,18 +934,28 @@ private:
         if (it == mappings.begin())
             return false;
         auto& [start, mapping] = *--it;
-        if (offset - start >= mapping.length || mapping.fault_disabled)
+        if (offset - start >= mapping.length)
             return false;
+        // A protection fault is redirected to a native callback by Dynarmic. That
+        // callback accesses linear backing, not this alias. Materialize it before
+        // handing off, so the fallback does not immediately take a second AV.
+        if (!EnsureRegion(mapping.host / RegionSize)) {
+            mapping.fault_disabled = true;
+            ++alias_failures;
+            return false;
+        }
         const DWORD flags = mapping.protection;
-        if (flags == PAGE_NOACCESS || (access == 1 && flags != PAGE_READWRITE))
+        if (mapping.fault_disabled || flags == PAGE_NOACCESS ||
+            (access == 1 && flags != PAGE_READWRITE))
             return false;
         if (mapping.mapped)
             return true; // Concurrent fault already satisfied.
-        if (!EnsureRegion(mapping.host / RegionSize))
-            return false;
+        probe_stage = "map_alias_failed";
         if (map_view(regions[mapping.host / RegionSize].handle, process, virtual_base + start,
                      mapping.host % RegionSize, mapping.length, MEM_REPLACE_PLACEHOLDER,
                      mapping.protection, nullptr, 0) != virtual_base + start) {
+            ApiFailure("MapViewOfFile3FromApp", virtual_base + start, mapping.length,
+                       mapping.protection);
             mapping.fault_disabled = true;
             ++alias_failures;
             return false;
