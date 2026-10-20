@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "video_core/renderer_d3d12/d3d12_command_validation.h"
+#include "video_core/renderer_d3d12/d3d12_parallel_record.h"
 #include "video_core/renderer_d3d12/d3d12_record_args.h"
 #include "video_core/renderer_d3d12/d3d12_recorded_state.h"
 
@@ -69,6 +70,7 @@ struct RecordingTarget {
 #else
 #define D3D12_FORWARD_INLINE inline __attribute__((always_inline))
 #endif
+struct ParallelNativeState;
 class CommandFacade {
 public:
     const bool reuse_graphics_root_cbvs{BisectEnabled("NXBOX_D3D12_ROOT_CBV_REUSE")};
@@ -79,6 +81,44 @@ public:
     RecordDescriptors* descriptors{};
     ID3D12GraphicsCommandList* immediate{};
     RecordStream<>* stream{}; // Latched once; null is the immediate path.
+    // Native resources live in the context translation unit; the encoder owns routing.
+    std::shared_ptr<RecordDescriptors> parallel_descriptors;
+    std::shared_ptr<ParallelNativeState> parallel_native;
+    std::shared_ptr<ParallelRecordWorker> parallel_worker;
+    std::function<void()> parallel_begin;
+    std::vector<ID3D12DescriptorHeap*> parallel_heaps;
+    ParallelRecordSnapshot parallel_snapshot;
+    ParallelRecordCuts parallel_cuts{1790};
+    bool parallel_enabled{}, parallel_split{};
+    ID3D12RootSignature* parallel_graphics_signature{};
+    ID3D12RootSignature* parallel_compute_signature{};
+    bool CaptureParallelState() const {
+        return parallel_enabled && !parallel_split;
+    }
+    void BeginParallelRecording() {
+        parallel_heaps.clear();
+        parallel_snapshot.Reset();
+        parallel_cuts.Reset(parallel_enabled);
+        parallel_split = false;
+        parallel_graphics_signature = parallel_compute_signature = nullptr;
+    }
+    void BeforeParallelDraw() {
+        if (!parallel_enabled)
+            return;
+        if (parallel_cuts.TryCut()) {
+            parallel_begin();
+            parallel_snapshot.Encode(*stream);
+            parallel_snapshot.Reset();
+            parallel_split = true;
+        }
+        parallel_cuts.Draw();
+    }
+    template <auto Invoke, class... Args>
+    void EncodeState(ParallelStateKey key, Args... args) {
+        if (CaptureParallelState())
+            parallel_snapshot.Remember<Invoke>(key, args...);
+        EncodeCall<Invoke>(*stream, args...);
+    }
     bool compact_draws{true}; // NXBOX_D3D12_COMPACT_DRAWS=0 restores EncodeCall.
     bool reuse_draw_state{};  // NXBOX_D3D12_RECORD_STATE=1; independent of guest invalidation.
     struct TransportState {
@@ -111,6 +151,8 @@ public:
             immediate->BeginQuery(heap, type, index);
             return;
         }
+        if (parallel_enabled)
+            parallel_cuts.BeginQuery(reinterpret_cast<std::uintptr_t>(heap), type, index);
         EncodeCall<[](void* target, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
             static_cast<RecordingTarget*>(target)->list->BeginQuery(heap, type, index);
         }>(*stream, heap, type, index);
@@ -120,6 +162,9 @@ public:
             immediate->EndQuery(heap, type, index);
             return;
         }
+        if (parallel_enabled)
+            if (type != static_cast<D3D12_QUERY_TYPE>(2)) // D3D12_QUERY_TYPE_TIMESTAMP
+                parallel_cuts.EndQuery(reinterpret_cast<std::uintptr_t>(heap), type, index);
         EncodeCall<[](void* target, ID3D12QueryHeap* heap, D3D12_QUERY_TYPE type, UINT index) {
             static_cast<RecordingTarget*>(target)->list->EndQuery(heap, type, index);
         }>(*stream, heap, type, index);
@@ -229,6 +274,7 @@ public:
                                             first_instance);
             return;
         }
+        BeforeParallelDraw();
         if (compact_draws) {
             stream->Repeat(
                 DrawPacket{indices, instances, first_index, first_instance, base_vertex, true});
@@ -246,6 +292,7 @@ public:
             immediate->DrawInstanced(vertices, instances, first_vertex, first_instance);
             return;
         }
+        BeforeParallelDraw();
         if (compact_draws) {
             stream->Repeat(DrawPacket{vertices, instances, first_vertex, first_instance, 0, false});
             return;
@@ -266,6 +313,7 @@ public:
         }
         // Indirect signatures may write IA views; D3D12 clears those bindings
         // afterwards. The signature is opaque here, so discard all transport state.
+        parallel_cuts.Disable();
         ResetDrawState();
         EncodeCall<[](void* target, ID3D12CommandSignature* signature, UINT count,
                       ID3D12Resource* arguments, UINT64 offset, ID3D12Resource* count_buffer,
@@ -285,9 +333,9 @@ public:
             else if (!transport_state.index.Update(*view))
                 return;
         }
-        EncodeCall<[](void* target, const D3D12_INDEX_BUFFER_VIEW* view) {
+        EncodeState<[](void* target, const D3D12_INDEX_BUFFER_VIEW* view) {
             static_cast<RecordingTarget*>(target)->list->IASetIndexBuffer(view);
-        }>(*stream, Snapshot(view, 1));
+        }>({ParallelState::IndexBuffer}, Snapshot(view, 1));
     }
     D3D12_FORWARD_INLINE void IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY topology) {
         if (!stream) {
@@ -298,9 +346,9 @@ public:
             if (!transport_state.topology.Update(topology))
                 return;
         }
-        EncodeCall<[](void* target, D3D_PRIMITIVE_TOPOLOGY topology) {
+        EncodeState<[](void* target, D3D_PRIMITIVE_TOPOLOGY topology) {
             static_cast<RecordingTarget*>(target)->list->IASetPrimitiveTopology(topology);
-        }>(*stream, topology);
+        }>({ParallelState::PrimitiveTopology}, topology);
     }
     D3D12_FORWARD_INLINE void IASetVertexBuffers(UINT start, UINT count,
                                                  const D3D12_VERTEX_BUFFER_VIEW* views) {
@@ -314,6 +362,15 @@ public:
             transport_state.vertex_start = start;
             if (views && !transport_state.vertices.Update(views, count))
                 return;
+        }
+        if (CaptureParallelState()) {
+            for (UINT i = 0; i < count; ++i)
+                parallel_snapshot
+                    .Remember<[](void* target, UINT slot, const D3D12_VERTEX_BUFFER_VIEW* view) {
+                        static_cast<RecordingTarget*>(target)->list->IASetVertexBuffers(slot, 1,
+                                                                                        view);
+                    }>({ParallelState::VertexBuffer, start + i}, start + i,
+                       Snapshot(views ? views + i : nullptr, 1));
         }
         EncodeCall<[](void* target, UINT start, UINT count, const D3D12_VERTEX_BUFFER_VIEW* views) {
             static_cast<RecordingTarget*>(target)->list->IASetVertexBuffers(start, count, views);
@@ -330,9 +387,9 @@ public:
             else if (!transport_state.blend.Update({factor[0], factor[1], factor[2], factor[3]}))
                 return;
         }
-        EncodeCall<[](void* target, const FLOAT* factor) {
+        EncodeState<[](void* target, const FLOAT* factor) {
             static_cast<RecordingTarget*>(target)->list->OMSetBlendFactor(factor);
-        }>(*stream, Snapshot(factor, 4));
+        }>({ParallelState::BlendFactor}, Snapshot(factor, 4));
     }
     D3D12_FORWARD_INLINE void OMSetDepthBounds(FLOAT minimum, FLOAT maximum) {
         if (!stream) {
@@ -343,9 +400,9 @@ public:
             return;
         }
         Check(depth_bounds_status, "D3D12 depth-bounds command interface", device);
-        EncodeCall<[](void* target, FLOAT minimum, FLOAT maximum) {
+        EncodeState<[](void* target, FLOAT minimum, FLOAT maximum) {
             static_cast<RecordingTarget*>(target)->OMSetDepthBounds(minimum, maximum);
-        }>(*stream, minimum, maximum);
+        }>({ParallelState::DepthBounds}, minimum, maximum);
     }
     D3D12_FORWARD_INLINE void OMSetFrontAndBackStencilRef(UINT front, UINT back) {
         if (!stream) {
@@ -360,9 +417,9 @@ public:
             if (!transport_state.stencil.Update({front, back}))
                 return;
         }
-        EncodeCall<[](void* target, UINT front, UINT back) {
+        EncodeState<[](void* target, UINT front, UINT back) {
             static_cast<RecordingTarget*>(target)->OMSetFrontAndBackStencilRef(front, back);
-        }>(*stream, front, back);
+        }>({ParallelState::StencilReference}, front, back);
     }
     D3D12_FORWARD_INLINE void OMSetRenderTargets(UINT count,
                                                  const D3D12_CPU_DESCRIPTOR_HANDLE* handles,
@@ -371,6 +428,29 @@ public:
         if (!stream) {
             immediate->OMSetRenderTargets(count, handles, contiguous, depth);
             return;
+        }
+        if (CaptureParallelState()) {
+            const auto snapshot_slot = parallel_descriptors->Acquire(*stream);
+            D3D12_CPU_DESCRIPTOR_HANDLE snapshot_handles[8]{};
+            for (UINT i = 0; i < count; ++i) {
+                snapshot_handles[i] = parallel_descriptors->Rtv(snapshot_slot, i);
+                const D3D12_CPU_DESCRIPTOR_HANDLE source{
+                    handles[contiguous ? 0 : i].ptr +
+                    (contiguous ? i * parallel_descriptors->RtvStride() : 0)};
+                parallel_descriptors->Copy(snapshot_handles[i], source, false);
+            }
+            const auto snapshot_depth = parallel_descriptors->Dsv(snapshot_slot);
+            if (depth)
+                parallel_descriptors->Copy(snapshot_depth, *depth, true);
+            parallel_snapshot
+                .Remember<[](void* target, UINT count, const D3D12_CPU_DESCRIPTOR_HANDLE* handles,
+                             const D3D12_CPU_DESCRIPTOR_HANDLE* depth, DescriptorTicket) {
+                    static_cast<RecordingTarget*>(target)->list->OMSetRenderTargets(count, handles,
+                                                                                    false, depth);
+                }>({ParallelState::RenderTargets}, count,
+                   Snapshot(handles ? snapshot_handles : nullptr, count),
+                   Snapshot(depth ? &snapshot_depth : nullptr, 1),
+                   DescriptorTicket{parallel_descriptors.get(), snapshot_slot});
         }
         const auto slot = descriptors->Acquire(*stream);
         D3D12_CPU_DESCRIPTOR_HANDLE copies[8]{};
@@ -400,9 +480,9 @@ public:
             if (!transport_state.stencil.Update({stencil, stencil}))
                 return;
         }
-        EncodeCall<[](void* target, UINT stencil) {
+        EncodeState<[](void* target, UINT stencil) {
             static_cast<RecordingTarget*>(target)->list->OMSetStencilRef(stencil);
-        }>(*stream, stencil);
+        }>({ParallelState::StencilReference}, stencil);
     }
     D3D12_FORWARD_INLINE void RSSetScissorRects(UINT count, const D3D12_RECT* rects) {
         if (!stream) {
@@ -415,9 +495,9 @@ public:
             else if (!transport_state.scissors.Update(rects, count))
                 return;
         }
-        EncodeCall<[](void* target, UINT count, const D3D12_RECT* rects) {
+        EncodeState<[](void* target, UINT count, const D3D12_RECT* rects) {
             static_cast<RecordingTarget*>(target)->list->RSSetScissorRects(count, rects);
-        }>(*stream, count, Snapshot(rects, count));
+        }>({ParallelState::Scissors}, count, Snapshot(rects, count));
     }
     D3D12_FORWARD_INLINE void RSSetViewports(UINT count, const D3D12_VIEWPORT* views) {
         if (!stream) {
@@ -430,9 +510,9 @@ public:
             else if (!transport_state.viewports.Update(views, count))
                 return;
         }
-        EncodeCall<[](void* target, UINT count, const D3D12_VIEWPORT* views) {
+        EncodeState<[](void* target, UINT count, const D3D12_VIEWPORT* views) {
             static_cast<RecordingTarget*>(target)->list->RSSetViewports(count, views);
-        }>(*stream, count, Snapshot(views, count));
+        }>({ParallelState::Viewports}, count, Snapshot(views, count));
     }
     D3D12_FORWARD_INLINE void ResolveSubresource(ID3D12Resource* destination,
                                                  UINT destination_subresource,
@@ -454,6 +534,13 @@ public:
             immediate->ResourceBarrier(count, barriers);
             return;
         }
+        if (parallel_enabled) {
+            for (UINT i = 0; i < count; ++i) {
+                // Split barriers cannot cross command lists. Fail closed for this batch.
+                if (barriers[i].Flags != 0)
+                    parallel_cuts.Disable();
+            }
+        }
         EncodeCall<[](void* target, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
             static_cast<RecordingTarget*>(target)->list->ResourceBarrier(count, barriers);
         }>(*stream, count, Snapshot(barriers, count));
@@ -463,6 +550,14 @@ public:
         if (!stream) {
             immediate->SOSetTargets(start, count, views);
             return;
+        }
+        if (CaptureParallelState()) {
+            for (UINT i = 0; i < count; ++i)
+                parallel_snapshot.Remember<[](void* target, UINT slot,
+                                              const D3D12_STREAM_OUTPUT_BUFFER_VIEW* view) {
+                    static_cast<RecordingTarget*>(target)->list->SOSetTargets(slot, 1, view);
+                }>({ParallelState::StreamOutput, start + i}, start + i,
+                   Snapshot(views ? views + i : nullptr, 1));
         }
         EncodeCall<[](void* target, UINT start, UINT count,
                       const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) {
@@ -474,6 +569,14 @@ public:
         if (!stream) {
             immediate->SetComputeRoot32BitConstants(index, count, data, offset);
             return;
+        }
+        if (CaptureParallelState()) {
+            for (UINT i = 0; i < count; ++i)
+                parallel_snapshot.Remember<[](void* target, UINT slot, UINT value, UINT word) {
+                    static_cast<RecordingTarget*>(target)->list->SetComputeRoot32BitConstants(
+                        slot, 1, &value, word);
+                }>({ParallelState::ComputeRootArgument, index, offset + i}, index,
+                   static_cast<const UINT*>(data)[i], offset + i);
         }
         EncodeCall<[](void* target, UINT index, UINT count, const void* data, UINT offset) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRoot32BitConstants(index, count,
@@ -487,10 +590,10 @@ public:
             immediate->SetComputeRootConstantBufferView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRootConstantBufferView(index,
                                                                                           address);
-        }>(*stream, index, address);
+        }>({ParallelState::ComputeRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetComputeRootShaderResourceView(UINT index,
                                                                D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -499,10 +602,10 @@ public:
             immediate->SetComputeRootShaderResourceView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRootShaderResourceView(index,
                                                                                           address);
-        }>(*stream, index, address);
+        }>({ParallelState::ComputeRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetComputeRootUnorderedAccessView(UINT index,
                                                                 D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -511,10 +614,10 @@ public:
             immediate->SetComputeRootUnorderedAccessView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRootUnorderedAccessView(index,
                                                                                            address);
-        }>(*stream, index, address);
+        }>({ParallelState::ComputeRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetComputeRootDescriptorTable(UINT index,
                                                             D3D12_GPU_DESCRIPTOR_HANDLE handle) {
@@ -523,19 +626,24 @@ public:
             immediate->SetComputeRootDescriptorTable(index, handle);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRootDescriptorTable(index,
                                                                                        handle);
-        }>(*stream, index, handle);
+        }>({ParallelState::ComputeRootTable, index}, index, handle);
     }
     D3D12_FORWARD_INLINE void SetComputeRootSignature(ID3D12RootSignature* signature) {
         if (!stream) {
             immediate->SetComputeRootSignature(signature);
             return;
         }
-        EncodeCall<[](void* target, ID3D12RootSignature* signature) {
+        if (CaptureParallelState() && parallel_compute_signature != signature) {
+            parallel_snapshot.Forget(ParallelState::ComputeRootArgument);
+            parallel_snapshot.Forget(ParallelState::ComputeRootTable);
+            parallel_compute_signature = signature;
+        }
+        EncodeState<[](void* target, ID3D12RootSignature* signature) {
             static_cast<RecordingTarget*>(target)->list->SetComputeRootSignature(signature);
-        }>(*stream, signature);
+        }>({ParallelState::ComputeRootSignature}, signature);
     }
     D3D12_FORWARD_INLINE void SetGraphicsRoot32BitConstants(UINT index, UINT count,
                                                             const void* data, UINT offset) {
@@ -544,6 +652,14 @@ public:
         if (!stream) {
             immediate->SetGraphicsRoot32BitConstants(index, count, data, offset);
             return;
+        }
+        if (CaptureParallelState()) {
+            for (UINT i = 0; i < count; ++i)
+                parallel_snapshot.Remember<[](void* target, UINT slot, UINT value, UINT word) {
+                    static_cast<RecordingTarget*>(target)->list->SetGraphicsRoot32BitConstants(
+                        slot, 1, &value, word);
+                }>({ParallelState::GraphicsRootArgument, index, offset + i}, index,
+                   static_cast<const UINT*>(data)[i], offset + i);
         }
         EncodeCall<[](void* target, UINT index, UINT count, const void* data, UINT offset) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRoot32BitConstants(
@@ -559,10 +675,10 @@ public:
             immediate->SetGraphicsRootConstantBufferView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRootConstantBufferView(index,
                                                                                            address);
-        }>(*stream, index, address);
+        }>({ParallelState::GraphicsRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetGraphicsRootShaderResourceView(UINT index,
                                                                 D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -573,10 +689,10 @@ public:
             immediate->SetGraphicsRootShaderResourceView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRootShaderResourceView(index,
                                                                                            address);
-        }>(*stream, index, address);
+        }>({ParallelState::GraphicsRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetGraphicsRootUnorderedAccessView(
         UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
@@ -587,10 +703,10 @@ public:
             immediate->SetGraphicsRootUnorderedAccessView(index, address);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_VIRTUAL_ADDRESS address) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRootUnorderedAccessView(
                 index, address);
-        }>(*stream, index, address);
+        }>({ParallelState::GraphicsRootArgument, index}, index, address);
     }
     D3D12_FORWARD_INLINE void SetGraphicsRootDescriptorTable(UINT index,
                                                              D3D12_GPU_DESCRIPTOR_HANDLE handle) {
@@ -601,10 +717,10 @@ public:
             immediate->SetGraphicsRootDescriptorTable(index, handle);
             return;
         }
-        EncodeCall<[](void* target, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
+        EncodeState<[](void* target, UINT index, D3D12_GPU_DESCRIPTOR_HANDLE handle) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRootDescriptorTable(index,
                                                                                         handle);
-        }>(*stream, index, handle);
+        }>({ParallelState::GraphicsRootTable, index}, index, handle);
     }
     D3D12_FORWARD_INLINE void SetGraphicsRootSignature(ID3D12RootSignature* signature) {
         if (reuse_graphics_root_cbvs)
@@ -613,9 +729,14 @@ public:
             immediate->SetGraphicsRootSignature(signature);
             return;
         }
-        EncodeCall<[](void* target, ID3D12RootSignature* signature) {
+        if (CaptureParallelState() && parallel_graphics_signature != signature) {
+            parallel_snapshot.Forget(ParallelState::GraphicsRootArgument);
+            parallel_snapshot.Forget(ParallelState::GraphicsRootTable);
+            parallel_graphics_signature = signature;
+        }
+        EncodeState<[](void* target, ID3D12RootSignature* signature) {
             static_cast<RecordingTarget*>(target)->list->SetGraphicsRootSignature(signature);
-        }>(*stream, signature);
+        }>({ParallelState::GraphicsRootSignature}, signature);
     }
     D3D12_FORWARD_INLINE void SetDescriptorHeaps(UINT count, ID3D12DescriptorHeap* const* heaps) {
         validation.Heaps(device, count, heaps);
@@ -623,9 +744,22 @@ public:
             immediate->SetDescriptorHeaps(count, heaps);
             return;
         }
-        EncodeCall<[](void* target, UINT count, ID3D12DescriptorHeap* const* heaps) {
+        if (CaptureParallelState() &&
+            (parallel_heaps.size() != count ||
+             !std::is_permutation(parallel_heaps.begin(), parallel_heaps.end(), heaps))) {
+            // A changed heap can invalidate only some root tables. Until the encoder
+            // models the heap type of each table, do not cut after a heap switch.
+            if (!parallel_heaps.empty())
+                parallel_cuts.Disable();
+            parallel_snapshot.Forget(ParallelState::GraphicsRootTable);
+            parallel_snapshot.Forget(ParallelState::ComputeRootTable);
+            parallel_heaps.clear();
+            for (UINT i = 0; i < count; ++i)
+                parallel_heaps.push_back(heaps[i]);
+        }
+        EncodeState<[](void* target, UINT count, ID3D12DescriptorHeap* const* heaps) {
             static_cast<RecordingTarget*>(target)->list->SetDescriptorHeaps(count, heaps);
-        }>(*stream, count, Snapshot(heaps, count));
+        }>({ParallelState::DescriptorHeaps}, count, Snapshot(heaps, count));
     }
     D3D12_FORWARD_INLINE void SetMarker(UINT metadata, const void* data, UINT size) {
         if (!stream) {
@@ -641,9 +775,9 @@ public:
             immediate->SetPipelineState(state);
             return;
         }
-        EncodeCall<[](void* target, ID3D12PipelineState* state) {
+        EncodeState<[](void* target, ID3D12PipelineState* state) {
             static_cast<RecordingTarget*>(target)->list->SetPipelineState(state);
-        }>(*stream, state);
+        }>({ParallelState::Pipeline}, state);
     }
     D3D12_FORWARD_INLINE void SetPredication(ID3D12Resource* buffer, UINT64 offset,
                                              D3D12_PREDICATION_OP operation) {
@@ -651,10 +785,10 @@ public:
             immediate->SetPredication(buffer, offset, operation);
             return;
         }
-        EncodeCall<[](void* target, ID3D12Resource* buffer, UINT64 offset,
-                      D3D12_PREDICATION_OP operation) {
+        EncodeState<[](void* target, ID3D12Resource* buffer, UINT64 offset,
+                       D3D12_PREDICATION_OP operation) {
             static_cast<RecordingTarget*>(target)->list->SetPredication(buffer, offset, operation);
-        }>(*stream, buffer, offset, operation);
+        }>({ParallelState::Predication}, buffer, offset, operation);
     }
 };
 #undef D3D12_FORWARD_INLINE

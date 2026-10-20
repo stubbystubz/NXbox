@@ -35,6 +35,68 @@
 #include "video_core/renderer_d3d12/d3d12_ring_allocator.h"
 
 namespace D3D12 {
+// Second list and its allocator ring are exclusively mutated by the second recorder.
+// The first recorder reads the closed list only after the worker completion acquire.
+struct ParallelNativeState {
+    struct Slot {
+        ComPtr<ID3D12CommandAllocator> allocator;
+        u64 tick{};
+    };
+    std::vector<Slot> slots;
+    ComPtr<ID3D12GraphicsCommandList> list;
+    ComPtr<ID3D12GraphicsCommandList1> list1;
+    ComPtr<ID3D12GraphicsCommandList8> list8;
+    ID3D12Device* device{};
+    ID3D12Fence* fence{};
+    RecordingTarget target;
+    bool submit_second{}; // First recorder only; never read by the encoder.
+    void Initialize(ID3D12Device* value, ID3D12Fence* completion, size_t count) {
+        Common::SetCurrentThreadName("D3D12 parallel recorder");
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::Critical);
+        device = value;
+        fence = completion;
+        slots.resize(count);
+        for (auto& slot : slots)
+            Check(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                 IID_PPV_ARGS(&slot.allocator)),
+                  "parallel allocator", device);
+        Check(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, slots[0].allocator.Get(),
+                                        nullptr, IID_PPV_ARGS(&list)),
+              "parallel list", device);
+        Check(list->Close(), "parallel initial Close", device);
+        list.As(&list1);
+        list.As(&list8);
+        target.list = list.Get();
+        target.list1 = list1.Get();
+        target.list8 = list8.Get();
+    }
+    void Begin(u64 tick) {
+        auto& slot = slots[(tick - 1) % slots.size()];
+        const auto completed = fence->GetCompletedValue();
+        Check(device->GetDeviceRemovedReason(), "parallel allocator completion", device);
+        if (completed < slot.tick) {
+            const HANDLE event = CreateEventExW(nullptr, nullptr, 0, EVENT_ALL_ACCESS);
+            if (!event)
+                Check(HRESULT_FROM_WIN32(GetLastError()), "parallel event", device);
+            const auto status = fence->SetEventOnCompletion(slot.tick, event);
+            if (FAILED(status)) {
+                CloseHandle(event);
+                Check(status, "parallel allocator fence", device);
+            }
+            const auto wait = WaitForSingleObjectEx(event, 10000, FALSE);
+            const auto error = GetLastError();
+            CloseHandle(event);
+            if (wait != WAIT_OBJECT_0)
+                Check(wait == WAIT_FAILED ? HRESULT_FROM_WIN32(error)
+                                          : HRESULT_FROM_WIN32(ERROR_TIMEOUT),
+                      "parallel allocator wait", device);
+        }
+        Check(slot.allocator->Reset(), "parallel allocator Reset", device);
+        Check(list->Reset(slot.allocator.Get(), nullptr), "parallel list Reset", device);
+        slot.tick = tick;
+    }
+};
+
 bool BisectEnabled(const char* name) noexcept {
     // Called several times per draw with string literals; reading the process environment each
     // time showed up in the GPU thread's samples. No toggle changes after startup.
@@ -953,6 +1015,28 @@ Context::Context() {
         record_descriptors = std::make_unique<RecordDescriptors>();
         record_descriptors->Initialize(device.Get());
         facade.descriptors = record_descriptors.get();
+        facade.parallel_enabled = BisectEnabled("NXBOX_D3D12_PARALLEL_RECORD");
+        if (facade.parallel_enabled) {
+            facade.parallel_descriptors = std::make_shared<RecordDescriptors>();
+            facade.parallel_descriptors->Initialize(device.Get());
+            facade.parallel_native = std::make_shared<ParallelNativeState>();
+            auto* native = facade.parallel_native.get();
+            facade.parallel_worker = std::make_shared<ParallelRecordWorker>([this, native] {
+                native->Initialize(device.Get(), fence.Get(), allocators.size());
+                return &native->target;
+            });
+            facade.parallel_begin = [this, native] {
+                stream->RouteWritesTo(&facade.parallel_worker->Stream());
+                EncodeCall<[](void*, std::uintptr_t address, std::uintptr_t owner, u64 tick) {
+                    // Resetting the reusable list must follow the preceding CPU execute,
+                    // even if this allocator slot has never been used before.
+                    reinterpret_cast<Context*>(owner)->Acknowledge(tick - 1);
+                    reinterpret_cast<ParallelNativeState*>(address)->Begin(tick);
+                }>(*stream, reinterpret_cast<std::uintptr_t>(native),
+                   reinterpret_cast<std::uintptr_t>(this), CurrentTick());
+            };
+        }
+        Diagnostic(fmt::format("D3D12 parallel_record={}", facade.parallel_enabled));
         StartRecorder();
         facade.stream = stream.get();
     } else {
@@ -973,6 +1057,8 @@ void Context::InitializeLists() {
 }
 
 void Context::CheckRecorder() {
+    if (facade.parallel_worker)
+        facade.parallel_worker->Check();
     recorder_progress.Check();
 }
 void Context::Acknowledge(u64 tick) {
@@ -1054,9 +1140,11 @@ void Context::RecorderBegin() {
 }
 void Context::RecorderSubmit(u64 tick) {
     Check(commands->Close(), "Close", device.Get());
-    ID3D12CommandList* lists[]{commands.Get()};
+    auto* parallel = facade.parallel_native.get();
+    const bool second = parallel && std::exchange(parallel->submit_second, false);
+    ID3D12CommandList* lists[]{commands.Get(), second ? parallel->list.Get() : nullptr};
     Check(device->GetDeviceRemovedReason(), "before ExecuteCommandLists", device.Get());
-    queue->ExecuteCommandLists(1, lists);
+    queue->ExecuteCommandLists(second ? 2 : 1, lists);
     Check(device->GetDeviceRemovedReason(), "after ExecuteCommandLists", device.Get());
     if (info_callback.registered)
         ClearInfoQueue(info_callback.queue.Get());
@@ -1116,6 +1204,20 @@ u64 Context::SealRecording(FrameCount reason) {
         EncodeCall<[](void*, const char* message) { Diagnostic(message); }>(
             *stream, Snapshot(summary.c_str(), summary.size() + 1));
     }
+    if (facade.parallel_split) {
+        EncodeCall<[](void* target) {
+            Check(static_cast<RecordingTarget*>(target)->list->Close(), "parallel Close");
+        }>(*stream);
+        stream->RouteWritesTo(nullptr);
+        facade.parallel_worker->Publish(tick);
+        EncodeCall<[](void* target, u64 tick) {
+            auto* context = static_cast<Context*>(static_cast<RecordingTarget*>(target)->owner);
+            context->facade.parallel_worker->Wait(tick);
+            context->facade.parallel_native->submit_second = true;
+        }>(*stream, tick);
+    }
+    // Encoded snapshot packets retain their own immutable leases until replay retires.
+    facade.parallel_snapshot.Reset();
     EncodeCall<[](void* target, u64 tick) {
         static_cast<Context*>(static_cast<RecordingTarget*>(target)->owner)->RecorderSubmit(tick);
     }>(*stream, tick);
@@ -1150,6 +1252,8 @@ Context::~Context() {
         stream->Close();
         recorder.join();
     }
+    facade.parallel_worker.reset();
+    facade.parallel_snapshot.Reset();
 }
 void Context::LogInfoQueue() noexcept {
     if (deferred)
@@ -1356,6 +1460,7 @@ CommandFacade* Context::Commands() {
         }
         facade.validation.Begin(CurrentTick());
         facade.ResetDrawState();
+        facade.BeginParallelRecording();
         copy_writes.clear();
         // Globally unique across Context instances; never reuse a resource stamp.
         static std::atomic<u64> next_retention_generation{1};
