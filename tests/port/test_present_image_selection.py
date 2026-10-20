@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Execute the production display lookup with conflicting live image aliases."""
 
+import os
 import shlex
 import subprocess
 import tempfile
@@ -28,18 +29,31 @@ class PresentImageSelectionTests(unittest.TestCase):
                 extra_flags=[*flags, "-fsanitize=address,undefined", "-Wall", "-Wextra"],
             )
 
-    def test_presenter_fallback_downloads_gpu_owned_alias_before_guest_upload(self):
+    def test_presenter_fallback_downloads_gpu_owned_alias_before_guest_upload_only_when_opted_in(
+        self,
+    ):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_rasterizer.cpp").read_text()
         signature = "RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture("
         body = source.split(signature, 1)[1].split("\n}\n", 1)[0]
         presenter = signature + body + "\n}\n"
         harness = (ROOT / "tests/port/fixtures/present_framebuffer.cpp").read_text()
-        with tempfile.TemporaryDirectory() as directory:
-            compile_run(
-                harness.replace("// PRODUCTION_METHOD", presenter),
-                Path(directory),
-                extra_flags=["-fsanitize=address,undefined", "-Wall", "-Wextra"],
-            )
+        for value in (None, "0", "1"):
+            with self.subTest(fallback_download=value), tempfile.TemporaryDirectory() as directory:
+                environment = os.environ.copy()
+                environment.pop("NXBOX_PRESENT_FALLBACK_DOWNLOAD", None)
+                if value is not None:
+                    environment["NXBOX_PRESENT_FALLBACK_DOWNLOAD"] = value
+                compile_run(
+                    harness.replace("// PRODUCTION_METHOD", presenter),
+                    Path(directory),
+                    environment=environment,
+                    extra_flags=[
+                        "-fsanitize=address,undefined",
+                        "-Wall",
+                        "-Wextra",
+                        f"-DEXPECT_FALLBACK_DOWNLOAD={int(value == '1')}",
+                    ],
+                )
 
 
 if __name__ == "__main__":
