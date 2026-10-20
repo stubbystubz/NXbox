@@ -7,9 +7,12 @@
 #pragma once
 
 #include <array>
+#include <cstdlib>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <string_view>
+#include <type_traits>
 #include <utility>
 #include "common/container/unordered_map.h"
 
@@ -18,6 +21,7 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/core_timing_trace.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -27,6 +31,10 @@
 #include "video_core/query_cache/query_cache_base.h"
 #include "video_core/query_cache/query_stream.h"
 #include "video_core/query_cache/types.h"
+
+namespace D3D12 {
+struct QueryCacheParams;
+}
 
 namespace VideoCommon {
 
@@ -246,6 +254,25 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // D3D12 retires reports after a native GPU/fence round trip. That controls
+    // visibility, not the time the emulated GPU reached this method. Capture
+    // before WriteCounter, which may itself submit or wait for native queries.
+    bool timestamp_at_processing = false;
+    if constexpr (std::is_same_v<Traits, D3D12::QueryCacheParams>) {
+        static const bool timestamp_at_publish = [] {
+            const char* value = std::getenv("NXBOX_QUERY_TIMESTAMP_AT_PUBLISH");
+            return value && std::string_view{value} == "1";
+        }();
+        timestamp_at_processing = !timestamp_at_publish;
+    }
+    const u64 report_timestamp =
+        has_timestamp && timestamp_at_processing ? impl->gpu.GetTicks() : 0;
+    if (has_timestamp && Core::Timing::Trace::Enabled()) {
+        Core::Timing::Trace::Record(Core::Timing::Trace::Source::QueryIssue,
+                                    timestamp_at_processing ? report_timestamp
+                                                            : impl->gpu.GetTicks(),
+                                    timestamp_at_processing, cpu_addr);
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
@@ -289,7 +316,8 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             diagnostic_token = impl->runtime.ReportPending(cpu_addr);
     }
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
-                                     pointer, pointer_timestamp, diagnostic_token] {
+                                     pointer, pointer_timestamp, diagnostic_token,
+                                     timestamp_at_processing, report_timestamp] {
         std::scoped_lock lock(cache_mutex);
         const auto complete = [&](bool invalidated) {
             if constexpr (requires {
@@ -316,7 +344,11 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         query_base->value += streamer->GetAmendValue();
         streamer->SetAccumulationValue(query_base->value);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
-            u64 timestamp = impl->gpu.GetTicks();
+            const u64 timestamp = timestamp_at_processing ? report_timestamp : impl->gpu.GetTicks();
+            if (Core::Timing::Trace::Enabled()) {
+                Core::Timing::Trace::Record(Core::Timing::Trace::Source::QueryPublish, timestamp,
+                                            impl->gpu.GetTicks(), query_base->guest_address);
+            }
             std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
             std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
         } else {
@@ -334,7 +366,12 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     } else {
         if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
             if (has_timestamp) {
-                u64 timestamp = impl->gpu.GetTicks();
+                const u64 timestamp =
+                    timestamp_at_processing ? report_timestamp : impl->gpu.GetTicks();
+                if (Core::Timing::Trace::Enabled()) {
+                    Core::Timing::Trace::Record(Core::Timing::Trace::Source::QueryPublish,
+                                                timestamp, impl->gpu.GetTicks(), cpu_addr);
+                }
                 u64 value = static_cast<u64>(payload);
                 std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
                 std::memcpy(pointer, &value, sizeof(value));

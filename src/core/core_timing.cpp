@@ -5,10 +5,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <tuple>
-#include "common/cpu_features.h"
 #include "common/cpu_features.h"
 
 #ifdef _WIN32
@@ -17,11 +17,34 @@
 #include "common/windows/timer_resolution.h"
 #endif
 
+#include "common/logging.h"
 #include "common/settings.h"
 #include "core/core_timing.h"
+#include "core/core_timing_trace.h"
 #include "core/hardware_properties.h"
 
 namespace Core::Timing {
+
+void Trace::Flush() {
+    if (!Enabled()) {
+        return;
+    }
+    static std::mutex flush_mutex;
+    std::unique_lock lock{flush_mutex, std::try_to_lock};
+    if (!lock.owns_lock()) {
+        return;
+    }
+    for (std::size_t i = 0; i < Names.size(); ++i) {
+        auto batch = FlightRecorder().Take(static_cast<Source>(i));
+        LOG_INFO(Core, "NXBOX_TIMING_TRACE source={} samples={} overwritten={} contended={}",
+                 Names[i], batch.samples.size(), batch.overwritten, batch.contended);
+        for (const auto& sample : batch.samples) {
+            LOG_INFO(
+                Core, "NXBOX_TIMING_TRACE source={} host_ns={} thread={} value={} detail={} id={}",
+                Names[i], sample.host_ns, sample.thread, sample.value, sample.detail, sample.id);
+        }
+    }
+}
 
 constexpr s64 MAX_SLICE_LENGTH = 10000;
 
@@ -72,6 +95,21 @@ void CoreTiming::Initialize(std::function<void()>&& on_thread_init_) {
     on_thread_init = std::move(on_thread_init_);
     event_fifo_id = 0;
     cpu_ticks = 0;
+    if (Trace::Enabled()) {
+        for (std::size_t i = 0; i < Trace::Names.size(); ++i) {
+            Trace::FlightRecorder().Take(static_cast<Trace::Source>(i));
+        }
+        trace_thread = std::jthread([](std::stop_token stop) {
+            Common::SetCurrentThreadName("TimingTrace");
+            std::mutex mutex;
+            std::condition_variable_any wake;
+            std::unique_lock lock{mutex};
+            while (!stop.stop_requested()) {
+                wake.wait_for(lock, stop, std::chrono::milliseconds{250}, [] { return false; });
+                Trace::Flush();
+            }
+        });
+    }
     if (is_multicore) {
         timer_thread = std::jthread([this](std::stop_token stop_token) {
             Common::SetCurrentThreadName("HostTiming");
@@ -253,6 +291,7 @@ void CoreTiming::ResetTicks() {
 
 u64 CoreTiming::GetClockTicks() const {
     u64 fres = is_multicore ? Common::g_wall_clock.GetCNTPCT() : Common::WallClock::CPUTickToCNTPCT(cpu_ticks);
+    const u64 raw_ticks = fres;
     if (const u32 target = CpuClockTargetMhz(Settings::values.cpu_clock.GetValue());
         target != CPU_CLOCK_BASE_MHZ) {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
@@ -260,15 +299,17 @@ u64 CoreTiming::GetClockTicks() const {
     if (::Settings::values.sync_core_speed.GetValue()) {
         auto const ticks = f64(fres);
         auto const speed_limit = f64(Settings::SpeedLimit()) * 0.01;
-        return u64(ticks / speed_limit);
+        fres = u64(ticks / speed_limit);
     }
+    Trace::Record(Trace::Source::ClockTicks, fres, raw_ticks);
     return fres;
 }
 
 u64 CoreTiming::GetGPUTicks() const {
-    return is_multicore
-        ? Common::g_wall_clock.GetGPUTick()
-        : Common::WallClock::CPUTickToGPUTick(cpu_ticks);
+    const u64 ticks = is_multicore ? Common::g_wall_clock.GetGPUTick()
+                                   : Common::WallClock::CPUTickToGPUTick(cpu_ticks);
+    Trace::Record(Trace::Source::GpuTicks, ticks);
+    return ticks;
 }
 
 std::optional<s64> CoreTiming::Advance() {
@@ -331,6 +372,10 @@ std::optional<s64> CoreTiming::Advance() {
 }
 
 void CoreTiming::Reset() {
+    if (trace_thread.joinable()) {
+        trace_thread.request_stop();
+        trace_thread.join();
+    }
     paused = true;
     pause_event.Set();
     event.Set();

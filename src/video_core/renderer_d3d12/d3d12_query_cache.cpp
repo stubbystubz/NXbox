@@ -14,6 +14,7 @@
 
 #include "common/logging.h"
 #include "common/settings.h"
+#include "core/core_timing_trace.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/query_cache/query_cache.h"
 #include "video_core/rasterizer_interface.h"
@@ -1203,7 +1204,10 @@ u64 QueryCacheRuntime::ReadTimestamp(const Timestamp& timestamp) {
     impl->context.Wait(timestamp.tick);
     u64 ticks{};
     std::memcpy(&ticks, timestamp.result.mapped_span.data(), 8);
-    return TimestampNanoseconds(ticks, timestamp.frequency);
+    const auto ns = TimestampNanoseconds(ticks, timestamp.frequency);
+    Core::Timing::Trace::Record(Core::Timing::Trace::Source::NativeTimestamp, ns, ticks,
+                                timestamp.frequency);
+    return ns;
 }
 } // namespace D3D12
 namespace VideoCommon {

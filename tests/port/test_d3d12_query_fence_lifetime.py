@@ -42,7 +42,7 @@ template<class T> T operator&(T a,T b) { return T(u32(a)&u32(b)); }
 template<class T> T& operator|=(T& a,T b) { return a=a|b; }
 template<class T> bool True(T a) { return u32(a)!=0; }
 template<class T> bool False(T a) { return !True(a); }
-struct Query { u64 value; QueryFlagBits flags; bool alive=true; };
+struct Query { u64 value; QueryFlagBits flags; bool alive=true; u64 guest_address=16; };
 struct Field { u32 value{}; void Assign(u32 v) { value=v; } };
 struct QueryLocation { Field stream_id,query_id; };
 struct StreamerInterface {
@@ -162,7 +162,11 @@ class D3D12QueryFenceLifetimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="nxbox-query-fence-lifetime-") as folder:
             cpp = Path(folder) / "reports.cpp"
             binary = Path(folder) / "reports"
-            cpp.write_text(DRIVER.replace("__COUNTER_REPORT__", report))
+            cpp.write_text(
+                f'#include "{ROOT / "src/core/core_timing_trace.h"}"\n'
+                "namespace D3D12 { struct QueryCacheParams; }\n"
+                + DRIVER.replace("__COUNTER_REPORT__", report)
+            )
             result = subprocess.run(
                 ["clang++", "-std=c++20", str(cpp), "-o", str(binary)],
                 capture_output=True,

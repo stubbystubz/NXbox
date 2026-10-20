@@ -157,6 +157,7 @@ public:
     Common::Event pause_event{};
     std::function<void()> on_thread_init{};
     std::jthread timer_thread;
+    std::jthread trace_thread;
     mutable std::mutex basic_lock;
     std::mutex advance_lock;
     std::atomic<bool> paused{};
