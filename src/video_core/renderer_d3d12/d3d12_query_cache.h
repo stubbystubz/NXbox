@@ -19,6 +19,9 @@ class TransformFeedback;
 class BufferCacheRuntime;
 struct QueryCacheRuntimeImpl;
 
+// Default-on draw bookkeeping shortcuts; set NXBOX_D3D12_RASTERIZER_STATE_FASTPATH=0 to bisect.
+bool RasterizerStateFastpathEnabled();
+
 // Integration: construct beside BufferCache/TransformFeedback, then construct
 // QueryCache with (gpu, rasterizer, device_memory, runtime). Route channel binding,
 // Query/ResetCounter, WFI, invalidation and fence flushes to QueryCache as Vulkan

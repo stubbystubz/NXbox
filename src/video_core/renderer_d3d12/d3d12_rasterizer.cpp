@@ -913,22 +913,33 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
 
     draw_phase.emplace(context.Profile(), FramePhase::ResourceBindings);
     // ---- 1. Gather views/samplers and tell the buffer cache what the shaders use ----
+    static const bool rasterizer_state_fastpath = RasterizerStateFastpathEnabled();
+    std::array<const Shader::Info*, NUM_GRAPHICS_STAGES> stage_infos{};
     StageTableCounts totals{};
     bool has_images = false;
     for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
-        uniform_masks[stage] = 0;
-        uniform_sizes[stage].fill(0);
-        if (const Shader::Info* info = pipeline->StageInfo(stage)) {
-            uniform_masks[stage] = info->constant_buffer_mask;
-            // The HLSL byte-addressed cbuffer can read dynamic offsets. Bind the
-            // full guest range (the shared cache clamps this to the guest size).
-            uniform_sizes[stage].fill(65536);
+        const Shader::Info* const info = pipeline->StageInfo(stage);
+        stage_infos[stage] = info;
+        uniform_masks[stage] = info ? info->constant_buffer_mask : 0;
+        // Every entry in a graphics stage has the same size. These arrays are
+        // initialized to zero and only written here; comparing the first entry
+        // detects the whole-array transition without rewriting it on every draw.
+        // Keep SetUniformBuffersState below: channel switches still need it.
+        if (!rasterizer_state_fastpath)
+            uniform_sizes[stage].fill(0);
+        if (info) {
+            // Dynamic HLSL cbuffer offsets require the full guest range; the
+            // shared buffer cache clamps it to the current guest binding size.
+            if (!rasterizer_state_fastpath || uniform_sizes[stage][0] != 65536)
+                uniform_sizes[stage].fill(65536);
             const auto counts = CountStageTables(*info);
             totals.cbv += counts.cbv;
             totals.srv += counts.srv;
             totals.uav += counts.uav;
             totals.sampler += counts.sampler;
             has_images |= !info->image_descriptors.empty();
+        } else if (rasterizer_state_fastpath && uniform_sizes[stage][0] != 0) {
+            uniform_sizes[stage].fill(0);
         }
     }
     buffer_cache.SetUniformBuffersState(uniform_masks, &uniform_sizes);
@@ -937,7 +948,8 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     sampler_scratch.clear();
     const bool via_header_index = regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding;
     for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
-        const Shader::Info* info = pipeline->StageInfo(stage);
+        const Shader::Info* info =
+            (rasterizer_state_fastpath ? stage_infos[stage] : pipeline->StageInfo(stage));
         if (!info)
             continue;
         buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -1006,7 +1018,8 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     {
         const VideoCommon::ImageViewInOut* it = view_scratch.data();
         for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
-            const Shader::Info* info = pipeline->StageInfo(stage);
+            const Shader::Info* info =
+                (rasterizer_state_fastpath ? stage_infos[stage] : pipeline->StageInfo(stage));
             if (!info)
                 continue;
             buffer_cache.UnbindGraphicsTextureBuffers(stage);
@@ -1072,7 +1085,7 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     draw_phase.emplace(context.Profile(), FramePhase::StageBuffers);
     for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
         bindings.stages[stage].Clear();
-        if (!pipeline->StageInfo(stage))
+        if (!(rasterizer_state_fastpath ? stage_infos[stage] : pipeline->StageInfo(stage)))
             continue;
         bindings.current_stage = stage;
         buffer_cache.BindHostStageBuffers(stage);
@@ -2220,8 +2233,14 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                                                 0);
 
     draw_phase.emplace(context.Profile(), FramePhase::QueryState);
-    query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
-                              regs.zpass_pixel_count_enable != 0);
+    if (rasterizer_state_fastpath) {
+        // CounterStreamer::Start/PauseCounter only forwards to EnableCounter.
+        query_runtime.EnableCounter(VideoCommon::QueryType::ZPassPixelCount64,
+                                    regs.zpass_pixel_count_enable != 0);
+    } else {
+        query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                  regs.zpass_pixel_count_enable != 0);
+    }
     if (feedback_info)
         transform_feedback.Bind(true);
     else
