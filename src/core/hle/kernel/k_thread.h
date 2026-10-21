@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
@@ -32,6 +33,10 @@
 #include "core/hle/kernel/svc_common.h"
 #include "core/hle/kernel/svc_types.h"
 #include "core/hle/result.h"
+
+#ifdef NXBOX_UWP
+#include "core/hle/kernel/nxbox_thread_profile.h"
+#endif
 
 namespace Common {
 class Fiber;
@@ -179,6 +184,7 @@ public:
      */
 #ifdef NXBOX_UWP
     Core::NxboxFault::SvcHistory nxbox_svc_history{};
+    std::unique_ptr<NxboxThreadProfile::Profile> nxbox_thread_profile;
 #endif
 
     u64 GetThreadId() const {

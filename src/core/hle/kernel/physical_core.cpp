@@ -72,6 +72,25 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
         m_current_thread = nullptr;
     };
 
+#ifdef NXBOX_UWP
+    if (NxboxThreadProfile::Enabled() && !thread->nxbox_thread_profile) {
+        thread->nxbox_thread_profile = std::make_unique<NxboxThreadProfile::Profile>();
+    }
+    auto* const profile = thread->nxbox_thread_profile.get();
+    const auto poll_profile = [&] {
+        if (profile) {
+            profile->Poll(
+                [&](const char* kind, auto key, const auto& time, auto interval) {
+                    LOG_INFO(Kernel,
+                             "THREAD_PROFILE guest_thread={} kind={} key={:#x} calls={} "
+                             "wall_us={} max_us={} interval_ms={}",
+                             thread->GetThreadId(), kind, key, time.calls, time.total_us,
+                             time.max_us, interval);
+                },
+                NxboxThreadProfile::Profile::Clock::now());
+        }
+    };
+#endif
     while (true) {
         // If the thread is scheduled for termination, exit.
         if (thread->HasDpc() && thread->IsTerminationRequested()) {
@@ -94,6 +113,10 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 return;
             }
 
+#ifdef NXBOX_UWP
+            const auto run_start = profile ? NxboxThreadProfile::Profile::Clock::now()
+                                           : NxboxThreadProfile::Profile::Clock::time_point{};
+#endif
             if (thread->GetStepState() == StepState::StepPending) {
                 hr = interface->StepThread(thread);
 
@@ -104,7 +127,15 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                 hr = interface->RunThread(thread);
             }
 
+#ifdef NXBOX_UWP
+            if (profile) {
+                profile->Run(run_start, NxboxThreadProfile::Profile::Clock::now());
+            }
+#endif
             ExitContext();
+#ifdef NXBOX_UWP
+            poll_profile();
+#endif
         }
 
         // Determine why we stopped.
@@ -171,9 +202,16 @@ void PhysicalCore::RunThread(KernelCore& kernel, Kernel::KThread* thread) {
                     : NxboxWait::Begin(NxboxWait::Kind::Svc, thread->GetThreadId(),
                                        std::to_string(interface->GetSvcNumber()), args,
                                        thread->GetContext().pc, thread->GetContext().lr);
+            const auto svc_number = interface->GetSvcNumber();
+            const auto svc_start = profile ? NxboxThreadProfile::Profile::Clock::now()
+                                           : NxboxThreadProfile::Profile::Clock::time_point{};
 #endif
             Svc::Call(system, interface->GetSvcNumber());
 #ifdef NXBOX_UWP
+            if (profile) {
+                profile->Svc(svc_number, svc_start, NxboxThreadProfile::Profile::Clock::now());
+                poll_profile();
+            }
             // A blocking SVC may migrate the guest thread. Reacquire the current core.
             kernel.CurrentPhysicalCore().SaveSvcArguments(*process, args);
             entry.output_x0 = args[0];

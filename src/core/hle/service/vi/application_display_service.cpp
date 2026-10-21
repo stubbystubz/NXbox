@@ -7,6 +7,9 @@
 #ifdef _WIN32
 #include <atomic>
 #endif
+#ifdef NXBOX_UWP
+#include "core/hle/kernel/nxbox_thread_profile.h"
+#endif
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/nvnflinger/hos_binder_driver.h"
 #include "core/hle/service/nvnflinger/parcel.h"
@@ -273,6 +276,12 @@ Result IApplicationDisplayService::GetDisplayVsyncEvent(
 
     m_container->LinkVsyncEvent(display_id, &it->second);
     *out_vsync_event = it->second.GetHandle();
+#ifdef NXBOX_UWP
+    if (Kernel::NxboxThreadProfile::Enabled()) {
+        LOG_INFO(Service_VI, "THREAD_PROFILE event_object={:#x} name=DisplayVsync display_id={}",
+                 reinterpret_cast<std::uintptr_t>(it->second.GetHandle()), display_id);
+    }
+#endif
 
     R_SUCCEED();
 }

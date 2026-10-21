@@ -101,7 +101,22 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     }
 
     // Wait on the objects.
+#ifdef NXBOX_UWP
+    auto* const profile = GetCurrentThread(system.Kernel()).nxbox_thread_profile.get();
+    const auto wait_start = profile ? NxboxThreadProfile::Profile::Clock::now()
+                                    : NxboxThreadProfile::Profile::Clock::time_point{};
+#endif
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+#ifdef NXBOX_UWP
+    if (profile) {
+        // Successful multi-object waits identify the selected object, not every
+        // object in the wait set. Failed waits deliberately use key zero.
+        const auto object = R_SUCCEEDED(res) && *out_index >= 0 && *out_index < num_handles
+                                ? reinterpret_cast<std::uintptr_t>(objs[*out_index])
+                                : 0;
+        profile->Sync(object, wait_start, NxboxThreadProfile::Profile::Clock::now());
+    }
+#endif
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);

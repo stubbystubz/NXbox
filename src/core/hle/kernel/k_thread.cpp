@@ -381,6 +381,9 @@ namespace Kernel {
 
         // Release host emulation members.
         m_host_context.reset();
+#ifdef NXBOX_UWP
+        nxbox_thread_profile.reset();
+#endif
 
         // Perform inherited finalization.
         KSynchronizationObject::Finalize(kernel);
