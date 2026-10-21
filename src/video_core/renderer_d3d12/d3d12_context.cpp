@@ -836,28 +836,28 @@ void FrameProfile::EndFrame(bool presented) {
         if (guest_visibility)
             line += guest_visibility();
         if (method_enabled) {
-            using namespace Common::MaxwellMethodProfile;
+            namespace MP = Common::MaxwellMethodProfile;
             std::string method_line = "NXBOX METHOD_PROFILE";
             const double divisor = frames ? static_cast<double>(frames) : 1.0;
-            const auto append = [&](std::string_view name, const Sample& sample) {
+            const auto append = [&](std::string_view name, const MP::Sample& sample) {
                 method_line +=
                     fmt::format(" {}={:.6f},{:.3f}", name, sample.ticks / (10000.0 * divisor),
                                 sample.count / divisor);
             };
-            for (unsigned i = 0; i < Other; ++i)
-                append(Names[i], samples[i]);
-            Sample other{};
-            std::array<unsigned, RegisterCount> indices{};
-            for (unsigned i = 0; i < RegisterCount; ++i) {
+            for (unsigned i = 0; i < MP::Other; ++i)
+                append(MP::Names[i], samples[i]);
+            MP::Sample other{};
+            std::array<unsigned, MP::RegisterCount> indices{};
+            for (unsigned i = 0; i < MP::RegisterCount; ++i) {
                 indices[i] = i;
-                other.ticks += samples[ClassCount + i].ticks;
-                other.count += samples[ClassCount + i].count;
+                other.ticks += samples[MP::ClassCount + i].ticks;
+                other.count += samples[MP::ClassCount + i].count;
             }
             append("other", other);
             std::partial_sort(indices.begin(), indices.begin() + 16, indices.end(),
                               [&](unsigned a, unsigned b) {
-                                  const auto& x = samples[ClassCount + a];
-                                  const auto& y = samples[ClassCount + b];
+                                  const auto& x = samples[MP::ClassCount + a];
+                                  const auto& y = samples[MP::ClassCount + b];
                                   if (x.ticks != y.ticks)
                                       return x.ticks > y.ticks;
                                   if (x.count != y.count)
@@ -866,7 +866,7 @@ void FrameProfile::EndFrame(bool presented) {
                               });
             for (unsigned i = 0; i < 16; ++i) {
                 const auto index = indices[i];
-                const auto& sample = samples[ClassCount + index];
+                const auto& sample = samples[MP::ClassCount + index];
                 if (sample.count)
                     append(fmt::format("other_0x{:03x}", index), sample);
             }

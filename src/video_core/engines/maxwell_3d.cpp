@@ -491,24 +491,24 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, const std::vec
 }
 
 u32 Maxwell3D::MethodProfileKey(u32 method) const {
-    using namespace Common::MaxwellMethodProfile;
+    namespace MP = Common::MaxwellMethodProfile;
     if (method >= MacroRegistersStart)
-        return Macro;
+        return MP::Macro;
     if (method >= MAXWELL3D_REG_INDEX(const_buffer.buffer) &&
         method < MAXWELL3D_REG_INDEX(const_buffer.buffer) + 16)
-        return ConstantBuffer;
+        return MP::ConstantBuffer;
     switch (method) {
     case MAXWELL3D_REG_INDEX(inline_data):
     case MAXWELL3D_REG_INDEX(launch_dma):
-        return InlineUpload;
+        return MP::InlineUpload;
     case MAXWELL3D_REG_INDEX(draw.begin):
-        return DrawBegin;
+        return MP::DrawBegin;
     case MAXWELL3D_REG_INDEX(draw.end):
-        return DrawEnd;
+        return MP::DrawEnd;
     case MAXWELL3D_REG_INDEX(draw_inline_index):
     case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
     case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
-        return DrawInline;
+        return MP::DrawInline;
     case MAXWELL3D_REG_INDEX(index_buffer.count):
     case MAXWELL3D_REG_INDEX(index_buffer32_first):
     case MAXWELL3D_REG_INDEX(index_buffer16_first):
@@ -516,13 +516,13 @@ u32 Maxwell3D::MethodProfileKey(u32 method) const {
     case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
     case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
     case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
-        return DrawIndexed;
+        return MP::DrawIndexed;
     case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
     case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
     case MAXWELL3D_REG_INDEX(draw_texture.src_y0):
-        return Draw;
+        return MP::Draw;
     case MAXWELL3D_REG_INDEX(clear_surface):
-        return Clear;
+        return MP::Clear;
     case MAXWELL3D_REG_INDEX(report_semaphore.query):
     case MAXWELL3D_REG_INDEX(render_enable.mode):
     case MAXWELL3D_REG_INDEX(clear_report_value):
@@ -531,9 +531,9 @@ u32 Maxwell3D::MethodProfileKey(u32 method) const {
     case MAXWELL3D_REG_INDEX(fragment_barrier):
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
-        return QuerySync;
+        return MP::QuerySync;
     default:
-        return execution_mask[method] ? ClassCount + method : PlainRegisters;
+        return execution_mask[method] ? MP::ClassCount + method : MP::PlainRegisters;
     }
 }
 
