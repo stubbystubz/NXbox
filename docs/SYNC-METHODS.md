@@ -1,8 +1,200 @@
 # D3D12 query/sync CPU audit
 
-Baseline: `95687cd04063eca3f812d71127e270ca557a52d1`, branch
-`p42/sync-methods`. Changes are uncommitted. Measurements below are **host CPU
+Current work: branch `p43/fence-scopes`, uncommitted. The p43 section separates
+console evidence from source analysis and an unmeasured opt-in mitigation.
+The earlier p42 audit/replays below use baseline
+`95687cd04063eca3f812d71127e270ca557a52d1`; those benchmark results are **host CPU
 replays**, not a measured Xbox improvement.
+
+## p43: fence and conditional subdivisions
+
+The later Xbox MK8D capture `r-mk8d-mp70/eden.txt`, with
+`NXBOX_D3D12_METHOD_PROFILE=1`, contains 45 valid windows and one malformed line.
+`method_rank.py` reproduces median `other_0x0b2` = **8.4073 ms/frame**, **3.321
+words/frame**, and `other_0x556` = **1.6827 ms/frame**, **97.938 words/frame**.
+The ratio of the separate medians for sync_info is approximately 2.53 ms/call;
+it is not a measured latency distribution. Both FENCE_BATCHING and SUBMIT_TRACE
+are explicitly logged as zero. These register details belong to the `other`
+aggregate, not `query_sync`, in this revision. The earlier mp69 class totals
+below describe an older classifier and must not be compared as identical bins.
+
+### New output and interpretation
+
+Under the same exact, latched METHOD_PROFILE gate, named scopes move time out
+of their enclosing register/method scope into these disjoint classes:
+
+| Key | Interval and what the next console split can distinguish |
+| --- | --- |
+| `commit_async_flushes` | Entire generic CommitAsyncFlushes, including acquiring the buffer/texture locks and all three cache commits. A high value localizes interval processing, staging/resource allocation, pending query writes or cache lock contention; it does not distinguish the three caches internally. |
+| `create_fence` | CreateFence only: D3D12 make_shared of InnerFence. No D3D12 fence creation, submit, GPU wait or memory download. A high value means host allocation/scheduling cost. |
+| `fence_lock` | Only the wait to acquire the async publication guard. It excludes the work performed while holding it. The completion thread releases this guard before WaitFence, PopAsyncFlushes and guest callbacks, so it does not hold this lock across the GPU wait or readback copy. |
+| `queue_fence` | QueueFence → InnerFence::Queue → Submit, or PendingFenceTick with deferred submission. Includes before_submit/FlushBatch before Submit changes phase; excludes time spent in Submit/FenceWait phases. A small value does not rule out an expensive native submission. |
+| `flush_commands` | Rasterizer::FlushCommands, including CommitPendingOperations and FlushDiskCache after Submit. The latter locks the disk-cache mutex and, when dirty, serializes/writes the pipeline library. Large CPU/file work can remain here even when the requested native submit is empty. |
+| `invalidate_gpu_cache` | Feedback epoch, GPU::InvalidateGPUCache, System::GatherGPUDirtyMemory and every OnCacheInvalidation callback. Large values identify dirty-run/cache work or contention, not a whole-RAM scan. |
+| `accelerate_conditional` | Entire AccelerateConditionalRendering attempt, including attempts returning false. Query lookup, predicate resource creation and any internal CPU-predicate ReadGuest path belong here. |
+| `fallback_condition` | The Maxwell override/mode switch after acceleration returns false, including ReadBlock/FlushRegion when a comparison needs guest memory. True/False and forced overrides also count but perform no read. |
+
+Counts for these new keys are **scope invocations**, not method words or bytes.
+They can be entered by other fence users as well as sync_info. Parent register
+counts remain unchanged, but parent exclusive time shrinks. The sum of the new
+classes plus remaining parent time reconstructs attributed method-clock work,
+not the old individual register ranking in isolation. Nested scopes subtract
+children, including reentrant fence publication. method_rank prints the names
+automatically, with a wider label column; the logger now iterates all named
+classes while still computing `other` from the register samples separately.
+
+All these intervals use the existing cumulative **exclusive Maxwell phase
+clock**, not a new wall clock. Submit, FenceWait, UploadAllocation and explicit
+buffer/texture download phases still pause attribution. Correlate `cpu_submit`,
+`cpu_fence_wait`, download/allocation phases, `wait_allocator_*`,
+`wait_finish_*`, forced-submit counters and query-report waits in FrameProfile.
+A GPU wait excluded by a phase must not be inferred absent from a zero sub-key.
+Uninstrumented overhead (policy checks, reserve, publication queues, notify,
+etc.) remains in the enclosing method. Samples finishing across a window reset
+retain the existing completion-window rule. No clock, lock, allocation or
+environment lookup is added by a disabled subdivision; it checks the existing
+recording-thread TLS collector pointer. Cache locks and native work themselves
+are unchanged by instrumentation.
+
+### Blocking and memory work verified in source
+
+- **Cache commit:** BufferCache::CommitAsyncFlushesHigh subtracts overlapping
+  committed ranges, visits buffers/download ranges, allocates staging and
+  records copies. Cost grows with ranges/copies (the overlapping-range pass can
+  be quadratic in the number of committed sets), not a fixed scalar signal.
+  TextureCache's D3D12 policy implements async downloads: it totals pending
+  images, allocates a dedicated mapped readback lease and records DownloadMemory.
+  QueryCache commits NotifyWFI/SyncWrites, pending vectors, streamer locks and
+  batch registration. None performs an unconditional Finish per normal async
+  commit. CPU copies/unswizzling happen on PopAsyncFlushes after completion and
+  scale with downloaded bytes; the producer can contend on their cache locks.
+- **Indirect commit waits:** Commands() can open a recording during any copy or
+  query write. In the direct recorder it calls
+  WaitSubmitted(allocators[allocator_index].tick, "allocator") before Reset.
+  The native recorder waits on its own allocator reuse; deferred profiling also
+  protects timestamp-slot reuse. StagingRing::Request can Finish at its 64 MiB
+  pressure limit. CreateBuffer/CreateResource can Finish on memory pressure or
+  allocation retry. These calls are reachable from both cache commits and
+  predicate creation. Those waits protect live resources and are retained.
+- **Readback mapping:** CreateResource and the placed-buffer pool map new staging
+  resources at allocation, before their GPU copies are issued; Map is not the
+  completion protocol. The CPU reads persistently mapped bytes only after a
+  native completion wait (or after Finish in a synchronous path). There is no
+  unconditional "map waits for this download" in normal CommitAsyncFlushes.
+  Image::Transfer's converted **GPU DMA destination** bridge explicitly Finishes
+  and repacks bytes, but normal async texture commit supplies no GPU destination
+  and does not take that bridge. Scaling/conversion/copy work and memory-pressure
+  allocations can still be expensive; no claim that MK8D takes these branches
+  is supported by mp70.
+- **Queue/flush:** Submit itself does not unconditionally wait for a free
+  allocator. It closes/executes/signals the current list, retains resources and
+  queues completion work; before_submit flushes query reductions. Allocator
+  recycling happens on the *next* Commands()/RecorderBegin. SUBMIT_TRACE adds
+  WaitSubmitted after each submit, but is off in mp70. A queue driver call may
+  block internally; source alone cannot establish its console latency. Submit
+  also calls EndFrame, so a window may close inside a named scope. FlushCommands
+  subsequently serializes the dirty disk pipeline library, O(library bytes),
+  under its own mutex. This is CPU/storage work, not proof of a GPU wait.
+- **Invalidation:** Gather exchanges each core's current dirty transform and
+  swaps its vectors under a mutex; it iterates recorded transforms and contiguous
+  dirty runs. OnCacheInvalidation flushes overlapping queued query reductions,
+  then WriteMemory/InvalidateRegion visits affected buffer, texture and shader
+  metadata under locks. Cost grows with dirty runs, covered cached objects and
+  dirty ranges; it does not read every byte of guest RAM. There is no direct
+  Finish in this chain; any command recording/allocation invoked by a pending
+  query flush can encounter the allocator/pressure paths above.
+- **Condition acceleration:** Cache-map and buffer-cache locks, SyncWrites,
+  FlushBatch and fresh predicate allocation can do work proportional to pending
+  reports or affected ranges. CompareConditional's CPU predicate/high-accuracy
+  fallback ReadGuest copies eight bytes through a GPU readback and calls Finish
+  once per operand. That is a real CPU/GPU serialization **inside the acceleration
+  attempt**, even when it returns true. The native predication path avoids that
+  explicit readback; allocator/staging/memory-pressure waits remain possible.
+- **Maxwell fallback:** ReadBlock first drains the optional GPU pipeline, then
+  FlushRegion on the 16-byte Compare range. FlushRegion can download overlapping
+  buffers/images and finish/wait for them; query FlushRegion may request
+  ReleaseFences for a host-managed report not yet guest-synced. The memory copy
+  is small, but flushing an overlapping image can process its full contents.
+  Removing these waits would allow comparisons against stale guest values.
+
+### Opt-in mitigation: NXBOX_D3D12_SYNC_FAST=1
+
+A native Switch syncpoint orders GPU work and advances on GPU completion; it
+needs no host command-list boundary per signal. On D3D12 the default immediate
+QueueFence submit fragments recordings and consumes bounded allocator slots.
+Opening later lists can then serialize the recording CPU with GPU completion.
+This is an avoidable host boundary, although the allocator-reuse wait itself is
+required for correctness. It is **not established as the cause of the 8.4073 ms
+exclusive sync_info time**, because its GPU wait is excluded from that clock.
+
+SYNC_FAST reuses the existing FENCE_BATCHING protocol rather than introducing a
+second queue/retirement implementation. Either exact flag value `1` enables
+PendingFenceTick capture and suppresses the per-fence FlushCommands. Both flags
+default off; SYNC_FAST works with FENCE_BATCHING=0 and is logged at startup.
+Use the same enabled profiling scene with SYNC_FAST=0 and then 1; restart
+between runs. The profile gate and the optimization gate are independent.
+
+All cache commits, invalidation boundaries and FIFO callbacks remain. Guest
+syncpoints increment immediately; host increments stay in callbacks after the
+captured tick completes on the GPU. A tick not yet submitted is never passed to
+the GPU-completion timeout. Command/DMA boundaries, presentation, forced drains
+and the existing submission wakeups supply progress. A forced guest wait submits
+the pending tick before sleeping; submit failure propagates instead of stranding
+an unsubmitted fence. Completed ticks need no empty submission. The opt-in has
+the existing batching policy's progress assumptions and potential latency tradeoff
+for work before the next submission boundary; it does not enlarge allocator
+rings, skip invalidation, publish early or relax predicate accuracy. See the
+fence batching progress contract in `docs/nxbox-port.md`.
+
+Expected evidence, **not measured results**: fewer forced guest-fence executes
+and less allocator pressure, while cache-commit and invalidation work may stay
+unchanged. Per-fence `flush_commands` invocations disappear; normal boundary
+flushes still persist the pipeline library. If `invalidate_gpu_cache` or
+`commit_async_flushes` owns the exclusive bottleneck, this mitigation need not
+improve it. Compare total GPU-thread/frame wall time and correct scene output,
+not only the smaller remaining `other_0x0b2` row. No Xbox build or new console
+capture was performed for this patch.
+
+### p43 validation
+
+New tests execute production ProcessQueryCondition with acceleration accepted
+and rejected, all five normal modes, and disabled instrumentation; check nested
+exclusive named scopes, exceptions and reference returns; and parse production
+logger output containing the new classes. The real D3D12 fence-manager source
+runs against the existing fake GPU with all four combinations of SYNC_FAST and
+FENCE_BATCHING. It verifies pre-completion host values, FIFO callbacks, deferred
+progress without another guest command, forced drains, empty submits and failed
+submissions. A collector on the producer also checks all six SignalFence scope
+counts, while retirement runs on the completion thread.
+
+
+Final p43 host validation (Mac arm64):
+
+```text
+python3 -m unittest discover -s tests/port
+Ran 994 tests in 530.645s
+FAILED (errors=2, skipped=44)
+Differential cases: 651265
+```
+
+The only errors were the two known fontTools import failures. Repeating the
+same discovery with an existing cached fontTools package on PYTHONPATH (no
+installation or repository dependency changes) passed:
+
+```text
+Ran 992 tests in 541.805s
+OK (skipped=44)
+Differential cases: 651265
+```
+
+The count drops by two because successful imports remove unittest's synthetic
+failed-import cases; these two files contain pytest functions, not unittest
+cases. The seven method-profile tests and five fence-manager tests also pass
+independently. Changed C++ ranges pass clang-format; changed Python ranges pass
+Ruff formatting; `git diff --check` is clean. Logs and the reproduced mp70 ranking
+are saved outside the repository in
+`artifacts/compat-2026-10-18/p43-fence-scopes-validation/`. No commits were made.
+
 
 ## Console evidence and workload limits
 

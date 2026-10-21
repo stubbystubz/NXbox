@@ -844,8 +844,10 @@ void FrameProfile::EndFrame(bool presented) {
                     fmt::format(" {}={:.6f},{:.3f}", name, sample.ticks / (10000.0 * divisor),
                                 sample.count / divisor);
             };
-            for (unsigned i = 0; i < MP::Other; ++i)
-                append(MP::Names[i], samples[i]);
+            for (unsigned i = 0; i < MP::ClassCount; ++i) {
+                if (i != MP::Other)
+                    append(MP::Names[i], samples[i]);
+            }
             MP::Sample other{};
             std::array<unsigned, MP::RegisterCount> indices{};
             for (unsigned i = 0; i < MP::RegisterCount; ++i) {
@@ -1018,9 +1020,10 @@ Context::Context() {
     for (const auto* knob :
          {"NXBOX_D3D12_NO_PSO_LIBRARY", "NXBOX_D3D12_GPU_ASTC", "NXBOX_D3D12_NO_COMPUTE",
           "NXBOX_D3D12_NO_DRAWS", "NXBOX_D3D12_NO_QUERIES", "NXBOX_D3D12_SUBMIT_TRACE",
-          "NXBOX_D3D12_FENCE_BATCHING", "NXBOX_D3D12_BATCH_DESCRIPTOR_COPIES",
-          "NXBOX_D3D12_ASYNC_DMA", "NXBOX_D3D12_SMALL_RECORDER_QUEUE",
-          "NXBOX_D3D12_SYNC_BUFFER_CLEARS", "NXBOX_D3D12_VALIDATE_COMMANDS"})
+          "NXBOX_D3D12_FENCE_BATCHING", "NXBOX_D3D12_SYNC_FAST",
+          "NXBOX_D3D12_BATCH_DESCRIPTOR_COPIES", "NXBOX_D3D12_ASYNC_DMA",
+          "NXBOX_D3D12_SMALL_RECORDER_QUEUE", "NXBOX_D3D12_SYNC_BUFFER_CLEARS",
+          "NXBOX_D3D12_VALIDATE_COMMANDS"})
         Diagnostic(fmt::format("D3D12 bisect {}={}", knob, BisectEnabled(knob) ? 1 : 0));
     Diagnostic(fmt::format("D3D12 flush_draws={}", FlushDrawsKnob()));
     D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};

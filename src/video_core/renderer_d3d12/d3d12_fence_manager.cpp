@@ -9,11 +9,17 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace D3D12 {
+namespace {
+bool DeferredFenceSubmission() {
+    // Reuse the established progress/drain protocol. Fewer fence-only lists also
+    // avoid forcing allocator recycling on the next Commands() boundary.
+    return BisectEnabled("NXBOX_D3D12_SYNC_FAST") || BisectEnabled("NXBOX_D3D12_FENCE_BATCHING");
+}
+} // namespace
 void InnerFence::Queue() {
     if (!is_stubbed) {
-        tick = !BisectEnabled("NXBOX_D3D12_FENCE_BATCHING")
-                   ? context.Submit(FrameCount::ForcedSubmitGuestFence)
-                   : context.PendingFenceTick();
+        tick = !DeferredFenceSubmission() ? context.Submit(FrameCount::ForcedSubmitGuestFence)
+                                          : context.PendingFenceTick();
     }
 }
 bool InnerFence::IsSubmitted() const {
@@ -95,11 +101,11 @@ void FenceManager::LogSyncpoints() const {
     }
 }
 bool FenceManager::ShouldFlushFence() const {
-    return !BisectEnabled("NXBOX_D3D12_FENCE_BATCHING");
+    return !DeferredFenceSubmission();
 }
 void FenceManager::FlushPendingFences() {
     // Without batching every fence submitted when it was queued; keep that path untouched.
-    if (!BisectEnabled("NXBOX_D3D12_FENCE_BATCHING"))
+    if (!DeferredFenceSubmission())
         return;
     context.Submit(FrameCount::ForcedSubmitGuestFence);
     NotifySubmitted();
@@ -107,11 +113,11 @@ void FenceManager::FlushPendingFences() {
 void FenceManager::NotifyDeferredSubmit() {
     // Without batching this can run under the fence lock (SignalFence flushes there), and
     // there is no deferred tick to wake the fencing thread for.
-    if (BisectEnabled("NXBOX_D3D12_FENCE_BATCHING"))
+    if (DeferredFenceSubmission())
         NotifySubmitted();
 }
 bool FenceManager::IsFenceSubmitted(const Fence& fence) const {
-    return !BisectEnabled("NXBOX_D3D12_FENCE_BATCHING") || fence->IsSubmitted();
+    return !DeferredFenceSubmission() || fence->IsSubmitted();
 }
 Fence FenceManager::CreateFence(bool is_stubbed) {
     return std::make_shared<InnerFence>(context, is_stubbed);

@@ -20,6 +20,7 @@
 #include <queue>
 
 #include "common/common_types.h"
+#include "common/maxwell_method_profile.h"
 #include "common/nxbox_wait_diag.h"
 #include "common/settings.h"
 #include "common/thread.h"
@@ -109,11 +110,13 @@ public:
         }
         // Query retirement normally adds one operation before the guest signal.
         uncommitted_operations.reserve(2);
-        CommitAsyncFlushes();
-        TFence new_fence = CreateFence(!should_flush);
+        namespace Profile = Common::MaxwellMethodProfile;
+        Profile::Measure(Profile::CommitAsyncFlushes, [&] { CommitAsyncFlushes(); });
+        TFence new_fence =
+            Profile::Measure(Profile::CreateFence, [&] { return CreateFence(!should_flush); });
         std::unique_lock fence_lock{guard, std::defer_lock};
         if constexpr (can_async_check) {
-            fence_lock.lock();
+            Profile::Measure(Profile::FenceLock, [&] { fence_lock.lock(); });
             if (thread_error)
                 std::rethrow_exception(thread_error);
         }
@@ -121,19 +124,19 @@ public:
             uncommitted_operations.emplace_back(std::move(func));
         }
         pending_operations.emplace_back(std::move(uncommitted_operations));
-        QueueFence(new_fence);
+        Profile::Measure(Profile::QueueFence, [&] { QueueFence(new_fence); });
         if (!delay_fence) {
             func();
         }
         fences.push(std::move(new_fence));
         if (should_flush && ShouldFlushFence()) {
-            rasterizer.FlushCommands();
+            Profile::Measure(Profile::FlushCommands, [&] { rasterizer.FlushCommands(); });
         }
         if constexpr (can_async_check) {
             fence_lock.unlock();
             cv.notify_all();
         }
-        rasterizer.InvalidateGPUCache();
+        Profile::Measure(Profile::InvalidateGpuCache, [&] { rasterizer.InvalidateGPUCache(); });
     }
 
     void SignalSyncPoint(u32 value) {

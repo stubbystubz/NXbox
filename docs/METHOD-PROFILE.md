@@ -58,6 +58,15 @@ detail the `other` aggregate: adding them to the class totals double counts time
   outside `maxwell3d_methods` contributes zero. Their later drain belongs here.
 - `other`: remaining executable methods, with the top 16 register indices.
 
+Fence publication also emits `commit_async_flushes`, `create_fence`,
+`queue_fence`, `flush_commands`, `invalidate_gpu_cache` and `fence_lock`.
+ProcessQueryCondition emits `accelerate_conditional` and `fallback_condition`.
+These are disjoint exclusive subdivisions moved out of the enclosing method;
+their counts are scope invocations, while parent counts remain method words.
+They use the same gate and phase clock, so Submit/FenceWait/download phase time
+is still excluded. See [the sync audit](SYNC-METHODS.md) for interval definitions,
+blocking paths and the independent opt-in `NXBOX_D3D12_SYNC_FAST=1` mitigation.
+
 A collector reads FrameProfile's cumulative **exclusive Maxwell phase clock**
 using its existing QueryPerformanceCounter clock (100 ns units). Phase changes
 into macro execution, renderer/cache/upload work or waits automatically pause

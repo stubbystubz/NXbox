@@ -433,7 +433,8 @@ int main() {
     }
     // SignalFence flushes under the fence lock when batching is off; the hook must not lock.
     rasterizer.on_flush = [&] { manager.NotifyDeferredSubmit(); };
-    if (D3D12::BisectEnabled("NXBOX_D3D12_FENCE_BATCHING")) {
+    if (D3D12::BisectEnabled("NXBOX_D3D12_FENCE_BATCHING") ||
+        D3D12::BisectEnabled("NXBOX_D3D12_SYNC_FAST")) {
         // DBSZ logs ~42 guest fences/frame. They share one tick without a producer wait.
         constexpr int fences_per_frame = 42;
         std::atomic<int> callbacks{};
@@ -511,6 +512,12 @@ int main() {
         manager.SignalReference();
         return 0;
     }
+    namespace MP = Common::MaxwellMethodProfile;
+    struct MethodClock : MP::Collector {
+        Common::GpuProfile::Tick now{};
+        Common::GpuProfile::Tick ReadTicks() override { return ++now; }
+    } clock;
+    MP::collector = &clock;
     Common::GpuProfile::Reset();
     Common::GpuProfile::enabled = true;
     Common::GpuProfile::RequestFence(7, 1);
@@ -526,6 +533,12 @@ int main() {
         callback = true;
     });
     assert(context.submitted == 3 && context.completed == 0);
+    for (auto key : {MP::CommitAsyncFlushes, MP::CreateFence, MP::QueueFence,
+                     MP::FlushCommands, MP::InvalidateGpuCache, MP::FenceLock}) {
+        assert(clock.samples[key].count == 3 && clock.samples[key].ticks == 3);
+    }
+    assert(!clock.active);
+    MP::collector = nullptr;
     assert(gpu.host.sync.guest == 1 && gpu.host.sync.host == 0 && !callback);
     // No further guest command or presentation is needed to retire the last fence.
     context.Complete();
@@ -575,9 +588,13 @@ int main() {
                 text=True,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            for enabled in ("0", "1"):
-                with self.subTest(fence_batching=enabled):
-                    env = dict(os.environ, NXBOX_D3D12_FENCE_BATCHING=enabled)
+            for batching, fast in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
+                with self.subTest(fence_batching=batching, sync_fast=fast):
+                    env = dict(
+                        os.environ,
+                        NXBOX_D3D12_FENCE_BATCHING=batching,
+                        NXBOX_D3D12_SYNC_FAST=fast,
+                    )
                     subprocess.run([str(binary)], check=True, timeout=10, env=env)
 
     def test_fencing_thread_wakes_when_a_deferred_tick_is_submitted(self):

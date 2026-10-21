@@ -23,12 +23,37 @@ enum Class : unsigned {
     PlainRegisters,
     ShadowDirty,
     Other,
+    CommitAsyncFlushes,
+    CreateFence,
+    QueueFence,
+    FlushCommands,
+    InvalidateGpuCache,
+    FenceLock,
+    AccelerateConditional,
+    FallbackCondition,
     ClassCount
 };
-inline constexpr std::array Names{
-    "cb_data",         "inline_upload", "draw_begin", "draw_end",   "draw_inline",
-    "draw_indexed",    "draw",          "clear",      "query_sync", "macro",
-    "plain_registers", "shadow_dirty",  "other"};
+inline constexpr std::array Names{"cb_data",
+                                  "inline_upload",
+                                  "draw_begin",
+                                  "draw_end",
+                                  "draw_inline",
+                                  "draw_indexed",
+                                  "draw",
+                                  "clear",
+                                  "query_sync",
+                                  "macro",
+                                  "plain_registers",
+                                  "shadow_dirty",
+                                  "other",
+                                  "commit_async_flushes",
+                                  "create_fence",
+                                  "queue_fence",
+                                  "flush_commands",
+                                  "invalidate_gpu_cache",
+                                  "fence_lock",
+                                  "accelerate_conditional",
+                                  "fallback_condition"};
 static_assert(Names.size() == ClassCount);
 inline constexpr unsigned RegisterCount = 0xE00;
 inline bool Enabled() {
@@ -87,6 +112,16 @@ __attribute__((always_inline)) inline
     } else {
         function(std::false_type{});
     }
+}
+// Backend subdivisions share the exclusive phase clock and subtract from the
+// enclosing method. The TLS pointer is installed only by the method-profile gate.
+template <typename Function>
+decltype(auto) Measure(Class key, Function&& function) {
+    if (auto* owner = collector) [[unlikely]] {
+        Collector::Scope scope{*owner, key, 1};
+        return function();
+    }
+    return function();
 }
 template <bool Profile, typename Function>
 decltype(auto) Shadow(GpuProfile::Tick count, Function&& function) {

@@ -68,9 +68,9 @@ def main():
         print(json.dumps(result, indent=2))
     else:
         print(f"windows={result['windows']} malformed={result['malformed']}")
-        print("class                     ms/frame    count/frame")
+        print("class                         ms/frame    count/frame")
         for row in result["ranking"][: max(0, args.top)]:
-            print(f"{row['class']:<25} {row['ms/frame']:9.4f} {row['count/frame']:14.3f}")
+            print(f"{row['class']:<29} {row['ms/frame']:9.4f} {row['count/frame']:14.3f}")
         print("other_0x registers detail 'other'; do not add them to class totals.")
     return 0 if result["windows"] else 1
 

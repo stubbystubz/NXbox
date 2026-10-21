@@ -137,6 +137,129 @@ int main() {
 """.replace("// PRODUCTION", production)
         )
 
+    def test_production_condition_acceleration_and_fallback_split(self):
+        source = (ROOT / "src/video_core/engines/maxwell_3d.cpp").read_text()
+        body = frontend.method(source, "Maxwell3D::ProcessQueryCondition")
+        self.compile_and_run(
+            r"""
+#include <cassert>
+#include <cstring>
+#include "common/maxwell_method_profile.h"
+using u32 = unsigned;
+using GPUVAddr = unsigned long long;
+namespace Profile = Common::MaxwellMethodProfile;
+u32 now{};
+struct Clock : Profile::Collector {
+    Common::GpuProfile::Tick ReadTicks() override { return now; }
+};
+namespace VideoCommon::SubmissionTrace {
+template <typename... Args> void Log(Args&&...) {}
+}
+#define SCOPE_EXIT [[maybe_unused]] auto unused_exit = [&]()
+#define UNIMPLEMENTED_MSG(...) assert(false)
+struct Maxwell3D {
+    struct Regs {
+        struct RenderEnable {
+            enum class Override { AlwaysRender, NeverRender, UseRenderEnable };
+            enum class Mode { True, False, Conditional, IfEqual, IfNotEqual };
+            Mode mode = Mode::True;
+            GPUVAddr Address() const { return 16; }
+        } render_enable;
+        RenderEnable::Override render_enable_override = RenderEnable::Override::UseRenderEnable;
+        struct ReportSemaphore {
+            struct Compare { u32 initial_sequence, initial_mode, current_sequence, current_mode; };
+        };
+    } regs;
+    struct Rasterizer {
+        bool accelerate{};
+        bool AccelerateConditionalRendering() { now += 5; return accelerate; }
+    } backend;
+    Rasterizer* rasterizer = &backend;
+    struct Memory {
+        unsigned reads{};
+        void ReadBlock(GPUVAddr address, void* output, size_t size) {
+            assert(address == 16 && size == sizeof(Regs::ReportSemaphore::Compare));
+            ++reads;
+            now += 11;
+            const Regs::ReportSemaphore::Compare value{1, 2, 1, 2};
+            std::memcpy(output, &value, size);
+        }
+    } memory_manager;
+    bool execute_on{};
+    void ProcessQueryCondition();
+};
+// PRODUCTION
+int main() {
+    Clock clock;
+    Profile::collector = &clock;
+    Maxwell3D engine;
+    engine.backend.accelerate = true;
+    engine.ProcessQueryCondition();
+    assert(engine.execute_on && !engine.memory_manager.reads);
+    assert(clock.samples[Profile::AccelerateConditional].ticks == 5);
+    assert(clock.samples[Profile::FallbackCondition].count == 0);
+    engine.backend.accelerate = false;
+    using Mode = Maxwell3D::Regs::RenderEnable::Mode;
+    for (auto mode : {Mode::True, Mode::False, Mode::Conditional, Mode::IfEqual, Mode::IfNotEqual}) {
+        engine.regs.render_enable.mode = mode;
+        engine.ProcessQueryCondition();
+        assert(engine.execute_on == (mode != Mode::False && mode != Mode::IfNotEqual));
+    }
+    assert(engine.memory_manager.reads == 3);
+    assert(clock.samples[Profile::AccelerateConditional].count == 6);
+    assert(clock.samples[Profile::FallbackCondition].count == 5);
+    assert(clock.samples[Profile::FallbackCondition].ticks == 33);
+    assert(!clock.active);
+    Profile::collector = nullptr;
+    engine.ProcessQueryCondition();
+    assert(engine.memory_manager.reads == 4 && !engine.execute_on);
+    assert(clock.samples[Profile::FallbackCondition].count == 5);
+}
+""".replace("// PRODUCTION", body)
+        )
+
+    def test_named_subscopes_use_exclusive_clock_and_unwind(self):
+        self.compile_and_run(
+            r"""
+#include <cassert>
+#include <stdexcept>
+#include "common/maxwell_method_profile.h"
+using namespace Common::MaxwellMethodProfile;
+struct Clock : Collector {
+    GpuProfile::Tick now{};
+    GpuProfile::Tick ReadTicks() override { return now; }
+};
+int main() {
+    Clock clock;
+    collector = &clock;
+    Dispatch([] { return ClassCount + 0xb2; }, 1, [&](auto) {
+        clock.now = 2;
+        Measure(CommitAsyncFlushes, [&] {
+            clock.now = 12;
+            Measure(QueueFence, [&] { clock.now = 19; });
+            clock.now = 22;
+        });
+        clock.now = 25;
+    });
+    assert(clock.samples[CommitAsyncFlushes].ticks == 13);
+    assert(clock.samples[QueueFence].ticks == 7);
+    assert(clock.samples[ClassCount + 0xb2].ticks == 5);
+    assert(clock.samples[CommitAsyncFlushes].count == 1);
+    int value = 3;
+    int& result = Measure(CreateFence, [&]() -> int& { return value; });
+    assert(&result == &value);
+    try {
+        Measure(FenceLock, [&] { clock.now = 30; throw std::runtime_error("test"); });
+    } catch (const std::runtime_error&) {}
+    assert(!clock.active && clock.samples[FenceLock].ticks == 5);
+    collector = nullptr;
+    const auto before = clock.samples[FlushCommands].count;
+    Measure(FlushCommands, [&] { ++value; });
+    assert(value == 4 && clock.samples[FlushCommands].count == before);
+}
+""".replace("GpuProfile::Tick", "Common::GpuProfile::Tick")
+        )
+
     def test_production_line_normalization_and_top16(self):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
         start = source.index(
@@ -168,6 +291,8 @@ int main() {
     const bool method_enabled = true;
     const unsigned frames = 100;
     samples[ConstantBuffer] = {2000000, 1200};
+    samples[CommitAsyncFlushes] = {3000000, 300};
+    samples[AccelerateConditional] = {1000000, 9800};
     for (unsigned i = 0; i < 17; ++i)
         samples[ClassCount + 0x100 + i] = {10000 * (i + 1), i + 1};
     // REPORT
@@ -195,6 +320,9 @@ int main() {
         self.assertEqual(result["windows"], 1)
         self.assertEqual(result["malformed"], 0)
         rows = {row["class"]: row for row in result["ranking"]}
+        self.assertEqual(rows["commit_async_flushes"]["ms/frame"], 3)
+        self.assertEqual(rows["commit_async_flushes"]["count/frame"], 3)
+        self.assertEqual(rows["accelerate_conditional"]["count/frame"], 98)
         self.assertEqual(rows["cb_data"]["ms/frame"], 2)
         self.assertEqual(rows["cb_data"]["count/frame"], 12)
         self.assertAlmostEqual(rows["other"]["ms/frame"], 1.53)
