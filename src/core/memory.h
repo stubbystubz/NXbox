@@ -164,6 +164,10 @@ public:
     u8* GetPointer(Common::ProcessAddress vaddr);
     u8* GetPointerSilent(Common::ProcessAddress vaddr);
 
+    /// Resolves a canonical address for mapping/continuity metadata without materializing backing.
+    /// The returned pointer must not be dereferenced; use GetPointer for native accesses.
+    [[nodiscard]] u8* GetPointerForAddressTranslation(Common::ProcessAddress vaddr) const;
+
     template <typename T>
     T* GetPointer(Common::ProcessAddress vaddr) {
         return reinterpret_cast<T*>(GetPointer(vaddr));

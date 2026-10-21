@@ -226,6 +226,151 @@ int main() {
 """.replace("HELPER", helper)
         self.compile_and_run(native_test)
 
+    def test_device_continuity_translation_does_not_materialize_backing(self):
+        memory_source = (ROOT / "src/core/memory.cpp").read_text()
+        helper = re.search(
+            r"    u8\* PrepareNativePointer\(.*?^    }", memory_source, re.DOTALL | re.MULTILINE
+        )[0]
+        lookup = re.search(
+            r"    template\s*<bool prepare_backing.*?^    }",
+            memory_source,
+            re.DOTALL | re.MULTILINE,
+        )[0]
+        translation = re.search(
+            r"    \[\[nodiscard\]\] u8\* GetPointerForAddressTranslation\(.*?^    }",
+            memory_source,
+            re.DOTALL | re.MULTILINE,
+        )[0]
+        device_source = (ROOT / "src/core/device_memory_manager.inc").read_text()
+        continuity = re.search(
+            r"template <typename Traits>\nvoid DeviceMemoryManager<Traits>::TrackContinuityImpl.*?^}",
+            device_source,
+            re.DOTALL | re.MULTILINE,
+        )[0]
+        # Both metadata walks must use the same allocation-free translation API.
+        map_body = device_source.split("::Map(DAddr", 1)[1].split("::Unmap(", 1)[0]
+        self.assertIn("GetPointerForAddressTranslation", map_body)
+        self.assertNotIn("GetPointerSilent", map_body)
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+#define NXBOX_UWP 1
+#define ASSERT_MSG(condition, ...) assert(condition)
+using VAddr = u64;
+using DAddr = u64;
+namespace Common {
+using ProcessAddress = u64;
+size_t AlignUp(size_t value, size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+enum class PageType { Unmapped, Memory, DebugMemory, RasterizerCachedMemory };
+struct PageTable {
+    struct PageEntryData {
+        uintptr_t pointer{};
+        PageType type{PageType::Memory};
+        static uintptr_t ExtractPointer(PageEntryData raw) { return raw.pointer; }
+        PageEntryData Raw() const { return *this; }
+    };
+    std::vector<PageEntryData> entries;
+};
+}
+u64 GetInteger(u64 value) { return value; }
+constexpr size_t YUZU_PAGEBITS = 12;
+bool AddressSpaceContains(const Common::PageTable& table, u64 address, size_t) {
+    return (address >> YUZU_PAGEBITS) < table.entries.size();
+}
+struct Buffer {
+    Common::HostMemory::Impl& memory;
+    u8* VirtualBasePointer() const { return memory.virtual_base; }
+    bool PrepareBackingPage(const u8* pointer) { return memory.PrepareBackingPage(pointer); }
+};
+struct ProcessMemory {
+    Buffer* host_buffer;
+    Common::PageTable* current_page_table;
+    u8* special_pointer{};
+    u8* GetPointerFromDebugMemory(u64) const { return special_pointer; }
+    u8* GetPointerFromRasterizerCachedMemory(u64) const { return special_pointer; }
+HELPER
+LOOKUP
+TRANSLATION
+    u8* GetPointerSilent(u64 address) const {
+        return GetPointerImpl(address, [] {}, [] {});
+    }
+};
+namespace Core::Memory {
+using Memory = ProcessMemory;
+constexpr size_t YUZU_PAGEBITS = 12, YUZU_PAGESIZE = 4096;
+}
+namespace Memory = Core::Memory;
+struct Asid { size_t id; };
+template <typename Traits> struct DeviceMemoryManager {
+    std::array<ProcessMemory*, 1> registered_processes;
+    static constexpr size_t page_size = 4096;
+    struct Entry { u32 continuity_tracker{}; };
+    struct Entries {
+        std::vector<Entry> values;
+        void CommitRegion(size_t, size_t end) { values.resize(end); }
+        Entry& GetUnchecked(size_t index) { return values.at(index); }
+    } tracked_entries;
+    void TrackContinuityImpl(DAddr, VAddr, size_t, Asid);
+};
+CONTINUITY
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    {
+        constexpr size_t size = 32 * 65536;
+        Common::HostMemory::Impl memory(size, 2 * size);
+        assert(memory.Init() && memory.fastmem_enabled.load());
+        Buffer buffer{memory};
+        Common::PageTable table;
+        table.entries.resize(size / 4096);
+        for (auto& entry : table.entries)
+            entry.pointer = reinterpret_cast<uintptr_t>(memory.backing_base);
+        ProcessMemory process{&buffer, &table};
+        DeviceMemoryManager<int> device{{&process}, {}};
+        const auto calls = Mock::calls;
+        Mock::fail_name = "create";
+        Mock::fail_at = Mock::calls["create"] + 1;
+        Mock::reject_private_replacement = true;
+        // The production reverse walk reaches the last region first. No bytes are
+        // touched: even unavailable backing APIs must not fail this metadata query.
+        device.TrackContinuityImpl(0, 0, size, {0});
+        assert(Mock::calls == calls && Mock::committed == 0);
+        assert(memory.fastmem_enabled.load());
+        assert(device.tracked_entries.values.front().continuity_tracker == size / 4096 - 1);
+        assert(device.tracked_entries.values.back().continuity_tracker == 0);
+        for (auto type : {Common::PageType::DebugMemory,
+                          Common::PageType::RasterizerCachedMemory}) {
+            table.entries[0] = {0, type};
+            process.special_pointer = memory.backing_base;
+            assert(process.GetPointerForAddressTranslation(0) == memory.backing_base);
+            assert(Mock::committed == 0 && Mock::calls == calls);
+        }
+        table.entries[0] = {0, Common::PageType::Unmapped};
+        assert(process.GetPointerForAddressTranslation(0) == nullptr);
+        assert(process.GetPointerForAddressTranslation(size) == nullptr);
+        table.entries[0] = {reinterpret_cast<uintptr_t>(memory.backing_base)};
+        // A genuine native-pointer request must still prepare, and report failure
+        // before a dereference when both recovery paths are unavailable.
+        bool failed{};
+        try { process.GetPointerSilent(0); } catch (const std::bad_alloc&) { failed = true; }
+        assert(failed && !memory.fastmem_enabled.load());
+        Mock::reject_private_replacement = false;
+        auto* pointer = process.GetPointerSilent(0);
+        assert(pointer == memory.backing_base && Mock::Accessible(pointer, true));
+    }
+    Mock::Reset();
+}
+"""
+        for marker, source in (
+            ("HELPER", helper),
+            ("LOOKUP", lookup),
+            ("TRANSLATION", translation),
+            ("CONTINUITY", continuity),
+        ):
+            native_test = native_test.replace(marker, source)
+        self.compile_and_run(native_test)
+
     def test_backed_region_preparation_avoids_lock_and_rechecks_after_reclaim(self):
         native_test = self.allocator_source().split("int main() {", 1)[0]
         # Instrument the production mutex without changing its locking semantics.
@@ -410,6 +555,68 @@ int main() {
         }
     }
     Mock::Reset();
+}
+"""
+        self.compile_and_run(native_test)
+
+    def test_boundary_writes_and_private_fallback_keep_last_region_in_bounds(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    for (bool private_recovery : {false, true}) {
+        Mock::Reset();
+        {
+            constexpr size_t region = 65536;
+            // Include a short final section, as well as ordinary 64 KiB boundaries.
+            constexpr size_t size = 3 * region + 4096;
+            Common::HostMemory::Impl memory(size, 32 * region);
+            assert(memory.Init());
+            memory.Map(0, 0, size, Common::MemoryPermission::ReadWrite);
+            if (private_recovery) {
+                // Retain an existing section/alias and its data through recovery.
+                assert(Fault(memory.virtual_base));
+                Mock::Store(memory.backing_base, 99);
+                Mock::fail_name = "map";
+                Mock::fail_at = Mock::calls["map"] + 1;
+            }
+            // Simulate native range writes using the production VEH for each
+            // inaccessible destination, including the final byte of backing.
+            for (size_t begin : {region - 8, 2 * region - 8, 3 * region - 8, size - 16}) {
+                for (size_t offset = begin; offset < begin + 16; ++offset) {
+                    u8 value = 73;
+                    assert(Mock::ProbeMemoryAccess(memory.backing_base + offset, true, value));
+                    assert(memory.backing_base[offset] == 73);
+                }
+            }
+            // The one-past-end pointer is outside backing, never a region index.
+            // An untracked arena address also declines, allowing guarded SEH fallback.
+            assert(!Fault(memory.backing_base + size));
+            assert(!Fault(memory.virtual_base + size));
+            assert(!Fault(memory.virtual_base + 32 * region));
+            if (private_recovery) {
+                assert(!memory.fastmem_enabled.load());
+                assert(Mock::calls["map"] == Mock::fail_at);
+                assert(Mock::calls["private_replace"] == 3);
+                assert(fallback_reasons.size() == 1 && api_errors.size() == 1);
+                assert(memory.backing_base[0] == 99 && memory.virtual_base[0] == 99);
+                // Reclaimed fresh backing stays private: no repeated section/view
+                // failures or log flood on the next native access.
+                const auto creates = Mock::calls["create"];
+                memory.Clear(region, size - region, 0);
+                assert(memory.PrepareBackingPage(memory.backing_base + size - 1));
+                assert(Mock::calls["create"] == creates);
+                assert(Mock::calls["map"] == Mock::fail_at);
+                assert(memory.backing_base[size - 1] == 0);
+            } else {
+                assert(memory.fastmem_enabled.load());
+                assert(Fault(memory.virtual_base + size - 1));
+                assert(Mock::Accessible(memory.virtual_base + size - 1, true));
+                assert(memory.backing_base[size - 1] == 73);
+            }
+        }
+        Mock::Reset();
+    }
 }
 """
         self.compile_and_run(native_test)

@@ -608,8 +608,8 @@ public:
                     LOG_INFO(HW_Memory,
                              "NXBOX MEMORY mode=fastmem backing=regional_sections "
                              "region_kib=64 arena_gib={} committed_mib=0 probe=passed veh=ready "
-                             "fault_probe=passed backing_base={} arena_base={}",
-                             virtual_size >> 30, static_cast<void*>(backing_base),
+                             "fault_probe=passed backing_base={} backing_size={:#x} arena_base={}",
+                             virtual_size >> 30, static_cast<void*>(backing_base), backing_size,
                              static_cast<void*>(virtual_base));
                     return true;
                 }
@@ -832,6 +832,8 @@ private:
         DropRegion(0);
         probe_stage = "protected_alias_fault_claimed";
         value = 0xA5;
+        LOG_INFO(HW_Memory, "NXBOX MEMORY probe=protected_alias expected_fault=write target={}",
+                 static_cast<void*>(virtual_base));
         if (ProbeMemoryAccess(virtual_base, true, value))
             return false;
         probe_stage = "native_fallback_fault_failed";
@@ -931,6 +933,10 @@ private:
             region.backed.store(true, std::memory_order_release);
             return true;
         }
+        // A failed section API already selected private recovery. Do not keep creating
+        // sections/views for every remaining page of a large native range after fallback.
+        if (private_backing_only)
+            return TryPrivateRegion(index, pc, address, access);
         probe_stage = "create_section_failed";
         HANDLE handle = create_section(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                        RegionLength(index), nullptr);
@@ -970,6 +976,7 @@ private:
         if (!ready)
             return ApiFailure("VirtualAlloc2FromApp", base, RegionLength(index), PAGE_READWRITE);
         regions[index].private_backing = true;
+        private_backing_only = true;
         g_backing_committed.fetch_add(RegionLength(index), std::memory_order_relaxed);
         regions[index].backed.store(true, std::memory_order_release);
         return true;
@@ -1206,6 +1213,7 @@ private:
     std::recursive_mutex mutex;
     bool probe_mapped{};
     bool probing_faults{true};
+    bool private_backing_only{};
     bool reported_backing_fault{};
     DWORD probe_error{};
     const char* probe_stage = "section_alias_probe_failed";

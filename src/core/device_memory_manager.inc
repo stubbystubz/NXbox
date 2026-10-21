@@ -213,7 +213,8 @@ void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
     for (size_t i = 0; i < num_pages; i++) {
         const VAddr new_vaddress = virtual_address + i * Memory::YUZU_PAGESIZE;
-        auto* ptr = process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress));
+        auto* ptr =
+            process_memory->GetPointerForAddressTranslation(Common::ProcessAddress(new_vaddress));
         if (ptr == nullptr) [[unlikely]] {
             tracked_entries.GetUnchecked(start_page_d + i).compressed_physical_ptr = 0;
             continue;
@@ -284,7 +285,7 @@ void DeviceMemoryManager<Traits>::TrackContinuityImpl(DAddr address, VAddr virtu
         size_t index = i - 1;
         const VAddr new_vaddress = virtual_address + index * Memory::YUZU_PAGESIZE;
         const uintptr_t new_ptr = reinterpret_cast<uintptr_t>(
-            process_memory->GetPointerSilent(Common::ProcessAddress(new_vaddress)));
+            process_memory->GetPointerForAddressTranslation(Common::ProcessAddress(new_vaddress)));
         if (new_ptr + page_size == last_ptr) {
             page_count++;
         } else {

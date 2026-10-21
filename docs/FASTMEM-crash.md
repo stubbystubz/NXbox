@@ -1,5 +1,120 @@
 # UWP fastmem boot faults
 
+## Round 3: build 0.3.813 / fm4
+
+### The arena-base AV is the intentional startup probe
+
+The three `crash.txt:6` worker writes have the same ownership:
+
+| Capture | Backing base | Write target = alias arena base | Target − backing base |
+| --- | --- | --- | --- |
+| `r-mk8d-fm4` | `0x29440000000` | `0x29540000000` | `0x100000000` |
+| `r-ody-fm4` | `0x234dc000000` | `0x235dc000000` | `0x100000000` |
+| `r-wonder-fm4` | `0x10f6a000000` | `0x1106a000000` | `0x100000000` |
+
+Backing size is 4 GiB (`0x100000000`), with a separately reserved 512 GiB
+alias arena immediately following it in these captures. The address is both
+one-past-backing and arena offset zero. It is **not a backing overrun, guard-page
+write, DMA/memset span, or last-section boundary failure**. During
+`ProbeFaultHandling`, offset zero is a tracked 4 KiB read-only alias of backing
+offset `0x1000`. The probe deliberately writes `0xA5` through it after reclaiming
+the region. VEH prepares backing, declines the protected alias, and the leaf
+probe's SEH guard catches the AV. Dynarmic SEH is not involved in this native
+probe. `role=worker` is the crash logger's default role, not a GPU-thread identity.
+
+Static inspection of the matching package establishes this attribution:
+`async-real/pkg-39529147740/NXbox_game_0.3.813.0_x64.appx`, emulator revision
+`c2a8ee53424524248e22501b6b1aa9066bd20a1a`. Extracted `nxbox.exe` SHA-256 is
+`6e24fb4aff3e6815632b42a4e70956e4a730e9d1edaac8cd74d96b1a83b7cc0c`.
+LLVM disassembly at RVA `0x431408` is `88 01`, `mov byte ptr [rcx], al`, in
+the read/write leaf `ProbeMemoryAccess`. Its caller at `0x430480` loads the alias
+base and write value `0xA5`; the recorded return address `0x430485` checks that
+the probe returned false. REA tools were unavailable in this session; this is
+instruction/source matching without PDB function symbols, not a runtime trace.
+
+All three runs subsequently report `fault_probe=passed` and a resolved ordinary
+backing write (`eden.txt:6`, `:5`, `:6`, respectively). MK8D's backing offset is
+`0x1a7e88`, Odyssey's `0x11a3048`, Wonder's `0x1272c0`; all report reserved
+state `0x2000`, protection zero, and `resolved=true`. No unresolved terminal
+backing AV is recorded. The processes continue for 25.437 / 26.797 / 31.078
+seconds after the arena-base probe AV.
+
+### The fatal worker path materializes memory while only comparing addresses
+
+The actual recorded terminations are `active_exception what=bad allocation`
+followed by `SIGABRT` (`crash.txt:95–96`, `:96–97`, `:100–101`). All share
+the same stack: `nxbox.exe+0x50a5a5`, `+0x9f8092`, `+0x6da185`, and onward.
+The immediate preceding allocator evidence is:
+
+| Capture / eden.txt line | First failed backing view offset | Time | Result |
+| --- | --- | --- | --- |
+| `r-mk8d-fm4:164–165` | `0xa8790000` | 25.724 s | map error 8; private recovery disables emission |
+| `r-ody-fm4:144–145` | `0x3e5f0000` | 26.857 s | map error 8; private recovery disables emission |
+| `r-wonder-fm4:166–167` | `0xbbd50000` | 31.285 s | map error 8; private recovery disables emission |
+
+These are in-range, 64 KiB-aligned backing sections. Microsoft defines error 8
+as [ERROR_NOT_ENOUGH_MEMORY](https://learn.microsoft.com/en-us/windows/win32/debug/system-error-codes--0-499-).
+The logs do not identify the exhausted kernel resource or establish a particular
+section/view quota. Successful private recovery is followed by many more failed
+section-view attempts; the end of each `eden.txt` is truncated. The exact final
+allocation failure is therefore not present in that file.
+
+At RVA `0x9f808d` the binary calls the `GetPointerSilent` wrapper, then iterates
+backward in page-sized steps and writes the continuity count. This matches
+`DeviceMemoryManager::TrackContinuityImpl`, a device-address-space metadata
+walk, not a GPU memory copy. `GetPointerSilent` tail-jumps to `GetPointerImpl`
+at `0x50a360`. The canonical-pointer branch calls backing preparation at
+`0x50a41a`; a false result branches to the `std::bad_alloc` throw at `0x50a586`
+(return address `0x50a5a5`). This explains the shared fatal stack and descending
+failed backing addresses. The caller returning to `0x6da185` matches nvdrv's
+`Container::OpenSession` heap preallocation: a 32 MiB threshold at `0x6da0a0`,
+device-address reservation, `HeapMapper` construction, then the locked continuity
+walk. It scans the application's largest normal heap range before GPU rendering.
+This is the nvdrv session/service worker operation, not a GPU/DMA buffer write;
+the captures do not supply a native thread name beyond `worker`. The separate
+forward `DeviceMemoryManager::Map` walk uses the same pointer query, so both
+metadata paths acquired the unwanted materialization side effect from round 2.
+
+### Fix and regression coverage
+
+- Added `GetPointerForAddressTranslation`, which shares canonical/debug/rasterizer
+  address resolution but never prepares physical backing. Both device mapping
+  walks use it. Its pointer is only for address arithmetic; dereferencing callers
+  retain `GetPointer`/`GetPointerSilent` and preparation before native access.
+- After the first successful private recovery from a runtime section failure,
+  untouched/reclaimed regions use private backing directly. Existing sections,
+  aliases, contents, and canonical addresses remain intact. This prevents repeated
+  failed section allocations and warning floods after fallback. New fastmem
+  emission remains disabled; unavailable aliases decline to Dynarmic's existing
+  callback/recompile path. Startup probes still require real section support.
+- Startup logs now identify the expected protected-alias write before issuing it,
+  and the ready log includes the exact backing size.
+- A compiled regression runs the production reverse continuity walk and production
+  pointer resolution over 2 MiB with both allocation paths unavailable. It requires
+  zero backing allocations, unchanged fastmem state, and correct continuity counts.
+  It also checks debug/rasterizer/unmapped translation and verifies that actual
+  native pointer requests still prepare backing and explicitly report failure.
+- Boundary tests write across two 64 KiB boundaries, into a short final region,
+  and through the last byte of backing, using production VEH dispatch. They cover
+  section and private backing, out-of-range/hole rejection, retention of an existing
+  alias's bytes, reclamation, and no further failed section calls after recovery.
+  Restoring eager preparation only for the translation query makes the production
+  continuity regression fail with `std::bad_alloc` (negative control).
+
+Validation on 2026-10-20: all 17 fastmem tests passed.
+`python3 -m unittest discover -s tests/port` ran 984 tests in 515.911 seconds:
+938 passed, 44 skipped, and only the two known `fontTools` import errors
+(`test_button_layout`, `test_xbox_button_icons`). Ruff check/format,
+`git diff --check`, and the eager-preparation negative control passed. Hashes
+confirmed that the five implementation/test files were unchanged during the
+final suite run. Modified C++ lines were formatted with the project's clang-format
+configuration. No commits, Windows application build, or console rerun were made.
+Console first-frame acceptance remains unmeasured. If both section and private
+backing allocation fail during a real native access, page-table translation cannot
+manufacture those bytes: preparation still reports failure before dereference.
+This change removes allocation from metadata queries and preserves the existing
+guarded JIT fallback; it does not claim recovery from physical memory exhaustion.
+
 ## Build 0.3.809: what the console captures establish
 
 Both fm3 runs pass the p29 live fault probe before creating the CPU JITs.

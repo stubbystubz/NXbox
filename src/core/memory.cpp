@@ -599,7 +599,7 @@ struct Memory::Impl {
         return pointer;
     }
 
-    template<typename F, typename G>
+    template <bool prepare_backing = true, typename F, typename G>
     [[nodiscard]] u8* GetPointerImpl(u64 vaddr, F&& on_unmapped, G&& on_rasterizer) const {
         // AARCH64 masks the upper 16 bit of all memory accesses
         vaddr &= 0xffffffffffffULL;
@@ -607,18 +607,20 @@ struct Memory::Impl {
             // Avoid adding any extra logic to this fast-path block
             const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
             if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {
-                return PrepareNativePointer(reinterpret_cast<u8*>(pointer + vaddr));
+                auto* const host_ptr = reinterpret_cast<u8*>(pointer + vaddr);
+                return prepare_backing ? PrepareNativePointer(host_ptr) : host_ptr;
             } else {
                 switch (static_cast<Common::PageType>(raw.type)) {
                 case Common::PageType::Memory:
                     ASSERT_MSG(false, "Mapped memory page without a pointer @ {:#016x}", vaddr);
                     return nullptr;
                 case Common::PageType::DebugMemory:
-                    return PrepareNativePointer(GetPointerFromDebugMemory(vaddr));
+                    return prepare_backing ? PrepareNativePointer(GetPointerFromDebugMemory(vaddr))
+                                           : GetPointerFromDebugMemory(vaddr);
                 case Common::PageType::RasterizerCachedMemory: {
                     u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
                     on_rasterizer();
-                    return PrepareNativePointer(host_ptr);
+                    return prepare_backing ? PrepareNativePointer(host_ptr) : host_ptr;
                 }
                 case Common::PageType::Unmapped: [[unlikely]] {
                     on_unmapped();
@@ -647,6 +649,10 @@ struct Memory::Impl {
     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr), []() {}, []() {});
+    }
+
+    [[nodiscard]] u8* GetPointerForAddressTranslation(const Common::ProcessAddress vaddr) const {
+        return GetPointerImpl<false>(GetInteger(vaddr), []() {}, []() {});
     }
 
 #ifdef NXBOX_UWP
@@ -1121,6 +1127,10 @@ u8* Memory::GetPointer(Common::ProcessAddress vaddr) {
 
 u8* Memory::GetPointerSilent(Common::ProcessAddress vaddr) {
     return impl->GetPointerSilent(vaddr);
+}
+
+u8* Memory::GetPointerForAddressTranslation(Common::ProcessAddress vaddr) const {
+    return impl->GetPointerForAddressTranslation(vaddr);
 }
 
 const u8* Memory::GetPointer(Common::ProcessAddress vaddr) const {
