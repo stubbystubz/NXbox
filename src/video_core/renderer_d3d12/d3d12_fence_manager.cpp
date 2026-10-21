@@ -63,32 +63,42 @@ void FenceManager::SyncOperation(std::function<void()> &&func) {
     });
 }
 void FenceManager::SignalSyncPoint(u32 value) {
-    syncpoint_manager.IncrementGuest(value);
-    ++pending_syncpoints;
-    NxboxWait::Add(NxboxWait::Counter::SyncpointQueued);
-    LogSyncpoints();
-    const auto diagnostic_token = NxboxWait::Enabled()
-                                      ? NxboxWait::BeginPending(NxboxWait::PendingKind::Syncpoint,
-                                                                value, context.PendingFenceTick())
-                                      : 0;
-    auto signal = [this, value, diagnostic_token] {
-        syncpoint_manager.IncrementHost(value);
-        NxboxWait::EndPending(diagnostic_token);
-        --pending_syncpoints;
-        ++signaled_syncpoints;
-        NxboxWait::Add(NxboxWait::Counter::SyncpointSignaled);
+    auto publish_fence = [this, value] {
+        ++pending_syncpoints;
+        NxboxWait::Add(NxboxWait::Counter::SyncpointQueued);
         LogSyncpoints();
+        const auto diagnostic_token =
+            NxboxWait::Enabled() ? NxboxWait::BeginPending(NxboxWait::PendingKind::Syncpoint, value,
+                                                           context.PendingFenceTick())
+                                 : 0;
+        auto signal = [this, value, diagnostic_token] {
+            syncpoint_manager.IncrementHost(value);
+            NxboxWait::EndPending(diagnostic_token);
+            --pending_syncpoints;
+            ++signaled_syncpoints;
+            NxboxWait::Add(NxboxWait::Counter::SyncpointSignaled);
+            LogSyncpoints();
+        };
+        if (!Common::GpuProfile::enabled.load(std::memory_order_relaxed)) {
+            SignalFence(std::move(signal));
+            return;
+        }
+        const auto latency = Common::GpuProfile::ProcessFence(
+            value, syncpoint_manager.GetGuestSyncpointValue(value));
+        SignalFence([signal = std::move(signal), latency] {
+            Common::GpuProfile::CompleteFence(latency);
+            signal();
+        });
     };
-    if (!Common::GpuProfile::enabled.load(std::memory_order_relaxed)) {
-        SignalFence(std::move(signal));
-        return;
+    if (BisectEnabled("NXBOX_D3D12_OVERLAP_SYNCPOINT")) {
+        // The guest counter must be visible before the host can complete. Capture the
+        // preceding commands and cache retirements before Composite can append work
+        // or block in Present. Host visibility still requires the real GPU fence.
+        syncpoint_manager.IncrementGuest(value, std::move(publish_fence));
+    } else {
+        syncpoint_manager.IncrementGuest(value);
+        publish_fence();
     }
-    const auto latency =
-        Common::GpuProfile::ProcessFence(value, syncpoint_manager.GetGuestSyncpointValue(value));
-    SignalFence([signal = std::move(signal), latency] {
-        Common::GpuProfile::CompleteFence(latency);
-        signal();
-    });
 }
 void FenceManager::SignalReference() {
     SignalFence([] {});
