@@ -531,7 +531,8 @@ u32 Maxwell3D::MethodProfileKey(u32 method) const {
     case MAXWELL3D_REG_INDEX(fragment_barrier):
     case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
     case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
-        return MP::QuerySync;
+        // Per register, so method_rank.py shows which sync method dominates the class.
+        return MP::ClassCount + method;
     default:
         return execution_mask[method] ? MP::ClassCount + method : MP::PlainRegisters;
     }
