@@ -334,6 +334,30 @@ void D3D12DescriptorAllocator::WriteCached(D3D12_DESCRIPTOR_HEAP_TYPE type,
     WriteCached(type, resource, kind, desc, size, table.Slot(slot));
 }
 
+void D3D12DescriptorAllocator::ResolvePlanSources(DescriptorPlan& plan, bool sampler) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_SAMPLER_SOURCE_REUSE");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled || !descriptor_fastpath)
+        return;
+    plan.sources.Reset(plan.keys.size());
+    if (!plan.sources.valid)
+        return;
+    RefreshCaches();
+    auto& cache = sampler ? sampler_cache : view_cache;
+    const auto& previous = previous_draw_tables[sampler ? 1 : 0].plan;
+    const auto type =
+        sampler ? D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER : D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    for (u32 index = 0; index < plan.keys.size(); ++index) {
+        const auto& key = plan.keys[index];
+        plan.sources.Set(
+            index, previous.sources, index < previous.keys.size() && previous.keys[index] == key,
+            [&] { return cache.generation; },
+            [&] { return ResolveDescriptor(type, plan.resources[index], key, nullptr).ptr; });
+    }
+}
+
 bool D3D12DescriptorAllocator::CanReuseDrawTable(const DescriptorPlan& plan, bool sampler) const {
     return CanReusePreviousDrawTable(plan, sampler) || FindHandleDrawTable(plan, sampler) ||
            FindCachedDrawTable(plan, sampler);

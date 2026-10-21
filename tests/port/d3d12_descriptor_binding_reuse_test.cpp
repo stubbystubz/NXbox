@@ -71,6 +71,14 @@ int main() {
         } else {
             assert(!tables.Find(tick, generation, sizes, sources));
         }
+        if (random() % 43 == 0) {
+          // An indirect signature may overwrite root arguments and resets them
+          // afterwards. General draw-state invalidation alone does not cover
+          // it.
+          roots.Reset();
+          reference_valid.fill(false);
+          fast_valid.fill(false);
+        }
         const auto next_signature = random() % 9 == 0 ? random() % 4 : signature;
         if (next_signature != signature) {
             reference_valid.fill(false);

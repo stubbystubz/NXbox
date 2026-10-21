@@ -1670,6 +1670,7 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
             sampler_plan.keys = cached.keys;
             std::fill(sampler_plan.initialized.begin(), sampler_plan.initialized.end(), u8{1});
             sampler_plan.sources.valid = false;
+            descriptors.ResolvePlanSources(sampler_plan, true);
             // FinishDrawTable will reuse the current
             // recording's table or resolve keys against the current heap generation.
             ++cached.hits;
@@ -2088,7 +2089,7 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     bind_table(RootSrvTable - table_shift, srv_table.gpu);
     bind_table(RootUavTable - table_shift, uav_table.gpu);
     bind_table(RootSamplerTable - table_shift, sampler_table.gpu);
-    // Opt in independently: EndDraw deliberately invalidates general draw state
+    // Track independently: EndDraw deliberately invalidates general draw state
     // for a known title workaround. Track actual root writes without relaxing it.
     const bool root_cbv_reuse = commands->reuse_graphics_root_cbvs;
     for (UINT i = 0; i < root_cbv_addresses.size(); ++i) {

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Execute descriptor plan reuse with the production plan and finish methods."""
 
+import os
 import subprocess
 import tempfile
 import unittest
@@ -91,7 +92,15 @@ struct D3D12DescriptorAllocator {
         u32 stride = 1, capacity = 0;
     } view_cache, sampler_cache, null_view_cache;
     __IS_NULL_DESCRIPTOR_HANDLE__
+    unsigned resolutions = 0, rollover_at = 0;
     void RefreshCaches() {}
+    D3D12_CPU_DESCRIPTOR_HANDLE ResolveDescriptor(int type, const ResourcePtr&,
+                                                 const DescriptorKey& key, void*) {
+        if (++resolutions == rollover_at)
+            ++(type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_cache : view_cache).generation;
+        return {key.kind + 10};
+    }
+    void ResolvePlanSources(DescriptorPlan&, bool = false);
     struct CopyBatch {};
     struct PreviousDrawTable {
         u64 tick = 0;
@@ -271,7 +280,54 @@ void Run(bool ranges) {
         assert(cached.allocations == 6);
     }
 }
+void SamplerSources() {
+    D3D12DescriptorAllocator allocator;
+    allocator.descriptor_fastpath = true;
+    allocator.handle_table_reuse = true;
+    DescriptorPlan plan{{4, 0, 0}};
+    const char* value = std::getenv("NXBOX_D3D12_SAMPLER_SOURCE_REUSE");
+    const bool enabled = !value || std::strcmp(value, "0") != 0;
+    for (u32 draw = 0; draw < 100; ++draw) {
+        plan.Reset({4, 0, 0});
+        for (u32 slot = 0; slot < 4; ++slot) plan.keys[slot].kind = slot + (draw / 20) * 4;
+        plan.sources.valid = false; // Exact production sampler memo hit.
+        const auto before = allocator.resolutions;
+        allocator.ResolvePlanSources(plan, true);
+        assert(plan.sources.Current(allocator.sampler_cache.generation) == enabled);
+        if (enabled) {
+            for (u32 slot = 0; slot < 4; ++slot)
+                assert(plan.sources.handles[slot] == plan.keys[slot].kind + 10);
+            if (draw % 20 && draw != 51) assert(allocator.resolutions == before);
+        }
+        allocator.FinishDrawTable(plan, true);
+        if (draw == 50) {
+            ++allocator.sampler_cache.generation; // CPU descriptors recycled.
+            ++allocator.context.tick; // GPU table retired independently.
+        }
+    }
+    assert(allocator.resolutions == (enabled ? 24u : 0u));
+    // Heap rollover half-way through resolution must fall back to semantic keys.
+    plan.Reset({4, 0, 0});
+    for (auto& key : plan.keys) key.kind = 999;
+    plan.sources.valid = false;
+    allocator.rollover_at = allocator.resolutions + 2;
+    allocator.ResolvePlanSources(plan, true);
+    assert(!plan.sources.valid);
+    const auto before = allocator.writes;
+    allocator.FinishDrawTable(plan, true);
+    assert(allocator.writes == before + 4);
+    // Oversized future plans and the descriptor fast-path opt-out stay on legacy copies.
+    plan.Reset({4097, 0, 0});
+    allocator.ResolvePlanSources(plan, true);
+    assert(!plan.sources.valid);
+    plan.Reset({4, 0, 0});
+    plan.sources.valid = false;
+    allocator.descriptor_fastpath = false;
+    allocator.ResolvePlanSources(plan, true);
+    assert(!plan.sources.valid);
+}
 int main() {
+    SamplerSources();
     Run(false);
     Run(true);
 }
@@ -292,6 +348,7 @@ class DrawScratchTests(unittest.TestCase):
         methods = "\n".join(
             function(source, signature)
             for signature in (
+                "void D3D12DescriptorAllocator::ResolvePlanSources(",
                 "bool D3D12DescriptorAllocator::CanReuseDrawTable(",
                 "bool D3D12DescriptorAllocator::CanReusePreviousDrawTable(",
                 "const DescriptorTable* D3D12DescriptorAllocator::FindHandleDrawTable(",
@@ -322,7 +379,13 @@ class DrawScratchTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            subprocess.run([str(binary)], check=True, timeout=10)
+            for value in ("1", "0"):
+                subprocess.run(
+                    [str(binary)],
+                    env={**os.environ, "NXBOX_D3D12_SAMPLER_SOURCE_REUSE": value},
+                    check=True,
+                    timeout=10,
+                )
 
 
 if __name__ == "__main__":

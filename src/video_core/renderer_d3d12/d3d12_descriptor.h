@@ -405,6 +405,8 @@ public:
     // Reserve only missing tables, then recheck after Reserve (it may change the tick).
     bool CanReuseDrawTable(const DescriptorPlan& plan, bool sampler = false) const;
     DescriptorTable FinishDrawTable(DescriptorPlan& plan, bool sampler = false);
+    // Rehydrate semantic memo hits through the same generation-checked sources as writers.
+    void ResolvePlanSources(DescriptorPlan& plan, bool sampler = false);
     void SetHeaps(CommandFacade* commands, bool cache_draw_state = false);
     DescriptorTable AllocateViews(u32 count);
     DescriptorTable AllocateSamplers(u32 count);

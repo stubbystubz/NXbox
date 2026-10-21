@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 NSPX
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include <cstdlib>
+#include <cstring>
+
 #include "video_core/renderer_d3d12/d3d12_command_validation.h"
 #include "video_core/renderer_d3d12/d3d12_gpu_pass_profile.h"
 #include "video_core/renderer_d3d12/d3d12_parallel_record.h"
@@ -74,7 +78,10 @@ struct RecordingTarget {
 struct ParallelNativeState;
 class CommandFacade {
 public:
-    const bool reuse_graphics_root_cbvs{BisectEnabled("NXBOX_D3D12_ROOT_CBV_REUSE")};
+    const bool reuse_graphics_root_cbvs{[] {
+        const char* value = std::getenv("NXBOX_D3D12_ROOT_CBV_REUSE");
+        return !value || std::strcmp(value, "0") != 0;
+    }()};
     GraphicsRootCbvCache graphics_root_cbvs;
     CommandValidation validation;
     GpuPassProfile* pass_profile{};
@@ -122,7 +129,7 @@ public:
         EncodeCall<Invoke>(*stream, args...);
     }
     bool compact_draws{true}; // NXBOX_D3D12_COMPACT_DRAWS=0 restores EncodeCall.
-    bool reuse_draw_state{};  // NXBOX_D3D12_RECORD_STATE=1; independent of guest invalidation.
+    bool reuse_draw_state{};  // NXBOX_D3D12_RECORD_STATE=0 disables transport reuse.
     struct TransportState {
         RecordedValue<D3D_PRIMITIVE_TOPOLOGY> topology;
         RecordedArray<D3D12_VIEWPORT, 16> viewports;
@@ -352,6 +359,7 @@ public:
         // The backend currently creates only DISPATCH indirect signatures.
         if (pass_profile)
             pass_profile->Work(GpuPassKind::Compute);
+        graphics_root_cbvs.Reset();
         if (!stream) {
             immediate->ExecuteIndirect(signature, count, arguments, offset, count_buffer,
                                        count_offset);
