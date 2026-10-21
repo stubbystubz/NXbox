@@ -13,6 +13,13 @@
 
 namespace D3D12 {
 namespace {
+bool UniformStreamEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_UNIFORM_STREAM");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 bool UploadTraceEnabled() {
     static const bool enabled = BisectEnabled("NXBOX_D3D12_UPLOAD_TRACE");
     return enabled;
@@ -112,6 +119,7 @@ void BufferCacheRuntime::TickFrame(Common::SlotVector<Buffer>& buffers) {
     const auto usage = context.MemoryUsage();
     trim_staging = usage >= NativeTextureMemoryBudget(usage).critical;
 #endif
+    uniform_stream.Clear();
     upload.Collect(trim_staging);
     readback.Collect(trim_staging);
     if (witness_resource) {
@@ -463,7 +471,11 @@ std::span<u8> BufferCacheRuntime::BindMappedUniformBuffer(size_t stage, u32, u32
         bindings.stages[stage].uniform.push_back({nullptr, 0, 0});
         return {};
     }
-    auto staging = upload.Request(padded);
+    auto staging = UniformStreamEnabled()
+                       ? uniform_stream.Request(
+                             padded, [this](size_t bytes) { return upload.Request(bytes); },
+                             [this] { return context.CurrentTick(); })
+                       : upload.Request(padded);
     std::fill(staging.mapped_span.begin() + size, staging.mapped_span.end(), u8{0});
     bindings.stages[stage].uniform.push_back(
         {staging.buffer, static_cast<u32>(staging.offset), padded});

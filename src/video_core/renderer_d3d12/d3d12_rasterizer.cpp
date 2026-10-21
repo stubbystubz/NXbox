@@ -915,6 +915,12 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
     // ---- 1. Gather views/samplers and tell the buffer cache what the shaders use ----
     static const bool rasterizer_state_fastpath = RasterizerStateFastpathEnabled();
     std::array<const Shader::Info*, NUM_GRAPHICS_STAGES> stage_infos{};
+    static const bool stage_metadata = [] {
+        const char* value = std::getenv("NXBOX_D3D12_STAGE_METADATA");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    const GraphicsPipeline* const native_pipeline = pipeline->AsNative();
+    const auto* metadata_pipeline = stage_metadata ? native_pipeline : nullptr;
     StageTableCounts totals{};
     bool has_images = false;
     for (size_t stage = 0; stage < NUM_GRAPHICS_STAGES; ++stage) {
@@ -932,7 +938,8 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
             // shared buffer cache clamps it to the current guest binding size.
             if (!rasterizer_state_fastpath || uniform_sizes[stage][0] != 65536)
                 uniform_sizes[stage].fill(65536);
-            const auto counts = CountStageTables(*info);
+            const auto counts =
+                metadata_pipeline ? metadata_pipeline->StageCounts(stage) : CountStageTables(*info);
             totals.cbv += counts.cbv;
             totals.srv += counts.srv;
             totals.uav += counts.uav;
@@ -1263,7 +1270,6 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         std::fill(zero_vertex_buffer->mapped.begin(), zero_vertex_buffer->mapped.end(), u8{0});
     }
     context.Retain(zero_vertex_buffer);
-    const GraphicsPipeline* const native_pipeline = pipeline->AsNative();
     if (!native_pipeline) {
         SkipDraw("vertex layout unavailable for native pipeline");
         return;

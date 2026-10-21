@@ -137,10 +137,12 @@ BINDINGS_DRIVER = r"""
 #include <string>
 #include <vector>
 #include "video_core/renderer_d3d12/d3d12_upload_cache.h"
+#include "video_core/renderer_d3d12/d3d12_uniform_stream.h"
 using namespace D3D12;
 using u64=std::uint64_t; using u32=std::uint32_t; using u8=std::uint8_t;
 namespace fmt { template<class... T> std::string format(const char*, T...) { return {}; } }
 bool UploadTraceEnabled() { return false; }
+bool UniformStreamEnabled() { return true; }
 void Diagnostic(const std::string&) {}
 namespace Common {
 template<class T> T AlignUp(T value, T alignment) { return (value+alignment-1)&~(alignment-1); }
@@ -220,6 +222,7 @@ struct BufferCacheRuntime {
     bool TryReuseStorageBinding(const Buffer&, u32, u32, bool);
     bool binding_cache = true;
     Context context;
+    UniformStream<StagingRef> uniform_stream;
     Staging upload{context};
     SnapshotStaging uniform_snapshots{context, {}, 0};
     BindingState bindings;
@@ -280,7 +283,7 @@ void CheckBindings(bool fastpath, bool binding_cache) {
     assert(stream.size()==3);
     const auto& mapped=runtime.bindings.stages[0].uniform.back();
     assert(mapped.offset%256==0 && mapped.size==256);
-    assert(mapped.resource->bytes.back()==0);
+    assert(mapped.resource->bytes[mapped.offset + mapped.size - 1]==0);
     stream[0]=42; assert(mapped.resource->bytes[0]==42);
     runtime.BindUniformBuffer(buffer,256,65536);
     assert(runtime.bindings.stages[0].uniform.back().resource==memory);
