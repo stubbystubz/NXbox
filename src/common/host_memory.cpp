@@ -987,7 +987,7 @@ private:
             ++backing_faults;
             MEMORY_BASIC_INFORMATION info{};
             const bool queried =
-                VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info));
+                VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0;
             bool ready{};
             if ((regions[index].handle || regions[index].private_backing) &&
                 (!queried || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE)) {
