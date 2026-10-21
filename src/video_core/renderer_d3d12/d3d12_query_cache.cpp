@@ -1003,7 +1003,9 @@ bool QueryCacheRuntime::CompareConditional(VideoCommon::LookupData first,
     if (host_managed(first) || host_managed(second)) {
         VideoCommon::SubmissionTrace::Log("predicate_fallback host_managed=1");
         EndHostConditionalRendering();
-        return false;
+        // As Vulkan outside high GPU accuracy: render unconditionally instead of
+        // draining the batch to read the report back (1.5-4 ms per frame).
+        return !Settings::IsGPULevelHigh();
     }
     impl->FlushBatch();
     PauseHostConditionalRendering();
