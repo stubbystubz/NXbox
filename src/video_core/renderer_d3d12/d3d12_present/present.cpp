@@ -3,10 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <string>
+#include "common/fps_overlay.h"
 #include "common/logging.h"
 #include "d3d12_present_shader_source.h"
+#include "video_core/renderer_d3d12/d3d12_present/fps_bitmap.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
@@ -307,4 +310,141 @@ HRESULT Presenter::Present(IDXGISwapChain3* swapchain, bool vsync, unsigned inte
     impl->begun = false;
     return swapchain->Present(SyncInterval(vsync, interval), 0);
 }
+namespace {
+constexpr std::string_view FpsShader = R"(
+cbuffer Parameters : register(b0) {
+    uint4 glyphs[8];
+    float2 size;
+    uint glyph_count;
+    float scale;
+};
+struct Vertex { float4 position : SV_Position; };
+Vertex VS(uint id : SV_VertexID) {
+    Vertex result;
+    float2 uv = float2((id << 1) & 2, id & 2);
+    result.position = float4(uv.x * 2 - 1, 1 - uv.y * 2, 0, 1);
+    return result;
+}
+float4 PS(Vertex input) : SV_Target {
+    // Viewport origin is eight bitmap pixels from the display's top-left corner.
+    float2 p = input.position.xy / scale - 8;
+    float2 extent = size / scale;
+    float radius = extent.y * .5;
+    float2 q = abs(p - extent * .5) - float2(extent.x * .5 - radius, 0);
+    float distance = length(max(q, 0)) + min(max(q.x, q.y), 0) - radius;
+    if (distance > 0) discard;
+    int2 cell = int2(floor(p - float2(8, 4)));
+    if (cell.x >= 0 && cell.x < int(glyph_count * 5) && cell.y >= 0 && cell.y < 7) {
+        uint index = uint(cell.x) / 5;
+        uint column = uint(cell.x) % 5;
+        uint bitmap = glyphs[index / 4][index % 4];
+        if (column < 4 && ((bitmap >> (uint(cell.y) * 4 + column)) & 1))
+            return float4(1, 1, 1, 1);
+    }
+    return float4(0, 0, 0, .72);
+}
+)";
+struct FpsConstants {
+    std::array<std::uint32_t, 32> glyphs{};
+    float width{}, height{};
+    unsigned length{};
+    float scale{};
+};
+static_assert(sizeof(FpsConstants) == 36 * 4);
+} // namespace
+struct FpsCounter::Impl {
+    Context& context;
+    ComPtr<ID3D12RootSignature> root;
+    ComPtr<ID3D12PipelineState> pipeline;
+    Common::FpsOverlay::Sample sample;
+
+    explicit Impl(Context& context_) : context{context_} {
+        D3D12_ROOT_PARAMETER parameter{};
+        parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        parameter.Constants = {0, 0, sizeof(FpsConstants) / 4};
+        parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        D3D12_ROOT_SIGNATURE_DESC root_desc{1, &parameter, 0, nullptr,
+                                            D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        ComPtr<ID3DBlob> serialized, errors;
+        Check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &serialized,
+                                          &errors),
+              "Serialize FPS root");
+        Check(context.Device()->CreateRootSignature(0, serialized->GetBufferPointer(),
+                                                    serialized->GetBufferSize(),
+                                                    IID_PPV_ARGS(&root)),
+              "Create FPS root");
+        ShaderCompiler compiler;
+        const auto vertex = compiler.Compile(FpsShader, L"VS", L"vs_6_0");
+        const auto pixel = compiler.Compile(FpsShader, L"PS", L"ps_6_0");
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.pRootSignature = root.Get();
+        desc.VS = {vertex.data(), vertex.size()};
+        desc.PS = {pixel.data(), pixel.size()};
+        desc.SampleMask = UINT_MAX;
+        desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        desc.RasterizerState.DepthClipEnable = TRUE;
+        desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        desc.DepthStencilState.StencilReadMask = desc.DepthStencilState.StencilWriteMask = 0xff;
+        desc.DepthStencilState.FrontFace =
+            desc.DepthStencilState.BackFace = {D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                               D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+        desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        desc.NumRenderTargets = 1;
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        auto& blend = desc.BlendState.RenderTarget[0];
+        blend.BlendEnable = TRUE;
+        blend.SrcBlend = blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+        blend.DestBlend = blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        blend.LogicOp = D3D12_LOGIC_OP_NOOP;
+        blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        Check(context.Device()->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline)),
+              "Create FPS pipeline");
+    }
+    void Draw(D3D12_CPU_DESCRIPTOR_HANDLE target, unsigned width, unsigned height) {
+        using namespace Common::FpsOverlay;
+        sample.Update(Sample::Clock::now(), guest_presents.load(std::memory_order_relaxed),
+                      generation.load(std::memory_order_relaxed));
+        // Integer formatting keeps the decimal point stable regardless of the user's locale.
+        const auto fps = static_cast<unsigned>(std::clamp(std::round(sample.fps), 0.0, 9999.0));
+        const auto tenths =
+            static_cast<unsigned>(std::clamp(std::round(sample.milliseconds * 10), 0.0, 999999.0));
+        std::array<char, 32> text{};
+        std::snprintf(text.data(), text.size(), "%u FPS  %u.%u ms", fps, tenths / 10, tenths % 10);
+        FpsConstants constants;
+        constants.length = static_cast<unsigned>(std::char_traits<char>::length(text.data()));
+        for (unsigned i = 0; i < constants.length; ++i)
+            constants.glyphs[i] = FpsGlyph(text[i]);
+        constants.scale = std::max(1.f, std::min(width / 1920.f, height / 1080.f) * 3.f);
+        constants.width = (16 + constants.length * 5) * constants.scale;
+        constants.height = 15 * constants.scale;
+        const float margin = 8 * constants.scale;
+        const D3D12_VIEWPORT viewport{margin, margin, constants.width, constants.height, 0, 1};
+        const D3D12_RECT scissor{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        context.InvalidateRecordedState();
+        auto* commands = context.Commands();
+        commands->SetGraphicsRootSignature(root.Get());
+        commands->SetPipelineState(pipeline.Get());
+        commands->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+        commands->OMSetRenderTargets(1, &target, FALSE, nullptr);
+        commands->RSSetViewports(1, &viewport);
+        commands->RSSetScissorRects(1, &scissor);
+        commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        commands->DrawInstanced(3, 1, 0, 0);
+    }
+};
+FpsCounter::FpsCounter(Context& context) : impl{std::make_unique<Impl>(context)} {}
+FpsCounter::~FpsCounter() {
+    try {
+        impl->context.Finish(FrameCount::ForcedSubmitLifecycle);
+    } catch (const std::exception& error) {
+        LOG_ERROR(Render, "D3D12 FPS teardown: {}", error.what());
+    }
+}
+void FpsCounter::Draw(D3D12_CPU_DESCRIPTOR_HANDLE target, unsigned width, unsigned height) {
+    impl->Draw(target, width, height);
+}
+
 } // namespace D3D12::Present

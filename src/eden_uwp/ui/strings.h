@@ -405,6 +405,8 @@ enum class Text {
     HomeComboPrompt,
     HintStickMotion,
     OfficialSwitchInterface,
+    ShowFps,
+    ShowFpsHint,
     RequiresFirmware,
     BackToNXboxInterface,
     SystemMenuTitle,

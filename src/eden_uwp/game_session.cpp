@@ -34,6 +34,7 @@
 
 #include <fmt/format.h>
 #include "common/cpu_features.h"
+#include "common/fps_overlay.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
 #include "common/host_memory.h"
@@ -74,6 +75,7 @@
 #include "eden_uwp/game_download.h"
 #include "eden_uwp/gamepad.h"
 #include "eden_uwp/home_ui_settings.h"
+#include "eden_uwp/fps_settings.h"
 #include "eden_uwp/http_vfs_file.h"
 #include "eden_uwp/mesa_window.h"
 #include "eden_uwp/renderer_settings.h"
@@ -350,7 +352,8 @@ void ApplyEdenSettingsFile(const std::filesystem::path& settings_file) {
             continue;
         }
         const auto& [label, value] = *entry;
-        if (label == kOfficialSwitchInterfaceKey || label == "button_layout") {
+        if (label == kOfficialSwitchInterfaceKey || label == kShowFpsKey ||
+            label == "button_layout") {
             // Frontend preferences have dedicated readers; layout is global and normalized
             // once per session so per-title files cannot disagree with the physical mapping.
             continue;
@@ -377,6 +380,11 @@ void ApplyEdenSettingsFile(const std::filesystem::path& settings_file) {
 }
 
 void ApplyEdenSettingsFile() {
+    const std::filesystem::path local_state(std::wstring_view(
+        winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
+    char show_fps[16]{};
+    GetEnvironmentVariableA("NXBOX_SHOW_FPS", show_fps, sizeof(show_fps));
+    Common::FpsOverlay::Initialize(ReadShowFps(local_state), show_fps);
     ApplyEdenSettingsFile(
         std::filesystem::path(winrt::to_string(
             winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path())) /

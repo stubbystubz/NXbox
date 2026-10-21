@@ -230,6 +230,8 @@
     {Text::SystemMenuHint, L"Use your installed firmware. View + Menu opens HOME."},
     {Text::HintStickMotion, L"View + right stick: tilt (motion)"},
     {Text::HomeComboPrompt, L"Press again to go home"},
+    {Text::ShowFps, L"Show FPS"},
+    {Text::ShowFpsHint, L"Game frames per second and average frame time (DirectX)."},
     {Text::OfficialSwitchInterface, L"Use the system interface (firmware)"},
     {Text::RequiresFirmware, L"Requires firmware"},
     {Text::BackToNXboxInterface, L"Back to NXbox interface"},

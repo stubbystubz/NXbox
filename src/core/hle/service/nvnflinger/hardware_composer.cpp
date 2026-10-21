@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <optional>
+#include "common/fps_overlay.h"
 
 #include <boost/container/small_vector.hpp>
 
@@ -77,6 +78,7 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
     std::optional<s32> swap_interval{};
     bool has_acquired_buffer{};
 
+    bool game_buffer_acquired = false;
     // Acquire all necessary framebuffers.
     for (auto& layer : display.stack.layers) {
         auto consumer_id = layer->consumer_id;
@@ -109,6 +111,7 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
         // If we acquired a new buffer, we need to present.
         if (result == CacheStatus::BufferAcquired) {
             has_acquired_buffer = true;
+            game_buffer_acquired |= !layer->is_overlay && layer->visible;
         }
 
         const auto& buffer = m_framebuffers[consumer_id];
@@ -158,6 +161,9 @@ u32 HardwareComposer::ComposeLocked(f32* out_speed_scale, Display& display,
         std::stable_sort(composition_stack.begin(), composition_stack.end(),
                          [&](const HwcLayer& l, const HwcLayer& r) { return l.z_index < r.z_index; });
 
+        // Count new guest images once per composition, excluding overlay-only updates.
+        if (game_buffer_acquired)
+            Common::FpsOverlay::GuestPresent();
         // Composite.
         nvdisp.Composite(composition_stack);
     }
