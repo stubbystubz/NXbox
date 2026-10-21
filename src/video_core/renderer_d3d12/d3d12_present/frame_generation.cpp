@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <algorithm>
 #include <array>
 #include <cstring>
+#include <fmt/format.h>
 #include "d3d12_present_shader_source.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
@@ -17,6 +19,29 @@ struct FrameGenerator::Impl {
     unsigned width{}, height{}, bx{}, by{};
     unsigned output_width{}, output_height{}, source_width{}, source_height{};
     bool history{};
+    // Why frames were or were not generated, logged every 300 real frames.
+    struct Tally {
+        unsigned calls{}, slow_or_fast{}, no_history{}, too_different{}, generated{};
+        double difference_sum{}, difference_max{};
+    } tally;
+    void Count(unsigned Tally::*reason, double difference = -1) {
+        ++(tally.*reason);
+        if (difference >= 0) {
+            tally.difference_sum += difference;
+            tally.difference_max = std::max(tally.difference_max, difference);
+        }
+        if (++tally.calls < 300)
+            return;
+        const unsigned measured = tally.too_different + tally.generated;
+        Diagnostic(fmt::format("D3D12_FRAME_GEN frames={} generated={} rejected_timing={} "
+                               "rejected_history={} rejected_difference={} "
+                               "difference_mean={:.3f} difference_max={:.3f}",
+                               tally.calls, tally.generated, tally.slow_or_fast,
+                               tally.no_history, tally.too_different,
+                               measured ? tally.difference_sum / measured : 0.0,
+                               tally.difference_max));
+        tally = {};
+    }
     explicit Impl(Context& context_) : context{context_} {}
     void Initialize() {
         if (root)
@@ -182,6 +207,7 @@ struct FrameGenerator::Impl {
     ResourcePtr Generate(const ResourcePtr& source, double seconds) {
         if (seconds > 0 && !policy.CanGenerate(true, seconds, 0)) {
             history = false;
+            Count(&Tally::slow_or_fast);
             return {}; // Fast games do not copy history or wait for GPU completion.
         }
         Initialize();
@@ -203,8 +229,10 @@ struct FrameGenerator::Impl {
         }
         const bool had_history = history;
         history = true;
-        if (!policy.CanGenerate(had_history, seconds, 0))
+        if (!policy.CanGenerate(had_history, seconds, 0)) {
+            Count(had_history ? &Tally::slow_or_fast : &Tally::no_history);
             return {};
+        }
         for (const auto& resource :
              {previous, current, output, luma, motion, stats, readback, zero})
             context.Retain(resource);
@@ -220,8 +248,12 @@ struct FrameGenerator::Impl {
         context.Finish(FrameCount::ForcedSubmitPresent);
         std::uint32_t sum{};
         std::memcpy(&sum, readback->mapped.data(), sizeof(sum));
-        if (!policy.CanGenerate(true, seconds, double(sum) / (4095.0 * bx * by)))
+        const double difference = double(sum) / (4095.0 * bx * by);
+        if (!policy.CanGenerate(true, seconds, difference)) {
+            Count(&Tally::too_different, difference);
             return {};
+        }
+        Count(&Tally::generated, difference);
         // The readback wait retired the luma batch. Retain both warp sources in
         // this new batch too, including if recording fails before the final copy.
         context.Retain(previous);
