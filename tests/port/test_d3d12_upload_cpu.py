@@ -13,8 +13,8 @@ NATIVE = ROOT / "src/video_core/renderer_d3d12"
 def test_upload_category_counts_include_legacy_callers():
     context = (NATIVE / "d3d12_context.cpp").read_text()
     method = (
-        "void FrameProfile::Count("
-        + context.split("void FrameProfile::Count(", 1)[1].split(
+        "void FrameProfile::CountEnabled("
+        + context.split("void FrameProfile::CountEnabled(", 1)[1].split(
             "void FrameProfile::NoteTransition", 1
         )[0]
     )
@@ -28,7 +28,8 @@ struct FrameProfile {
     bool owner = true;
     std::array<u64, static_cast<size_t>(FrameCount::Count)> counts{};
     bool OnOwner() const { return owner; }
-    void Count(FrameCount counter, u64 amount = 1);
+    void CountEnabled(FrameCount counter, u64 amount = 1);
+    void Count(FrameCount counter, u64 amount = 1) { CountEnabled(counter, amount); }
 };
 __METHOD__
 int main() {

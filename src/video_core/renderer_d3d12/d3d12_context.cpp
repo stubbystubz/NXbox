@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
@@ -522,7 +523,7 @@ void FrameProfile::Switch(FramePhase phase) {
     const auto now = ProfileWallTime();
     timing.Switch(phase, now);
 }
-FrameProfile::Scope::Scope(FrameProfile& profile_, FramePhase phase) {
+void FrameProfile::Scope::Begin(FrameProfile& profile_, FramePhase phase) {
     if (!profile_.OnOwner())
         return;
     profile = &profile_;
@@ -532,14 +533,14 @@ FrameProfile::Scope::Scope(FrameProfile& profile_, FramePhase phase) {
     if (wait)
         wall_start = ProfileWallTime();
 }
-FrameProfile::Scope::~Scope() {
+void FrameProfile::Scope::End() {
     if (!profile)
         return;
     if (wait)
         profile->fence_wall += ProfileWallTime() - wall_start;
     profile->Switch(previous);
 }
-void FrameProfile::Count(FrameCount counter, u64 amount) {
+void FrameProfile::CountEnabled(FrameCount counter, u64 amount) {
     if (!OnOwner())
         return;
     counts[static_cast<size_t>(counter)] += amount;
@@ -1065,7 +1066,10 @@ Context::Context() {
     if (GpuPassProfile::Enabled())
         pass_profile = std::make_unique<GpuPassProfile>(*this);
     facade.device = device.Get();
-    facade.reuse_draw_state = BisectEnabled("NXBOX_D3D12_RECORD_STATE");
+    {
+        const char* value = std::getenv("NXBOX_D3D12_RECORD_STATE");
+        facade.reuse_draw_state = !value || std::strcmp(value, "0") != 0;
+    }
     {
         char value[2]{};
         facade.compact_draws =

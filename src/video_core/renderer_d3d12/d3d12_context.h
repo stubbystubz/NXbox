@@ -441,12 +441,20 @@ class FrameProfile : public Common::GpuProfile::Sink,
 public:
     class Scope {
     public:
-        Scope(FrameProfile& profile_, FramePhase phase);
-        ~Scope();
+        Scope(FrameProfile& profile_, FramePhase phase) {
+            if (profile_.Enabled()) [[unlikely]]
+                Begin(profile_, phase);
+        }
+        ~Scope() {
+            if (profile) [[unlikely]]
+                End();
+        }
         Scope(const Scope&) = delete;
         Scope& operator=(const Scope&) = delete;
 
     private:
+        void Begin(FrameProfile& profile_, FramePhase phase);
+        void End();
         FrameProfile* profile{};
         FramePhase previous{};
         u64 wall_start{};
@@ -455,7 +463,10 @@ public:
     bool Enabled() const {
         return enabled;
     }
-    void Count(FrameCount counter, u64 amount = 1);
+    void Count(FrameCount counter, u64 amount = 1) {
+        if (enabled) [[unlikely]]
+            CountEnabled(counter, amount);
+    }
     // Diagnostic: histogram of transition barriers by before/after state and resource kind.
     void NoteTransition(u32 before, u32 after, bool buffer);
     void NoteWait(std::string_view site, u64 wall);
@@ -476,6 +487,7 @@ public:
 private:
     void* recorder_thread{};
     u64 recorder_initial_cpu{};
+    void CountEnabled(FrameCount counter, u64 amount);
     bool OnOwner();
     void Switch(FramePhase phase);
     bool method_enabled{Common::MaxwellMethodProfile::Enabled()};

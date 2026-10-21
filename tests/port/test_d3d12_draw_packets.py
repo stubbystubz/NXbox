@@ -11,6 +11,10 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 def random_source():
+    context = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
+    start = context.index('const char* value = std::getenv("NXBOX_D3D12_RECORD_STATE")')
+    end = context.index("\n    }", start)
+    policy = context[start:end].replace("facade.", "fast.")
     return (
         recorder_tests.source().split("int main() {", 1)[0]
         + r"""
@@ -79,7 +83,11 @@ int main() {
         RecordStream<> old_stream, stream;
         old.stream = &old_stream; old.compact_draws = false;
         fast.stream = &stream;
-        fast.reuse_draw_state = epoch % 3 != 2;
+        // Execute the actual Context policy with unset, explicit-on and opt-out values.
+        if (epoch % 3 == 0) unsetenv("NXBOX_D3D12_RECORD_STATE");
+        else setenv("NXBOX_D3D12_RECORD_STATE", epoch % 3 == 1 ? "1" : "0", 1);
+        __TRANSPORT_POLICY__
+        assert(fast.reuse_draw_state == (epoch % 3 != 2));
         fast.compact_draws = epoch % 3 != 1;
         fast.ResetDrawState(); // Same producer hook used after command-list Reset.
         ID3D12GraphicsCommandList expected, actual;
@@ -159,7 +167,7 @@ int main() {
     assert(!abandoned.Consume(nullptr, false));
 }
 """
-    )
+    ).replace("__TRANSPORT_POLICY__", policy)
 
 
 class DrawPacketTests(unittest.TestCase):
@@ -175,7 +183,7 @@ class DrawPacketTests(unittest.TestCase):
             "void Context::MarkWork", 1
         )[0]
         self.assertIn("facade.ResetDrawState();", begin)
-        self.assertIn('BisectEnabled("NXBOX_D3D12_RECORD_STATE")', context)
+        self.assertIn('std::getenv("NXBOX_D3D12_RECORD_STATE")', context)
         self.assertIn('GetEnvironmentVariableA("NXBOX_D3D12_COMPACT_DRAWS"', context)
 
 

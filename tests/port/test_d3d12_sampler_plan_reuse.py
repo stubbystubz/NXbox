@@ -81,6 +81,8 @@ DescriptorKey Build(const Sampler& sampler, bool compare) {
 struct Table { Plan* plan; u32 count; };
 struct Writers {
     u32 writes{};
+    // Source lifetime/generation handling is exercised by DrawScratchTests.
+    void ResolvePlanSources(Plan&, bool) {}
     void WriteSampler(Table table, u32 i, const Sampler& sampler, bool compares) {
         table.plan->keys.at(i) = Build(sampler, compares);
         table.plan->initialized.at(i) = 1;
