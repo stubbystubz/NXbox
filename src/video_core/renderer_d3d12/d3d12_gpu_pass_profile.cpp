@@ -29,12 +29,26 @@ struct Pass {
 } // namespace
 struct GpuPassProfile::Impl {
     explicit Impl(Context& owner) : context{owner} {
+        if (!context.Device() || !context.Queue())
+            throw std::runtime_error("GPU pass profiling requires a device and direct queue");
         D3D12_QUERY_HEAP_DESC desc{};
         desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
         desc.Count = SlotCount * QueriesPerSlot;
         Check(context.Device()->CreateQueryHeap(&desc, IID_PPV_ARGS(&heap)),
               "GPU pass timestamp heap", context.Device());
-        readback = context.CreateBuffer(u64{desc.Count} * sizeof(u64), D3D12_HEAP_TYPE_READBACK);
+        // Context creates us before initializing command allocators/the recorder. A pooled
+        // CreateBuffer emits an aliasing barrier through Commands(), which is not ready yet.
+        readback = context.CreateResource(D3D12_RESOURCE_DESC{D3D12_RESOURCE_DIMENSION_BUFFER,
+                                                              0,
+                                                              u64{desc.Count} * sizeof(u64),
+                                                              1,
+                                                              1,
+                                                              1,
+                                                              DXGI_FORMAT_UNKNOWN,
+                                                              {1, 0},
+                                                              D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                                              D3D12_RESOURCE_FLAG_NONE},
+                                          D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
         u64 frequency{};
         Check(context.Queue()->GetTimestampFrequency(&frequency), "GPU pass frequency",
               context.Device());

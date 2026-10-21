@@ -33,6 +33,15 @@ using u32 = std::uint32_t;
 using u64 = std::uint64_t;
 constexpr int D3D12_QUERY_HEAP_TYPE_TIMESTAMP = 1, D3D12_QUERY_TYPE_TIMESTAMP = 2;
 constexpr int D3D12_HEAP_TYPE_READBACK = 3;
+constexpr int D3D12_RESOURCE_DIMENSION_BUFFER = 1, DXGI_FORMAT_UNKNOWN = 0;
+constexpr int D3D12_TEXTURE_LAYOUT_ROW_MAJOR = 1, D3D12_RESOURCE_FLAG_NONE = 0;
+constexpr int D3D12_RESOURCE_STATE_COPY_DEST = 1;
+struct D3D12_RESOURCE_DESC {
+    int Dimension; u64 Alignment, Width; u32 Height, DepthOrArraySize, MipLevels;
+    int Format;
+    struct { u32 Count, Quality; } SampleDesc;
+    int Layout, Flags;
+};
 struct D3D12_QUERY_HEAP_DESC { int Type{}; u32 Count{}; };
 struct ID3D12QueryHeap { std::vector<u64> stamps; };
 template<class T> struct ComPtr {
@@ -59,7 +68,10 @@ struct DeviceMock {
     }
 };
 struct QueueMock {
-    int GetTimestampFrequency(u64* frequency) { *frequency = 1000; return 0; }
+    unsigned frequency_reads{};
+    int GetTimestampFrequency(u64* frequency) {
+        ++frequency_reads; *frequency = 1000; return 0;
+    }
 };
 class CommandFacade {
 public:
@@ -87,9 +99,25 @@ public:
     DeviceMock device;
     QueueMock queue;
     std::vector<std::function<void()>> completion;
-    DeviceMock* Device() { return &device; }
-    QueueMock* Queue() { return &queue; }
-    ResourcePtr CreateBuffer(u64 size, int) {
+    bool device_ready{true}, queue_ready{true};
+    unsigned readback_allocations{}, recording_attempts{};
+    DeviceMock* Device() { return device_ready ? &device : nullptr; }
+    QueueMock* Queue() { return queue_ready ? &queue : nullptr; }
+    ResourcePtr CreateBuffer(u64, int) {
+        // Production pooled buffers call Commands() to emit an aliasing barrier.
+        // The profiler is constructed before either immediate or deferred lists exist.
+        ++recording_attempts;
+        throw std::runtime_error("command allocators and recorder are not initialized");
+    }
+    ResourcePtr CreateResource(const D3D12_RESOURCE_DESC& desc, int heap, int state) {
+        assert(device_ready && queue_ready);
+        assert(desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+        assert(desc.Height == 1 && desc.DepthOrArraySize == 1 && desc.MipLevels == 1);
+        assert(desc.SampleDesc.Count == 1 && desc.Format == DXGI_FORMAT_UNKNOWN);
+        assert(desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && desc.Flags == 0);
+        assert(heap == D3D12_HEAP_TYPE_READBACK && state == D3D12_RESOURCE_STATE_COPY_DEST);
+        ++readback_allocations;
+        const auto size = desc.Width;
         auto resource = std::make_shared<Resource>();
         resource->handle.object = std::make_unique<ID3D12Resource>();
         resource->handle.Get()->bytes.resize(size);
@@ -151,7 +179,28 @@ int main() {
         setenv("NXBOX_D3D12_GPU_PASS_PROFILE", value, 1); assert(!GpuPassProfile::Enabled());
     }
     setenv("NXBOX_D3D12_GPU_PASS_PROFILE", "1", 1); assert(GpuPassProfile::Enabled());
-    Context context; CommandFacade commands; GpuPassProfile profile(context);
+    // Reproduce Context startup: device/queue first, profiler next, command lists later.
+    Context context;
+    for (const bool missing_device : {true, false}) {
+        context.device_ready = !missing_device;
+        context.queue_ready = missing_device;
+        bool rejected{};
+        try { GpuPassProfile premature(context); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected && context.device.allocations == 0);
+        assert(context.queue.frequency_reads == 0 && context.readback_allocations == 0);
+    }
+    context.device_ready = context.queue_ready = true;
+    GpuPassProfile profile(context);
+    assert(context.recording_attempts == 0 && context.readback_allocations == 1);
+    assert(context.device.allocations == 1 && context.queue.frequency_reads == 1);
+    assert(profile.impl->readback->mapped.size() == 32 * (2 + 4096 * 2) * sizeof(u64));
+    assert(!profile.impl->commands && context.completion.empty());
+    // Entry points are safe before any submission has attached a command facade.
+    profile.Work(GpuPassKind::Draw);
+    profile.Boundary(); profile.Target({}); profile.Label("guest draws");
+    profile.EndSubmission();
+    CommandFacade commands;
     profile.BeginSubmission(commands);
     profile.Target({1280, 720, 28, 45, 0xabc});
     profile.Work(GpuPassKind::Draw); commands.Advance(3);
@@ -290,6 +339,19 @@ class GpuPassProfileTests(unittest.TestCase):
         )
         self.assertIn("memory_order_release", profiler)
         self.assertIn("memory_order_acq_rel", profiler)
+
+    def test_startup_initializes_profile_after_queue_before_recorders(self):
+        context = (BACKEND / "d3d12_context.cpp").read_text()
+        startup = context.split("Context::Context() {", 1)[1].split(
+            "void Context::InitializeLists()", 1
+        )[0]
+        queue = startup.index("device->CreateCommandQueue(")
+        fence = startup.index("device->CreateFence(")
+        profile = startup.index("std::make_unique<GpuPassProfile>(*this)")
+        self.assertLess(queue, fence)
+        self.assertLess(fence, profile)
+        self.assertLess(profile, startup.index("StartRecorder();"))
+        self.assertLess(profile, startup.index("InitializeLists();"))
 
     def test_analyzer_weights_windows_and_handles_truncation(self):
         def sample(ms, shader="abc"):
