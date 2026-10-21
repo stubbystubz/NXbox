@@ -29,7 +29,7 @@ class PresentImageSelectionTests(unittest.TestCase):
                 extra_flags=[*flags, "-fsanitize=address,undefined", "-Wall", "-Wextra"],
             )
 
-    def test_presenter_fallback_downloads_gpu_owned_alias_before_guest_upload_only_when_opted_in(
+    def test_presenter_fallback_downloads_gpu_owned_alias_before_guest_upload_unless_opted_out(
         self,
     ):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_rasterizer.cpp").read_text()
@@ -51,7 +51,7 @@ class PresentImageSelectionTests(unittest.TestCase):
                         "-fsanitize=address,undefined",
                         "-Wall",
                         "-Wextra",
-                        f"-DEXPECT_FALLBACK_DOWNLOAD={int(value == '1')}",
+                        f"-DEXPECT_FALLBACK_DOWNLOAD={int(value != '0')}",
                     ],
                 )
 

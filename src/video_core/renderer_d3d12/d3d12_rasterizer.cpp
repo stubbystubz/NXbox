@@ -4319,10 +4319,11 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
     // The fallback reads guest RAM directly. An incompatible format/size alias may
     // still own newer GPU pixels; DownloadMemory writes whole images overlapping
     // the display base, ordered by modification tick, before that CPU read.
-    // Opt-in: it cost MK8D 4.4 fps (33.8 -> 29.4) on Series X; only Scarlet's capture needs it.
+    // Default on: without it MK8D, Odyssey and Wonder present black frames (the fallback reads
+    // guest memory the GPU never wrote back). NXBOX_PRESENT_FALLBACK_DOWNLOAD=0 disables it.
     const bool download_before_fallback = [] {
         const char* value = std::getenv("NXBOX_PRESENT_FALLBACK_DOWNLOAD");
-        return value && value[0] == '1';
+        return !(value && value[0] == '0');
     }();
     if (download_before_fallback)
         texture_cache.DownloadMemory(config.address + config.offset, 1);
