@@ -315,6 +315,23 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (!immediate_payload)
             diagnostic_token = impl->runtime.ReportPending(cpu_addr);
     }
+    // Immediate payloads have no retirement callback. Avoid allocating its large closure.
+    if (immediate_payload) {
+        if (has_timestamp) {
+            const u64 timestamp = timestamp_at_processing ? report_timestamp : impl->gpu.GetTicks();
+            if (Core::Timing::Trace::Enabled()) {
+                Core::Timing::Trace::Record(Core::Timing::Trace::Source::QueryPublish, timestamp,
+                                            impl->gpu.GetTicks(), cpu_addr);
+            }
+            u64 value = static_cast<u64>(payload);
+            std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+            std::memcpy(pointer, &value, sizeof(value));
+        } else {
+            std::memcpy(pointer, &payload, sizeof(payload));
+        }
+        streamer->Free(new_query_id);
+        return;
+    }
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, diagnostic_token,
                                      timestamp_at_processing, report_timestamp] {
@@ -364,23 +381,6 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     if (is_fence) {
         impl->rasterizer.SignalFence(std::move(operation));
     } else {
-        if (!Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
-            if (has_timestamp) {
-                const u64 timestamp =
-                    timestamp_at_processing ? report_timestamp : impl->gpu.GetTicks();
-                if (Core::Timing::Trace::Enabled()) {
-                    Core::Timing::Trace::Record(Core::Timing::Trace::Source::QueryPublish,
-                                                timestamp, impl->gpu.GetTicks(), cpu_addr);
-                }
-                u64 value = static_cast<u64>(payload);
-                std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-                std::memcpy(pointer, &value, sizeof(value));
-            } else {
-                std::memcpy(pointer, &payload, sizeof(payload));
-            }
-            streamer->Free(new_query_id);
-            return;
-        }
         impl->rasterizer.SyncOperation(std::move(operation));
     }
     if (is_synced) {

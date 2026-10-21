@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 #include <queue>
 
 #include "common/common_types.h"
@@ -106,6 +107,8 @@ public:
         if constexpr (!can_async_check) {
             TryReleasePendingFences<false>();
         }
+        // Query retirement normally adds one operation before the guest signal.
+        uncommitted_operations.reserve(2);
         CommitAsyncFlushes();
         TFence new_fence = CreateFence(!should_flush);
         std::unique_lock fence_lock{guard, std::defer_lock};
@@ -269,7 +272,7 @@ private:
 
         try {
             TFence current_fence;
-            std::deque<std::function<void()>> current_operations;
+            std::vector<std::function<void()>> current_operations;
             while (!stop_token.stop_requested()) {
                 {
                     std::unique_lock lock(guard);
@@ -353,8 +356,10 @@ private:
     }
 
     std::queue<TFence> fences;
-    std::deque<std::function<void()>> uncommitted_operations;
-    std::deque<std::deque<std::function<void()>>> pending_operations;
+    // Moving a deque allocates a replacement map/block even for an empty batch.
+    // A vector transfers its storage without allocating on every fence publication.
+    std::vector<std::function<void()>> uncommitted_operations;
+    std::deque<std::vector<std::function<void()>>> pending_operations;
 
     std::exception_ptr thread_error;
     std::mutex guard;
