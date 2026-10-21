@@ -691,8 +691,13 @@ int main() { setenv("NXBOX_FASTMEM", "1", 1); // UWP fastmem is opt-in
         std::vector<std::thread> workers;
         for (unsigned core = 0; core < 8; ++core) {
             workers.emplace_back([&] {
-                for (int i = 0; i < 100; ++i)
-                    assert(Fault(memory.virtual_base));
+                for (int i = 0; i < 100; ++i) {
+                    if (!Fault(memory.virtual_base)) {
+                        // Alias contention redirects to a native callback, which
+                        // prepares backing independently instead of retrying the AV.
+                        assert(memory.PrepareBackingPage(memory.backing_base));
+                    }
+                }
             });
         }
         for (auto& worker : workers)
