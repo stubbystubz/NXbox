@@ -75,7 +75,7 @@ class GpuQueryReports(unittest.TestCase):
         self.assertIn("host_managed(first) || host_managed(second)", compare)
         fallback = function_body(compare, "if (host_managed(first)")
         self.assertIn("EndHostConditionalRendering();", fallback)
-        self.assertIn("return false;", fallback)
+        self.assertIn("return !Settings::IsGPULevelHigh();", fallback)
 
     def test_guest_delivery_and_one_wait_for_an_unfinished_batch(self):
         source = (ROOT / "src/video_core/query_cache/query_cache.h").read_text()
