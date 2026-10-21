@@ -239,6 +239,8 @@
     {Text::SystemMenuHint, L"Use o firmware instalado. View + Menu abre o HOME."},
     {Text::HintStickMotion, L"View + analógico direito: inclinar (movimento)"},
     {Text::HomeComboPrompt, L"Aperte de novo para ir ao início"},
+    {Text::ShowFps, L"Mostrar FPS"},
+    {Text::ShowFpsHint, L"Quadros do jogo por segundo e tempo médio de quadro (DirectX)."},
     {Text::OfficialSwitchInterface, L"Usar a interface do sistema (firmware)"},
     {Text::RequiresFirmware, L"Requer firmware"},
     {Text::BackToNXboxInterface, L"Voltar para a interface do NXbox"},

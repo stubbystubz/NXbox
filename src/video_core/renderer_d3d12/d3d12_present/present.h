@@ -36,6 +36,17 @@ struct Layer {
     std::uint32_t transform{};
     Blend blend{Blend::Opaque};
 };
+// Created lazily on the first enabled swapchain presentation. No texture uploads or SRVs.
+class FpsCounter {
+public:
+    explicit FpsCounter(Context& context);
+    ~FpsCounter();
+    void Draw(D3D12_CPU_DESCRIPTOR_HANDLE target, unsigned width, unsigned height);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+};
 class Presenter {
 public:
     explicit Presenter(Context& context);

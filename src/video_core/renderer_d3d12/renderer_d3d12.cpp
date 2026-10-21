@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <dxgi1_4.h>
 #include <windows.h>
+#include "common/fps_overlay.h"
 #include "common/logging.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -57,6 +58,7 @@ struct RendererD3D12::Impl {
     D3D12::Context context;
     ComPtr<IDXGISwapChain3> swapchain;
     std::unique_ptr<Present::Presenter> upscaler;
+    std::unique_ptr<Present::FpsCounter> fps_counter;
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> root;
@@ -170,6 +172,10 @@ struct RendererD3D12::Impl {
         }
     }
     void Initialize(Core::Frontend::EmuWindow& window) {
+        char show_fps[16]{};
+        GetEnvironmentVariableA("NXBOX_SHOW_FPS", show_fps, sizeof(show_fps));
+        if (Common::FpsOverlay::EnvironmentForces(show_fps))
+            Common::FpsOverlay::Initialize(true, show_fps);
         const auto& info = window.GetWindowInfo();
         if (info.type != Core::Frontend::WindowSystemType::Windows || !info.render_surface) {
 #ifdef NXBOX_UWP
@@ -419,6 +425,14 @@ struct RendererD3D12::Impl {
         }
         const UINT index = swapchain->GetCurrentBackBufferIndex();
         Draw(layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
+        // Only the display target receives host diagnostics; Capture() never reaches this path.
+        if (!layers.empty()) {
+            Common::FpsOverlay::DrawIfEnabled([&] {
+                if (!fps_counter)
+                    fps_counter = std::make_unique<Present::FpsCounter>(context);
+                fps_counter->Draw(Rtv(index), width, height);
+            });
+        }
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
         context.SimulateSeriesSFrame();
         context.GpuPassFrame();
