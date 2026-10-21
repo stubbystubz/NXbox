@@ -1,5 +1,125 @@
 # UWP fastmem boot faults
 
+## Round 5: build 0.3.819 / fm6 — alias/backing lock coupling
+
+### Capture comparison (complete files)
+
+Round 4 is present. Neither fm6 capture contains an unhandled exception, abort,
+or repeated PC/target pair. Both have one initialization `Present complete`,
+not a game frame. `present_age_ms=0` is also the heartbeat's sentinel when
+`last_present_tick_ms` has never been set; it is not evidence of ongoing frames.
+Both watchers eventually report the process gone. These captures establish
+failure to reach gameplay, but do not establish that the process remained alive
+indefinitely or explain its eventual exit.
+
+| Capture | AVs | Unique PCs / exact targets / 4 KiB pages | Last renderer evidence | Game frames |
+| --- | ---: | --- | --- | --- |
+| `r-mk8d-fm6` | 5 | 5 / 5 / 2 | 14.313532 s: syncpoints pending=0, signaled=1 | none |
+| `r-wonder-fm6` | 5,993 | 5,993 / 2,694 / 196 | 15.259981 s: submission 2 | none |
+| `r-mk8d-mp70` | 0 | 0 / 0 / 0 | 234.608641 s: submission 91,200 | 45/45 sampled windows, median game fps 25.7 |
+| `r-wonder-mp70` | 0 | 0 / 0 / 0 | 205.694549 s: submission 120,120 | 39/39 sampled windows, median game fps 26.2 |
+
+The first AV in each fm6 run is the intentional protected native startup probe.
+All remaining recorded AV PCs are JIT addresses and all targets are inside the
+alias arena; no recorded native backing fault or faulting instruction inside the
+VEH follows them. The `handler_stack` frames are the observer's stack, not PCs
+of nested faults. Successful faults handled by the regional VEH can precede the
+observer in handler order, so their absence is not a complete fault census.
+
+MK8D's `eden.txt:181–182` ends with submission 4 (upload/copy and query
+report/predicate copy) and syncpoint completion. The same sequence exists in
+`mp70:179–180` at 2.648791/2.650041 s and is followed by gameplay; it is not by
+itself a failed GPU fence. The final HID producer logs at 14.308592 s, NVDRV at
+14.242281 s. The four JIT write faults are **cpu0, tid=1896**, in 15 ms at ticks
+137858031–137858046: page `0x1d9526f0000`, offsets 0, 8, 0x18, 0x28,
+at four distinct PCs. CPU0's last record is `crash.txt:129` (handler frame 6).
+The heartbeat is a different thread, **worker tid=7432**: 26 records, ending at
+tick 137867859 (`:139`), 9.813 s after the final JIT AV. Memory settles near
+1,589 MiB. Its progress does not prove CPU or GPU progress.
+
+Wonder's first JIT fault is **cpu2 tid=6456**, tick 137654406. It corresponds
+to the single backing-view error 8 at `eden.txt:185` (16.225070 s), followed by
+successful private recovery and disabled *new* fastmem emission at `:186`.
+The failing backing address is `0x250ed360000`, backing offset `0x8a360000`,
+size 64 KiB; the alias target is `0x262b1360000`. CPU2 records 718 JIT AVs,
+CPU0 tid=6080 records 4,134, CPU1 tid=6528 records 1,140. Their final records:
+
+| Producer | Last crash.txt line | Tick | Meaning |
+| --- | ---: | ---: | --- |
+| cpu2 / 6456 | 55,195 | 137687187 | final handler frame after a JIT AV |
+| cpu0 / 6080 | 60,032 | 137690109 | final handler frame after a JIT AV |
+| cpu1 / 6528 | 60,042 | 137690125 | final handler frame after a JIT AV |
+| heartbeat worker / 7784 | 60,046 | 137694281 | heartbeat after stall gap=3735 ms |
+| lifecycle worker / 1912 | 60,045 | 137694281 | Suspending |
+
+The final AV is 35.719 s after private recovery's first JIT fault. The hottest
+exact target (`0x262b64f6110`) appears 25 times, always at different PCs;
+maximum identical PC/target count is one. This is not an observed unchanged-PC
+retry loop, including after private recovery. Eden does resume at 44.683308 s,
+but its last 24 lines are the service-event inventory in `CreateEvent`, not GPU
+submissions or a resumed render loop. Eden categories are not thread IDs;
+only the crash records identify native tids. The worker role assigned to the
+startup probe, heartbeat, and lifecycle callback does not mean GPU thread.
+
+Microsoft's [MapViewOfFile3FromApp contract](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile3fromapp)
+requires an exact placeholder base/size match for replacement. The observed
+64 KiB request is aligned and error 8 means insufficient memory/resources; the
+logs do not establish an Xbox placeholder/view quota, a boundary mismatch, or
+which resource was exhausted. No quota is invented or retried here. Existing
+private recovery already stops new section attempts and preserves canonical
+addresses and old aliases. The healthy mp70 runs establish the page-table
+baseline, not an isolated measurement of every other build/config difference.
+
+### Source defect addressed and regression
+
+The regional allocator previously took its single recursive alias mutex before
+classifying *every* read/write AV, even a foreign address. A backing fault and
+`PrepareBackingPage` also waited for that mutex. Recursion only helps the same
+thread: if an alias-operation owner waits for work needing a native backing
+access on another thread, that access cannot finish and the owner cannot unlock.
+Merely changing the VEH to `try_lock` leaves the native fallback waiting on the
+same lock and does not break that dependency.
+
+The allocator now classifies addresses before locking. Alias faults try the
+metadata lock once and decline on contention, handing a known JIT access to
+Dynarmic's existing SEH/callback/recompile path. Native backing faults and native
+pointer preparation use a separate physical-backing mutex. Operations touching
+both use alias -> backing order; clear/reclamation retain serialization with
+materialization. Already-backed native preparation remains lock-free. A declined
+contended alias need not have backing yet: the redirected native callback
+prepares it before dereference. This is the explicit exception to the older
+permission-fault preparation guarantee above. No inaccessible instruction is
+reported resolved, and no alias is permanently disabled just for contention.
+
+The new compiled host regression holds the production alias lock on one thread
+until a native memory access on another completes. It executes production VEH,
+SEH redirection, pointer preparation and private recovery, for fresh/reclaimed
+regions, section/private backing and alias/native accesses (eight combinations).
+It requires one alias redirection, accessible native backing, preserved writes,
+normal alias materialization after contention, and no further section-map calls
+or successful alias retries through 32 private-backing accesses. The existing
+concurrent-fault harness now accepts a declined alias and performs native
+preparation, matching the production dispatch contract.
+
+Two negative controls independently restore (1) blocking alias acquisition and
+(2) shared-lock native preparation. Each fails at the owner's two-second
+watchdog; the fixed production paths complete. The test injects the owner's
+wait dependency; it does not run Windows VM dispatch or prove that this exact
+owner/wait cycle occurred on the console. The captures lack blocked-thread
+stacks, lock ownership and regional dispositions, so **the console hang's root
+cause remains unproven**. In particular this change does not claim all possible
+VEH recursion, logging/heap-lock interactions, or physical allocation failure
+are repaired. A matching console rerun is still required for first-frame
+acceptance.
+
+Validation on 2026-10-21: all 20 fastmem tests passed (including a focused run
+with the final contention assertions). `python3 -m unittest discover -s tests/port`
+ran 993 tests in 513.836 seconds: 947 passed, 44 skipped, and only the two known
+`fontTools` import errors (`test_button_layout`, `test_xbox_button_icons`). Both
+lock-order negative controls failed at the intended watchdog. Ruff check/format,
+modified-line project clang-format and `git diff --check` passed. No commits,
+Windows application build, or console rerun were made.
+
 ## Round 4: build 0.3.817 / fm5
 
 ### Complete capture analysis

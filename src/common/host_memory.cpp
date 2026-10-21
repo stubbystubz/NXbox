@@ -738,6 +738,7 @@ public:
     // regions retain their sections and aliases. Partial boundary chunks preserve bytes.
     void Clear(size_t offset, size_t length, u32 value) {
         std::scoped_lock lock{mutex};
+        std::scoped_lock backing_lock{backing_mutex};
         if (!virtual_base) {
             if (value == 0 && ((offset | length) & (PageAlignment - 1)) == 0 &&
                 VirtualFree(backing_base + offset, length, MEM_DECOMMIT))
@@ -781,7 +782,7 @@ public:
         const size_t index = offset / RegionSize;
         if (regions[index].backed.load(std::memory_order_acquire))
             return true;
-        std::scoped_lock lock{mutex};
+        std::scoped_lock lock{backing_mutex};
         if (EnsureRegion(index))
             return true;
         DisableFastmem("native_backing_unavailable", reinterpret_cast<size_t>(pointer));
@@ -985,9 +986,9 @@ private:
     bool Fault(size_t address, size_t access, size_t pc) {
         if (access != 0 && access != 1)
             return false;
-        std::scoped_lock lock{mutex};
         const size_t backing_offset = address - reinterpret_cast<size_t>(backing_base);
         if (backing_offset < backing_size) {
+            std::scoped_lock backing_lock{backing_mutex};
             const size_t index = backing_offset / RegionSize;
             // Another core may have satisfied the same fault while we waited for the lock.
             // The linear backing is always RW; only read/write faults within it are claimed.
@@ -1034,12 +1035,20 @@ private:
         const size_t offset = address - reinterpret_cast<size_t>(virtual_base);
         if (offset >= virtual_size)
             return false;
+        // Exception dispatch may interrupt a caller holding a GPU/monitor lock.
+        // Never wait for alias metadata here: the mapping owner may need that caller
+        // to finish a native memory access. Declining redirects JIT accesses once to
+        // Dynarmic's callback; backing preparation uses its independent lock below.
+        std::unique_lock lock{mutex, std::try_to_lock};
+        if (!lock.owns_lock())
+            return false;
         auto it = mappings.upper_bound(offset);
         if (it == mappings.begin())
             return false;
         auto& [start, mapping] = *--it;
         if (offset - start >= mapping.length)
             return false;
+        std::scoped_lock backing_lock{backing_mutex};
         // A protection fault is redirected to a native callback by Dynarmic. That
         // callback accesses linear backing, not this alias. Materialize it before
         // handing off, so the fallback does not immediately take a second AV.
@@ -1094,6 +1103,7 @@ private:
     }
 
     void DropRegion(size_t index) {
+        std::scoped_lock backing_lock{backing_mutex};
         auto& region = regions[index];
         // As with native loads/stores, reclamation requires quiescent users of this region.
         region.backed.store(false, std::memory_order_release);
@@ -1209,8 +1219,11 @@ private:
     PFN_VirtualProtect protect{};
     std::vector<Region> regions;
     std::map<size_t, Mapping> mappings;
-    // Clear may fault on the private fallback backing while holding this lock.
+    // Lock order: alias metadata, then physical backing. Native backing faults and
+    // preparation never acquire the alias lock. No GPU callbacks run under either.
+    // Recursive acquisition supports Protect -> Map and Clear -> DropRegion.
     std::recursive_mutex mutex;
+    std::recursive_mutex backing_mutex;
     bool probe_mapped{};
     bool probing_faults{true};
     bool private_backing_only{};

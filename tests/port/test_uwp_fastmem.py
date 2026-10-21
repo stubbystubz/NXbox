@@ -376,10 +376,10 @@ int main() {
         # Instrument the production mutex without changing its locking semantics.
         native_test = "#include <atomic>\nstd::atomic<int> lock_calls{};\n" + native_test
         native_test = native_test.replace(
-            "std::recursive_mutex mutex;",
+            "std::recursive_mutex backing_mutex;",
             "struct CountingMutex { std::recursive_mutex inner; "
             "void lock() { ++lock_calls; inner.lock(); } "
-            "void unlock() { inner.unlock(); } } mutex;",
+            "void unlock() { inner.unlock(); } } backing_mutex;",
         )
         native_test += r"""
 int main() {
@@ -824,6 +824,115 @@ int main() {
             .replace("DESTRUCTOR", destructor)
             .replace("SUPPORTS", supports)
         )
+        self.compile_and_run(native_test)
+
+    def test_fault_and_native_fallback_finish_while_alias_owner_waits(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        # Execute a caller wait with the real alias lock held, without depending on
+        # Windows VM calls to block at a particular instant.
+        native_test = native_test.replace(
+            "    std::recursive_mutex mutex;",
+            "    std::recursive_mutex mutex;\n"
+            "public:\n"
+            "    void WithAliasLock(const std::function<void()>& wait) {\n"
+            "        std::scoped_lock lock{mutex}; wait();\n"
+            "    }\nprivate:",
+        )
+        native_test += r"""
+#include <chrono>
+#include <condition_variable>
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    for (bool private_recovery : {false, true}) {
+        for (bool reclaimed : {false, true}) {
+            for (bool alias_access : {false, true}) {
+                {
+                    Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+                    assert(memory.Init());
+                    auto* backing = memory.backing_base + 65536;
+                    auto* alias = memory.virtual_base + 65536;
+                    memory.Map(65536, 65536, 65536, Common::MemoryPermission::ReadWrite);
+                    if (reclaimed) {
+                        assert(memory.PrepareBackingPage(backing));
+                        memory.Clear(65536, 65536, 0);
+                    }
+                    if (private_recovery) {
+                        Mock::fail_name = "map";
+                        Mock::fail_at = Mock::calls["map"] + 1;
+                    }
+                    std::mutex gate;
+                    std::condition_variable changed;
+                    bool owner_ready{}, access_done{};
+                    std::thread owner([&] {
+                        memory.WithAliasLock([&] {
+                            std::unique_lock lock{gate};
+                            owner_ready = true;
+                            changed.notify_one();
+                            // The old VEH/native preparation lock order waits for this
+                            // owner, which cannot release its lock until the access ends.
+                            assert(changed.wait_for(lock, std::chrono::seconds(2),
+                                                    [&] { return access_done; }));
+                        });
+                    });
+                    {
+                        std::unique_lock lock{gate};
+                        changed.wait(lock, [&] { return owner_ready; });
+                    }
+                    u8 foreign{};
+                    assert(!Fault(&foreign)); // Unrelated AVs must not wait for metadata.
+                    assert(!Fault(alias, 8)); // Execute faults cannot be repaired as RW data.
+                    if (alias_access) {
+                        assert(!Fault(alias)); // Must decline promptly, never retry.
+                        assert(!Mock::Accessible(alias, true));
+                        u64 stack[4]{};
+                        CONTEXT context{0x1234, reinterpret_cast<u64>(stack + 4)};
+                        EXCEPTION_RECORD record{EXCEPTION_ACCESS_VIOLATION, 2,
+                                                {1, reinterpret_cast<size_t>(alias)}};
+                        int redirects{};
+                        std::function<FakeCall(u64)> cb = [&](u64 pc) {
+                            assert(pc == 0x1234);
+                            ++redirects;
+                            return FakeCall{0x5678, 0x1238};
+                        };
+                        assert(DispatchFastmem(cb, &context, &record) == ExceptionContinueExecution);
+                        assert(redirects == 1 && context.Rip == 0x5678 && stack[3] == 0x1238);
+                        // Execute the redirected native callback, while the owner
+                        // still holds the alias lock. No second AV is required.
+                        assert(memory.PrepareBackingPage(backing));
+                    } else {
+                        // DMA/native accesses have no Dynarmic fallback. The backing
+                        // VEH must resolve them even with the alias lock unavailable.
+                        assert(Fault(backing));
+                    }
+                    assert(Mock::Accessible(backing, true));
+                    *backing = 0xA5;
+                    assert(memory.fastmem_enabled.load() == !private_recovery);
+                    {
+                        std::lock_guard lock{gate};
+                        access_done = true;
+                    }
+                    changed.notify_one();
+                    owner.join();
+                    if (private_recovery) {
+                        const auto maps = Mock::calls["map"];
+                        for (int i = 0; i < 32; ++i) {
+                            assert(!Fault(alias));
+                            assert(memory.PrepareBackingPage(backing));
+                            assert(*backing == 0xA5);
+                        }
+                        assert(Mock::calls["map"] == maps); // No private alias retry loop.
+                    } else {
+                        assert(Fault(alias)); // Contention did not poison the mapping.
+                        assert(Mock::Accessible(alias, true));
+                    }
+                }
+                Mock::Reset();
+            }
+        }
+    }
+}
+"""
         self.compile_and_run(native_test)
 
     def test_seh_wrapper_preserves_return_address_with_windows_home_space(self):
