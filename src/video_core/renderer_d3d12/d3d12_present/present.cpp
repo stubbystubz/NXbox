@@ -8,15 +8,17 @@
 #include <string>
 #include "common/fps_overlay.h"
 #include "common/logging.h"
+#include "common/maxwell_method_profile.h"
 #include "d3d12_present_shader_source.h"
 #include "video_core/renderer_d3d12/d3d12_present/fps_bitmap.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
+#include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
 namespace D3D12::Present {
 namespace {
 constexpr unsigned MaxPasses = 256; // Up to four passes for each of the renderer's 64 layers.
-constexpr unsigned FrameSlots = 2;
+constexpr unsigned FrameSlots = MaxFrameSlots;
 constexpr unsigned PassCount = 9;
 constexpr unsigned FxaaPass = 6, EasuPass = 7;
 constexpr DXGI_FORMAT IntermediateFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -289,7 +291,10 @@ void Presenter::DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target
         // Rotation is applied only in the final composition; upscale in source axes.
         const Extent fsr_extent =
             (layer.transform & 4) ? Extent{output.height, output.width} : output;
-        source = impl->Preprocess(EasuPass, 1, source, view, fsr_extent, constants);
+        source =
+            Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentEasu, [&] {
+                return impl->Preprocess(EasuPass, 1, source, view, fsr_extent, constants);
+            });
         view = View(fsr_extent);
         constants.crop = {};
         constants.source_width = float(fsr_extent.width);
@@ -301,8 +306,13 @@ void Presenter::DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target
     constants.transform = layer.transform;
     constants.opaque = layer.blend == Blend::Opaque;
     const unsigned final_pass = options.filter == Filter::Fsr && !upscale ? 0 : pass;
-    impl->Draw(source, view, target, viewport, scissor, constants,
-               impl->final[final_pass][blend].Get());
+    Common::MaxwellMethodProfile::Measure(upscale ? Common::MaxwellMethodProfile::PresentRcas
+                                                  : Common::MaxwellMethodProfile::PresentDraw,
+                                          [&] {
+                                              impl->Draw(source, view, target, viewport, scissor,
+                                                         constants,
+                                                         impl->final[final_pass][blend].Get());
+                                          });
 }
 HRESULT Presenter::Present(IDXGISwapChain3* swapchain, bool vsync, unsigned interval) {
     if (!swapchain)

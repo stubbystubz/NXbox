@@ -207,7 +207,7 @@ int main() {
         with tempfile.TemporaryDirectory(prefix="nxbox-pressure-reuse-") as folder:
             cpp = Path(folder) / "pressure.cpp"
             binary = Path(folder) / "pressure"
-            cpp.write_text(driver)
+            cpp.write_text('#include "common/maxwell_method_profile.h"\n' + driver)
             subprocess.run(
                 [
                     "clang++",

@@ -388,7 +388,7 @@ class T7BuffersTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="nxbox-t7-") as folder:
             source = Path(folder) / "buffers.cpp"
             binary = Path(folder) / "buffers"
-            source.write_text(source_text)
+            source.write_text('#include "common/maxwell_method_profile.h"\n' + source_text)
             result = subprocess.run(
                 [
                     "clang++",

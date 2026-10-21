@@ -17,8 +17,10 @@ shader model 6.0. EASU writes one float RGBA intermediate per swapchain slot;
 RCAS sharpens directly into the final blended swapchain layer. This removes the
 previous standalone RCAS intermediate and final bilinear copy. Crop is applied
 once by EASU, and final transformed UVs preserve rotation, flips and viewport
-origins. The two swapchain slots own separate scratch images and descriptor
-ranges, retired by their presentation fence rather than draining every frame.
+origins. Each swapchain slot owns separate scratch images and descriptor
+ranges, retired by its presentation fence rather than draining every frame.
+The default remains two buffers; the opt-in `NXBOX_D3D12_PRESENT_FAST=1` uses
+three coordinated slots. See [the presentation cost audit](PRESENT-COST.md).
 BGRA screenshots retain the existing capture compositor.
 
 ## Baseline evidence

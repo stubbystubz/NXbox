@@ -4,6 +4,7 @@
 
 #include <array>
 #include <cstdlib>
+#include <optional>
 #include <type_traits>
 #include <utility>
 #include "common/gpu_thread_profile.h"
@@ -32,6 +33,22 @@ enum Class : unsigned {
     AccelerateConditional,
     FallbackCondition,
     GuestSyncpointAction,
+    CompositeRest,
+    PresentLookup,
+    PresentPrepare,
+    PresentDownload,
+    PresentUpload,
+    PresentDraw,
+    PresentEasu,
+    PresentRcas,
+    PresentCapture,
+    PresentCopy,
+    PresentSwapchain,
+    PresentSubmit,
+    PresentWait,
+    PresentFinish,
+    PresentFrameEnd,
+    PresentMap,
     ClassCount
 };
 inline constexpr std::array Names{"cb_data",
@@ -55,7 +72,23 @@ inline constexpr std::array Names{"cb_data",
                                   "fence_lock",
                                   "accelerate_conditional",
                                   "fallback_condition",
-                                  "guest_syncpoint_action"};
+                                  "guest_syncpoint_action",
+                                  "composite_rest",
+                                  "present_lookup",
+                                  "present_prepare",
+                                  "present_download",
+                                  "present_upload",
+                                  "present_draw",
+                                  "present_easu",
+                                  "present_rcas",
+                                  "present_capture",
+                                  "present_copy",
+                                  "present_swapchain",
+                                  "present_submit",
+                                  "present_wait",
+                                  "present_finish",
+                                  "present_frame_end",
+                                  "present_map"};
 static_assert(Names.size() == ClassCount);
 inline constexpr unsigned RegisterCount = 0xE00;
 inline bool Enabled() {
@@ -99,6 +132,24 @@ struct Collector::Scope {
         owner.active = parent;
     }
 };
+// Optional named scope: the disabled path reads only the recording-thread TLS pointer.
+struct NamedScope {
+    std::optional<Collector::Scope> scope;
+    explicit NamedScope(Class key, bool enabled = true) {
+        if (auto* owner = collector; owner && enabled) [[unlikely]]
+            scope.emplace(*owner, key, 1);
+    }
+};
+inline bool InPresentation() {
+    if (auto* owner = collector) [[unlikely]] {
+        for (auto* scope = owner->active; scope; scope = scope->parent) {
+            if (scope->key == CompositeRest || scope->key == PresentLookup ||
+                scope->key == PresentDraw || scope->key == PresentCapture)
+                return true;
+        }
+    }
+    return false;
+}
 // Classify and construct the scope only in the enabled instantiation. The normal
 // instantiation has no scope cleanup, clock, classification, or per-word gate.
 template <typename Key, typename Function>

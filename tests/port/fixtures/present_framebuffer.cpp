@@ -5,6 +5,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include "common/maxwell_method_profile.h"
+#include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 using u32 = unsigned;
 using u64 = std::uint64_t;
 using DXGI_FORMAT = unsigned;
@@ -143,7 +145,22 @@ struct RasterizerD3D12 {
     DisplayTexture FramebufferTexture(const Tegra::FramebufferConfig&);
 };
 // PRODUCTION_METHOD
+struct Clock : Common::MaxwellMethodProfile::Collector {
+    Common::GpuProfile::Tick now{};
+    Common::GpuProfile::Tick ReadTicks() override {
+        return now++;
+    }
+};
 int main() {
+    namespace MP = Common::MaxwellMethodProfile;
+    Clock clock;
+    assert(!MP::InPresentation());
+    MP::collector = &clock;
+
+    assert(D3D12::Present::FastEnabled() == bool(EXPECT_FAST));
+    assert(D3D12::Present::FrameSlotCount() == (EXPECT_FAST ? 3u : 2u));
+    setenv("NXBOX_D3D12_PRESENT_FAST", EXPECT_FAST ? "0" : "1", 1);
+    assert(D3D12::Present::FastEnabled() == bool(EXPECT_FAST));
     constexpr unsigned downloads_per_fallback = EXPECT_FALLBACK_DOWNLOAD;
     constexpr unsigned expected_pixel = EXPECT_FALLBACK_DOWNLOAD ? 76 : 0;
     RasterizerD3D12 rasterizer;
@@ -164,4 +181,14 @@ int main() {
     rasterizer.device_memory.pixel = 0;
     assert(rasterizer.FramebufferTexture(config).resource->pixel == expected_pixel);
     assert(rasterizer.texture_cache.downloads == 2 * downloads_per_fallback);
+    assert(clock.samples[MP::PresentLookup].count == 3);
+    assert(clock.samples[MP::PresentPrepare].count == 1);
+    assert(clock.samples[MP::PresentDownload].count == 2 * downloads_per_fallback);
+    assert(clock.samples[MP::PresentUpload].count == 2);
+    assert(clock.samples[MP::PresentLookup].ticks > 0);
+    assert(!MP::InPresentation() && !clock.active);
+    MP::collector = nullptr;
+    const auto samples = clock.samples;
+    rasterizer.FramebufferTexture(config);
+    assert(clock.samples[MP::PresentLookup].count == samples[MP::PresentLookup].count);
 }

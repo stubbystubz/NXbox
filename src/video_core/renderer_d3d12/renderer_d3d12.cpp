@@ -12,12 +12,14 @@
 #include <windows.h>
 #include "common/fps_overlay.h"
 #include "common/logging.h"
+#include "common/maxwell_method_profile.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "eden_uwp/renderer_boundary.h"
 #include "eden_uwp/thread_profile.h"
 #include "video_core/capture.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
+#include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 #include "video_core/renderer_d3d12/d3d12_resolution.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
@@ -53,7 +55,9 @@ struct PresentParameters {
 static_assert(sizeof(PresentParameters) == 32);
 } // namespace
 struct RendererD3D12::Impl {
-    static constexpr UINT BufferCount = 2;
+    // Reserve descriptor/backbuffer storage for either policy; capture uses the next slice.
+    static constexpr UINT BufferCount = Present::MaxFrameSlots;
+    const UINT active_buffers = Present::FrameSlotCount();
     static constexpr UINT MaxLayers = 64;
     D3D12::Context context;
     ComPtr<IDXGISwapChain3> swapchain;
@@ -89,7 +93,7 @@ struct RendererD3D12::Impl {
         return handle;
     }
     void AcquireBuffers() {
-        for (UINT i = 0; i < BufferCount; ++i) {
+        for (UINT i = 0; i < active_buffers; ++i) {
             buffers[i] = std::make_shared<Resource>();
             buffers[i]->heap = D3D12_HEAP_TYPE_DEFAULT;
             buffers[i]->state = D3D12_RESOURCE_STATE_PRESENT;
@@ -195,7 +199,7 @@ struct RendererD3D12::Impl {
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
         desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        desc.BufferCount = BufferCount;
+        desc.BufferCount = active_buffers;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
@@ -227,7 +231,9 @@ struct RendererD3D12::Impl {
         Check(context.Device()->CreateDescriptorHeap(&heap, IID_PPV_ARGS(&srv_heap)),
               "Create SRV heap", context.Device());
         srv_stride = context.Device()->GetDescriptorHandleIncrementSize(heap.Type);
-        Diagnostic("D3D12 swapchain and descriptor heaps created");
+        Diagnostic("D3D12 swapchain and descriptor heaps created; NXBOX_D3D12_PRESENT_FAST=" +
+                   std::to_string(Present::FastEnabled()) +
+                   " buffers=" + std::to_string(active_buffers));
         AcquireBuffers();
         InitializePipeline();
         context.LogInfoQueue();
@@ -239,6 +245,8 @@ struct RendererD3D12::Impl {
               std::span<const Tegra::FramebufferConfig> layers, RasterizerD3D12& rasterizer,
               const ResourcePtr& render_target, D3D12_CPU_DESCRIPTOR_HANDLE target, UINT index,
               const std::array<ComPtr<ID3D12PipelineState>, 3>& target_pipelines) {
+        const Common::MaxwellMethodProfile::NamedScope draw_profile{
+            Common::MaxwellMethodProfile::PresentDraw};
         if (layers.size() > MaxLayers)
             throw std::runtime_error("D3D12 presentation layer limit exceeded");
         // Cache uploads/downloads may submit work. Resolve every source before binding
@@ -366,6 +374,8 @@ struct RendererD3D12::Impl {
     void Capture(const Layout::FramebufferLayout& layout,
                  std::span<const Tegra::FramebufferConfig> layers, RasterizerD3D12& rasterizer,
                  void* bits) {
+        const Common::MaxwellMethodProfile::NamedScope capture_profile{
+            Common::MaxwellMethodProfile::PresentCapture};
         D3D12_RESOURCE_DESC desc{};
         desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         desc.Width = layout.width;
@@ -397,6 +407,8 @@ struct RendererD3D12::Impl {
         context.BeforeCopyWrite(readback, footprint.Offset, total_bytes);
         context.Commands()->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
         context.Finish(FrameCount::ForcedSubmitPresent);
+        const Common::MaxwellMethodProfile::NamedScope copy_profile{
+            Common::MaxwellMethodProfile::PresentCopy};
         const size_t row_bytes = static_cast<size_t>(layout.width) * 4;
         for (u32 row = 0; row < layout.height; ++row) {
             std::memcpy(static_cast<u8*>(bits) + row * row_bytes,
@@ -416,7 +428,7 @@ struct RendererD3D12::Impl {
             present_ticks.fill(0);
             for (auto& buffer : buffers)
                 buffer.reset();
-            Check(swapchain->ResizeBuffers(BufferCount, new_width, new_height,
+            Check(swapchain->ResizeBuffers(active_buffers, new_width, new_height,
                                            DXGI_FORMAT_R8G8B8A8_UNORM, 0),
                   "ResizeBuffers", context.Device());
             width = new_width;
@@ -436,7 +448,11 @@ struct RendererD3D12::Impl {
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
         context.SimulateSeriesSFrame();
         context.GpuPassFrame();
-        present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
+        {
+            const Common::MaxwellMethodProfile::NamedScope submit_profile{
+                Common::MaxwellMethodProfile::PresentSubmit};
+            present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
+        }
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
         const bool log_present = ++present_sequence <= 8 || present_sequence % 120 == 0;
@@ -446,7 +462,9 @@ struct RendererD3D12::Impl {
         {
             const EdenXbox::ThreadProfile::Scope present_scope{
                 EdenXbox::ThreadProfile::Wait::Present};
-            status = swapchain->Present(1, 0);
+            status = Common::MaxwellMethodProfile::Measure(
+                Common::MaxwellMethodProfile::PresentSwapchain,
+                [&] { return swapchain->Present(1, 0); });
         }
         context.LogInfoQueue();
         Check(status, "Present", context.Device());
@@ -490,13 +508,16 @@ bool RendererD3D12::HasFailed() const {
 void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> layers) {
     if (rasterizer.OnGpuPipeline())
         return rasterizer.RunGpuPipeline([&] { Composite(layers); });
+    const Common::MaxwellMethodProfile::NamedScope composite_profile{
+        Common::MaxwellMethodProfile::CompositeRest};
     impl->context.Profile().EndFrame();
     try {
         if (IsScreenshotPending()) {
             std::vector<Tegra::FramebufferConfig> screenshot_layers;
             const auto selected = Tegra::FilterLayerStack(
                 layers, renderer_settings.screenshot_layer_stack, screenshot_layers);
-            rasterizer.PreparePresentation();
+            Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentPrepare,
+                                                  [&] { rasterizer.PreparePresentation(); });
             impl->Capture(renderer_settings.screenshot_framebuffer_layout, selected, rasterizer,
                           renderer_settings.screenshot_bits);
             renderer_settings.screenshot_requested = false;
@@ -507,7 +528,8 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> layers) 
                 std::vector<Tegra::FramebufferConfig> display_layers;
                 const auto selected = Tegra::FilterLayerStack(
                     layers, Service::Nvnflinger::LayerStackId::Default, display_layers);
-                rasterizer.PreparePresentation();
+                Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentPrepare,
+                                                      [&] { rasterizer.PreparePresentation(); });
                 impl->Present(render_window.GetFramebufferLayout(), selected, rasterizer);
                 ++m_current_frame;
                 render_window.OnFrameDisplayed();
@@ -523,6 +545,8 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> layers) 
         ReportFailure(error);
     }
     try {
+        const Common::MaxwellMethodProfile::NamedScope end_profile{
+            Common::MaxwellMethodProfile::PresentFrameEnd};
         gpu.RendererFrameEndNotify();
         // Advance the caches' frame clock like the Vulkan backend: texture garbage
         // collection, buffer downloads, fence and descriptor-cache aging all key off it.
