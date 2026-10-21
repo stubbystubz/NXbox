@@ -31,7 +31,8 @@ enum class Phase {
     SyncWait,
     BufferCacheBind,
     TextureCacheUpdate,
-    DescriptorAndPipeline
+    DescriptorAndPipeline,
+    QueueIdle
 };
 struct Sink {
     virtual ~Sink() = default;
@@ -65,7 +66,7 @@ private:
 };
 class PhaseScope {
 public:
-    explicit PhaseScope(Phase phase) : owner{sink} {
+    explicit PhaseScope(Phase phase, bool active = true) : owner{active ? sink : nullptr} {
         if (owner)
             previous = owner->Enter(phase);
     }
@@ -202,7 +203,8 @@ inline void Record(Wait reason, Tick start) {
 class WaitScope {
 public:
     explicit WaitScope(Wait reason_, bool waiting = true)
-        : reason{reason_}, start{waiting && enabled.load(std::memory_order_relaxed) ? Now() : 0} {}
+        : phase{reason_ == Wait::GpuQueueIdle ? Phase::QueueIdle : Phase::SyncWait, waiting},
+          reason{reason_}, start{waiting && enabled.load(std::memory_order_relaxed) ? Now() : 0} {}
     ~WaitScope() {
         Record(reason, start);
     }
@@ -210,7 +212,9 @@ public:
     WaitScope& operator=(const WaitScope&) = delete;
 
 private:
-    PhaseScope phase{Phase::SyncWait};
+    // An empty producer queue is idle time, not a renderer synchronization stall.
+    // Non-waiting operations must preserve their caller's phase as well as counters.
+    PhaseScope phase;
     Wait reason;
     Tick start;
 };

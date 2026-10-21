@@ -58,6 +58,37 @@ int main() {
     assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::DmaPusher)] == 20);
     assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::Maxwell3DMethods)] == 20);
     assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::MacroExecution)] == 10);
+    // Queue sleeps stay exclusive, but never enter the renderer-stall bucket.
+    owner.timing = {};
+    owner.now = 0;
+    {
+        PhaseScope parser{Phase::DmaPusher};
+        owner.now = 10;
+        {
+            WaitScope idle{Wait::GpuQueueIdle};
+            assert(owner.timing.active == D3D12::FramePhase::QueueIdle);
+            owner.now = 40;
+            {
+                WaitScope async_tick{Wait::TickGPU, false};
+                assert(owner.timing.active == D3D12::FramePhase::QueueIdle);
+            }
+            owner.now = 90;
+        }
+        assert(owner.timing.active == D3D12::FramePhase::DmaPusher);
+        owner.now = 100;
+        try {
+            WaitScope acquire{Wait::PullerAcquire};
+            assert(owner.timing.active == D3D12::FramePhase::SyncWait);
+            owner.now = 120;
+            throw 1;
+        } catch (int) {
+        }
+        assert(owner.timing.active == D3D12::FramePhase::DmaPusher);
+        owner.now = 130;
+    }
+    assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::DmaPusher)] == 30);
+    assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::QueueIdle)] == 80);
+    assert(owner.timing.cpu[static_cast<std::size_t>(D3D12::FramePhase::SyncWait)] == 20);
     std::thread other([] { assert(sink == nullptr); PhaseScope ignored{Phase::DmaPusher}; });
     other.join();
     // Method counts are exact, units retain bulk words, only 1/64 calls is timed.
@@ -84,6 +115,10 @@ int main() {
     { MethodScope disabled{MethodClass::DirtyFlags}; }
     assert(TakeMethodWindow()[0].count == 0);
     enabled = true;
+    { WaitScope idle{Wait::GpuQueueIdle}; }
+    const auto idle_window = TakeWindow();
+    assert(idle_window.waits[static_cast<std::size_t>(Wait::GpuQueueIdle)].count == 1);
+    assert(idle_window.waits[static_cast<std::size_t>(Wait::TickGPU)].count == 0);
     { WaitScope async_tick{Wait::TickGPU, false}; }
     assert(TakeWindow().waits[static_cast<std::size_t>(Wait::TickGPU)].count == 0);
     std::vector<std::thread> workers;
@@ -166,8 +201,11 @@ class GpuThreadProfileTests(unittest.TestCase):
             "buffer_cache_bind",
             "texture_cache_update",
             "descriptor_and_pipeline",
+            "queue_idle",
         ]:
             self.assertIn(f'"{name}"', source)
+        self.assertIn("gpu_queue_idle_wall_ms=", source)
+        self.assertIn("if (i == static_cast<size_t>(FramePhase::QueueIdle))", source)
         for field in [
             "D3D12_GUEST_WAITS",
             "_count=",

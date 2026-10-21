@@ -75,6 +75,7 @@ enum class FramePhase : size_t {
     BufferCacheBind,
     TextureCacheUpdate,
     DescriptorAndPipeline,
+    QueueIdle,
     TextureUploadDiagnostic,
     TextureRepack,
     BetweenDraws,
@@ -201,7 +202,7 @@ enum class FrameCount : size_t {
     CpuReinterpretBytes,
     Count
 };
-// Monotonic CPU samples, independent of the host clock API, for exclusive phases.
+// Monotonic wall samples, independent of the host clock API, for exclusive phases.
 struct FrameTiming {
     std::array<std::uint64_t, static_cast<size_t>(FramePhase::Count)> cpu{};
     // Residual recording-thread work (guest commands and housekeeping) outside
@@ -432,8 +433,8 @@ struct StagingBufferRef {
     size_t offset{};
     std::span<u8> mapped_span;
 };
-// CPU intervals are exclusive (nested scopes suspend the parent phase). Wait wall
-// time is separate: sleeping in a fence must not look like GPU-thread CPU work.
+// Phase intervals are exclusive wall estimates (nested scopes suspend the parent).
+// Queue idle and fence waits are reported separately from the CPU-work estimates.
 class FrameProfile : public Common::GpuProfile::Sink {
 public:
     class Scope {

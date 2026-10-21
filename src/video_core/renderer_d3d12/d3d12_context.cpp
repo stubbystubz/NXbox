@@ -481,7 +481,8 @@ std::size_t FrameProfile::Enter(Common::GpuProfile::Phase phase) {
                                 FramePhase::SyncWait,
                                 FramePhase::BufferCacheBind,
                                 FramePhase::TextureCacheUpdate,
-                                FramePhase::DescriptorAndPipeline};
+                                FramePhase::DescriptorAndPipeline,
+                                FramePhase::QueueIdle};
     const auto target = phases[static_cast<std::size_t>(phase)];
     const auto previous = timing.active;
     // Nested method/bulk dispatch often enters the already active phase. Preserve
@@ -637,6 +638,7 @@ void FrameProfile::EndFrame(bool presented) {
                                    "buffer_cache_bind",
                                    "texture_cache_update",
                                    "descriptor_and_pipeline",
+                                   "queue_idle",
                                    "texture_upload_diagnostic",
                                    "texture_repack",
                                    "between_draws",
@@ -773,9 +775,16 @@ void FrameProfile::EndFrame(bool presented) {
             std::exchange(recorder_waits, 0),
             static_cast<double>(std::exchange(recorder_wait_ns, 0)) /
                 (1000000.0 * std::max<u64>(frames, 1)));
-        for (size_t i = 0; i < timing.cpu.size(); ++i)
+        // Queue waits use the same exclusive clock, but must not rank as CPU work.
+        line += fmt::format(
+            " gpu_queue_idle_wall_ms={:.3f}",
+            static_cast<double>(timing.cpu[static_cast<size_t>(FramePhase::QueueIdle)]) / 10000.0);
+        for (size_t i = 0; i < timing.cpu.size(); ++i) {
+            if (i == static_cast<size_t>(FramePhase::QueueIdle))
+                continue;
             line += fmt::format(" {}_cpu_ms={:.3f}", names[i],
                                 static_cast<double>(timing.cpu[i]) / 10000.0);
+        }
         for (size_t i = 0; i < counts.size(); ++i)
             line += fmt::format(
                 " {}={} {}_per_frame={:.2f}", counters[i], counts[i], counters[i],
