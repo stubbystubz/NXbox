@@ -6,6 +6,7 @@
 
 #include "common/gpu_thread_profile.h"
 #include "common/nxbox_wait_diag.h"
+#include "common/maxwell_method_profile.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
 namespace Tegra {
@@ -79,7 +80,9 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
         wait_guest_cv.notify_all();
     }
     for (auto& entry : ready) {
-        entry.action();
+        // Presentation runs here on the GPU thread; time it apart from the sync method.
+        Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::GuestSyncpointAction,
+                                              [&] { entry.action(); });
     }
 }
 

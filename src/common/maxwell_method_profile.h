@@ -31,6 +31,7 @@ enum Class : unsigned {
     FenceLock,
     AccelerateConditional,
     FallbackCondition,
+    GuestSyncpointAction,
     ClassCount
 };
 inline constexpr std::array Names{"cb_data",
@@ -53,7 +54,8 @@ inline constexpr std::array Names{"cb_data",
                                   "invalidate_gpu_cache",
                                   "fence_lock",
                                   "accelerate_conditional",
-                                  "fallback_condition"};
+                                  "fallback_condition",
+                                  "guest_syncpoint_action"};
 static_assert(Names.size() == ClassCount);
 inline constexpr unsigned RegisterCount = 0xE00;
 inline bool Enabled() {
