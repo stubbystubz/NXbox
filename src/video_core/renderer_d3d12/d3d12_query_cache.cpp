@@ -27,6 +27,13 @@
 
 namespace D3D12 {
 using VideoCommon::QueryType;
+bool RasterizerStateFastpathEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_RASTERIZER_STATE_FASTPATH");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
 namespace {
 constexpr u32 BankSize = 256;
 constexpr u32 BatchCapacity = 1024;
@@ -950,7 +957,12 @@ void QueryCacheRuntime::PauseHostConditionalRendering() {
     static const bool no_queries = BisectEnabled("NXBOX_D3D12_NO_QUERIES");
     if (no_queries)
         return;
-    // Predication is always recorded and does not alter any cached draw state.
+    // Only this runtime binds non-null predication. External helpers can clear it,
+    // and a fresh command list starts with none. With no logical predicate,
+    // emitting another null binding cannot change the command-list state. Do not
+    // cache an active predicate: helper clears and list resets must still rebind it.
+    if (RasterizerStateFastpathEnabled() && !impl->predicate_set)
+        return;
     impl->context.Commands()->SetPredication(nullptr, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
 }
 void QueryCacheRuntime::EndHostConditionalRendering() {
