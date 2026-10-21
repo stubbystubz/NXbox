@@ -383,6 +383,8 @@ enum class Text {
     ShaderPreloadHint,
     AsyncShadersTitle,
     AsyncShadersHint,
+    MaxPlayersTitle,
+    MaxPlayersHint,
     ButtonLayoutTitle,
     ButtonLayoutName,
     ButtonLayoutPosition,

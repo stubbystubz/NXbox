@@ -17,6 +17,7 @@
 #include "eden_uwp/applet_boot.h"
 #include "eden_uwp/button_layout.h"
 #include "eden_uwp/diagnostic.h"
+#include "eden_uwp/gamepad_devices.h"
 #include "eden_uwp/home_combo.h"
 #include "eden_uwp/input_script.h"
 #include "eden_uwp/pad_style.h"
@@ -61,15 +62,18 @@ inline void UnregisterUnsupportedEngines() {
 class XboxGamepad final : public InputCommon::InputEngine {
 public:
     XboxGamepad() : InputEngine("nxbox") {
-        PreSetController(pad);
-        PreSetMotion(pad, 0);
-        BasicMotion level{};
-        level.accel_z = -1.0f;
-        SetMotion(pad, 0, level);
-        for (int i = 0; i < Settings::NativeButton::NumButtons; ++i)
-            PreSetButton(pad, i);
-        for (int i = 0; i < 4; ++i)
-            PreSetAxis(pad, i);
+        for (std::size_t slot = 0; slot < 4; ++slot) {
+            const PadIdentifier pad{.port = slot};
+            PreSetController(pad);
+            PreSetMotion(pad, 0);
+            BasicMotion level{};
+            level.accel_z = -1.0f;
+            SetMotion(pad, 0, level);
+            for (int i = 0; i < Settings::NativeButton::NumButtons; ++i)
+                PreSetButton(pad, i);
+            for (int i = 0; i < 4; ++i)
+                PreSetAxis(pad, i);
+        }
     }
 
     static void Configure(const std::shared_ptr<XboxGamepad>& engine) {
@@ -77,26 +81,34 @@ public:
                                             std::make_shared<InputCommon::InputFactory>(engine));
         Common::Input::RegisterOutputFactory("nxbox",
                                              std::make_shared<InputCommon::OutputFactory>(engine));
-        auto& player = Settings::values.players.GetValue()[0];
-        player.connected = true;
-        player.controller_type = Settings::ControllerType::ProController;
-        for (int i = 0; i < Settings::NativeButton::NumButtons; ++i) {
-            Common::ParamPackage parameters{{"engine", "nxbox"}, {"port", "0"}, {"pad", "0"}};
-            parameters.Set("button", i);
-            player.buttons[i] = parameters.Serialize();
-        }
-        // Both slots share the virtual sensor, including styles selected by AutoStyle.
-        // Keep HID's standard gyro deadband so its automatic bias estimate cannot drift at rest.
-        Common::ParamPackage motion{
-            {"engine", "nxbox"}, {"port", "0"}, {"pad", "0"}, {"motion", "0"}, {"threshold", "1"}};
-        for (auto& mapping : player.motions)
-            mapping = motion.Serialize();
-        for (int i = 0; i < 2; ++i) {
-            Common::ParamPackage parameters{{"engine", "nxbox"}, {"port", "0"}, {"pad", "0"}};
-            parameters.Set("axis_x", i * 2);
-            parameters.Set("axis_y", i * 2 + 1);
-            parameters.Set("deadzone", 0.15f);
-            player.analogs[i] = parameters.Serialize();
+        for (std::size_t slot = 0; slot < 4; ++slot) {
+            auto& player = Settings::values.players.GetValue()[slot];
+            player.connected = slot == 0;
+            player.controller_type = Settings::ControllerType::ProController;
+            for (int i = 0; i < Settings::NativeButton::NumButtons; ++i) {
+                Common::ParamPackage parameters{
+                    {"engine", "nxbox"}, {"port", std::to_string(slot)}, {"pad", "0"}};
+                parameters.Set("button", i);
+                player.buttons[i] = parameters.Serialize();
+            }
+            // Both motion mappings use this player's sensor, including styles selected by
+            // AutoStyle. Keep HID's standard gyro deadband so its automatic bias estimate cannot
+            // drift at rest.
+            Common::ParamPackage motion{{"engine", "nxbox"},
+                                        {"port", std::to_string(slot)},
+                                        {"pad", "0"},
+                                        {"motion", "0"},
+                                        {"threshold", "1"}};
+            for (auto& mapping : player.motions)
+                mapping = motion.Serialize();
+            for (int i = 0; i < 2; ++i) {
+                Common::ParamPackage parameters{
+                    {"engine", "nxbox"}, {"port", std::to_string(slot)}, {"pad", "0"}};
+                parameters.Set("axis_x", i * 2);
+                parameters.Set("axis_y", i * 2 + 1);
+                parameters.Set("deadzone", 0.15f);
+                player.analogs[i] = parameters.Serialize();
+            }
         }
     }
 
@@ -104,29 +116,62 @@ public:
         button_layout = layout;
     }
 
-    void Poll(Core::HID::EmulatedController& controller, Core::HID::NpadStyleTag supported = {},
-              bool suppress_guest = false) {
-        using namespace winrt::Windows::Gaming::Input;
-        const auto devices = Gamepad::Gamepads();
-        GamepadReading reading{};
-        // Remote keys describe physical Xbox buttons; scripts describe guest Switch buttons.
-        const auto physical_keys = key_state.load(std::memory_order_acquire);
-        const auto scripted_keys = ScriptedKeys();
-        const auto keys = physical_keys | scripted_keys;
-        if (devices.Size() != 0) {
-            reading = devices.GetAt(0).GetCurrentReading();
+    void SetMaxPlayers(int value) {
+        max_players = ClampMaxPlayers(value);
+    }
+
+    void Poll(Core::HID::HIDCore& hid, bool suppress_guest = false) {
+        const auto devices = SnapshotGamepads(max_players);
+        for (std::size_t slot = 0; slot < 4; ++slot) {
+            auto& controller = *hid.GetEmulatedControllerByIndex(slot);
+            const bool present = devices[slot].has_value();
+            if (devices[slot] != previous_devices[slot])
+                stick_motions[slot] = {};
+            if (present || slot == 0)
+                AutoStyle(controller, hid.GetSupportedStyleTag(), slot);
+            const bool allowed =
+                slot < static_cast<std::size_t>(max_players) &&
+                hid.IsSupportedPlayer(slot, controller.GetNpadStyleIndex() ==
+                                                Core::HID::NpadStyleIndex::Handheld);
+            // Keep the keyboard/remote-backed player 1 alive without a pad: disconnecting it
+            // repeatedly reopens support applets in P5R/BotW. Guest ID/style limits still win.
+            if (!allowed || (!present && slot != 0)) {
+                controller.Disconnect();
+                stick_motions[slot] = {};
+            } else {
+                if (!controller.IsControllerSupported())
+                    controller.Disconnect();
+                else if (!controller.IsConnected())
+                    controller.Connect();
+            }
+            const auto reading = ReadGamepad(devices[slot]);
+            PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot));
         }
+        previous_devices = devices;
+    }
+
+    void PollPlayer(std::size_t slot, const winrt::Windows::Gaming::Input::GamepadReading& reading,
+                    bool suppress_guest) {
+        using namespace winrt::Windows::Gaming::Input;
+        const PadIdentifier pad{.port = slot};
+        const bool primary = PlayerOneControls(slot);
+        // Remote keys describe physical Xbox buttons; scripts describe guest Switch buttons.
+        const auto physical_keys = primary ? key_state.load(std::memory_order_acquire) : 0u;
+        const auto scripted_keys = primary ? ScriptedKeys() : 0u;
+        const auto keys = physical_keys | scripted_keys;
         const bool view = (reading.Buttons & GamepadButtons::View) != GamepadButtons::None ||
                           (keys & (1u << Settings::NativeButton::Minus)) != 0;
         const bool menu = (reading.Buttons & GamepadButtons::Menu) != GamepadButtons::None ||
                           (keys & (1u << Settings::NativeButton::Plus)) != 0;
         const auto now = std::chrono::steady_clock::now();
-        const bool combo_blocked = home_combo.held || (view && menu);
-        home_pressed = home_edge.Update(view, menu);
-        home_combo_action = UpdateHomeCombo(home_combo, view, menu, now);
-        const auto motion = stick_motion.Update(view, static_cast<float>(reading.RightThumbstickX),
-                                                static_cast<float>(reading.RightThumbstickY), now,
-                                                suppress_guest || combo_blocked);
+        const bool combo_blocked = primary && (home_combo.held || (view && menu));
+        if (primary) {
+            home_pressed = home_edge.Update(view, menu);
+            home_combo_action = UpdateHomeCombo(home_combo, view, menu, now);
+        }
+        const auto motion = stick_motions[slot].Update(
+            view, static_cast<float>(reading.RightThumbstickX),
+            static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -136,14 +181,6 @@ public:
         sensors.gyro_z = motion.gyro[2];
         sensors.delta_timestamp = motion.delta_timestamp;
         SetMotion(pad, 0, sensors);
-        // Player 1 stays connected, as the keyboard keeps it on desktop Eden. Disconnecting when
-        // no Xbox pad was visible made games re-open the controller-support applet in a loop:
-        // Persona 5 Royal every ~5 s, and Breath of the Wild 43 times in 13 s, leaking each
-        // applet's events until CreateEvent hit the resource limit and the game stopped.
-        AutoStyle(controller, supported);
-        if (!controller.IsConnected()) {
-            controller.Connect();
-        }
         // Remap only guest input; frontend controls retain Xbox conventions.
         constexpr std::array mappings{GamepadButtons::A,
                                       GamepadButtons::B,
@@ -174,7 +211,7 @@ public:
                 pressed = motion.minus_pressed;
             if (i == Settings::NativeButton::RStick && motion.suppress_right_stick)
                 pressed = false;
-            if (((view && menu) || home_combo.held) &&
+            if (combo_blocked &&
                 (i == Settings::NativeButton::Minus || i == Settings::NativeButton::Plus)) {
                 pressed = false;
             }
@@ -223,8 +260,9 @@ public:
         bool pressed =
             ((key_state.load(std::memory_order_acquire) | ScriptedKeys()) &
              ((1u << Settings::NativeButton::A) | (1u << Settings::NativeButton::B))) != 0;
-        for (const auto& device : Gamepad::Gamepads())
-            pressed |= (device.GetCurrentReading().Buttons &
+        const auto devices = SnapshotGamepads(max_players);
+        if (devices[0])
+            pressed |= (ReadGamepad(devices[0]).Buttons &
                         (GamepadButtons::A | GamepadButtons::B)) != GamepadButtons::None;
         // Launch confirmation can still be held when preload starts. Require a fresh press.
         if (!pressed)
@@ -249,7 +287,9 @@ public:
 private:
     bool shader_skip_armed = false;
     ButtonLayout button_layout = ButtonLayout::Name;
-    StickMotion stick_motion;
+    GamepadSlots<winrt::Windows::Gaming::Input::Gamepad> previous_devices;
+    int max_players = 4;
+    std::array<StickMotion, 4> stick_motions;
     HomeComboState home_combo;
     HomeComboAction home_combo_action{};
     HomeButtonEdge home_edge;
@@ -257,15 +297,16 @@ private:
     /// NXBOX_PAD_AUTOSTYLE (default on): when the game changes its supported style set, present the
     /// pad as a type that set allows and signal a fresh connection, so games that look at the
     /// style only on a connect event (Super Mario 3D World's controller screen) see a valid pad.
-    void AutoStyle(Core::HID::EmulatedController& controller, Core::HID::NpadStyleTag supported) {
+    void AutoStyle(Core::HID::EmulatedController& controller, Core::HID::NpadStyleTag supported,
+                   std::size_t slot) {
         static const bool enabled = [] {
             const char* value = std::getenv("NXBOX_PAD_AUTOSTYLE");
             return value == nullptr || value[0] != '0';
         }();
         const auto raw = static_cast<std::uint32_t>(supported.raw);
-        if (!enabled || raw == last_style_raw)
+        if (!enabled || raw == last_style_raw[slot])
             return;
-        last_style_raw = raw;
+        last_style_raw[slot] = raw;
         using Core::HID::NpadStyleIndex;
         NpadStyleIndex style;
         // NXBOX_PAD_STYLE=pro|dual|handheld forces the preferred type (tests); it only applies
@@ -287,6 +328,10 @@ private:
             style = NpadStyleIndex::JoyconDual;
             break;
         case PadChoice::Handheld:
+            if (slot != 0) {
+                controller.Disconnect();
+                return;
+            }
             style = NpadStyleIndex::Handheld;
             break;
         default:
@@ -294,13 +339,11 @@ private:
         }
         controller.Disconnect();
         controller.SetNpadStyleIndex(style);
-        controller.Connect();
-        Diagnostic("PAD_AUTOSTYLE supported=0x" + std::to_string(raw) +
-                   " style=" + std::to_string(static_cast<int>(style)) +
-                   " connected=" + std::to_string(controller.IsConnected()));
+        Diagnostic("PAD_AUTOSTYLE supported=0x" + std::to_string(raw) + " style=" +
+                   std::to_string(static_cast<int>(style)) + " player=" + std::to_string(slot + 1));
     }
 
-    std::uint32_t last_style_raw = 0;
+    std::array<std::uint32_t, 4> last_style_raw{};
 
     /// NXBOX_INPUT_SCRIPT events active now, as key_state bits; the clock starts at the first poll.
     std::uint32_t ScriptedKeys() {
@@ -417,7 +460,6 @@ private:
         }
     }
 
-    const PadIdentifier pad{};
     std::atomic<std::uint32_t> key_state{0};
     std::atomic<bool> key_seen{false};
 };
