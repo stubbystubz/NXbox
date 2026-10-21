@@ -51,10 +51,10 @@ public:
     void SetSupportedPlayerMask(u32 mask) {
         supported_player_mask.store(mask, std::memory_order_release);
     }
-    bool IsSupportedPlayer(std::size_t index, bool handheld = false) const {
-        if (index >= 8 || (handheld && index != 0))
+    bool IsSupportedPlayer(std::size_t index, bool is_handheld = false) const {
+        if (index >= 8 || (is_handheld && index != 0))
             return false;
-        const auto bit = handheld ? 8 : index;
+        const auto bit = is_handheld ? 8 : index;
         return (supported_player_mask.load(std::memory_order_acquire) & (1u << bit)) != 0;
     }
 
