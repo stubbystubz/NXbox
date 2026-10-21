@@ -42,6 +42,7 @@ class GraphicsBindingCacheTests(unittest.TestCase):
         begin = header.index("    void ResetUsageTracking()")
         reset = header[begin : header.index("\n    }", begin) + 6]
         driver = r"""
+#include "video_core/renderer_d3d12/d3d12_usage_cache.h"
 #include <cassert>
 #include <cstdint>
 using u64 = std::uint64_t;
@@ -60,6 +61,8 @@ struct Buffer {
         void Reset() { tracks = 0; }
     } usage;
     u64 tick{}, usage_offset{}, usage_size{};
+    D3D12::UsageCache usage_ranges;
+    bool usage_reuse = false;
     bool usage_cached{}, binding_cache = true;
     void MarkUsage(u64, u64);
 __RESET__
@@ -100,6 +103,8 @@ int main() {
                     "-Wextra",
                     "-Werror",
                     "-fsanitize=address,undefined",
+                    "-I",
+                    str(ROOT / "src"),
                     str(cpp),
                     "-o",
                     str(binary),

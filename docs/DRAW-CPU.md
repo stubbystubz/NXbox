@@ -199,3 +199,131 @@ OK
 
 The standalone upload-category accounting test also passed. No console rendering
 or performance result is claimed.
+
+## p48
+
+This patch targets the supplied 2.8 ms buffer-bind, 2.2 ms texture-update and
+0.84 ms index-flush scopes. These scopes include necessary coherency work. The
+planning ranges below are **unmeasured console estimates**, not achieved savings;
+the 2 ms/frame goal remains to be tested. No p47 reduction is counted again.
+
+| Change | Skipped work | Expected ms/frame | Default-on opt-out |
+| --- | --- | --- | --- |
+| Exact buffer usage memo | Rewriting the same usage bitset for up to eight alternating ranges of one D3D12 buffer between usage resets. Unlike the old experimental last-range memo, this is independent of uniform snapshot reuse. | 0.3–1.5 within buffer bind; depends strongly on vertex range sizes and repeated ranges per resource | `NXBOX_D3D12_USAGE_REUSE=0` |
+| Small TIC/TSC reads | General nested GPU page walks and device block-reader setup when the descriptor fits within one mapped GPU page and one physical device page. Both graphics and compute use the D3D12 runtime hook; other backends retain their original read path. | 0.1–0.5 within texture update; every descriptor's bytes are still read | `NXBOX_D3D12_DESCRIPTOR_READ=0` |
+| Inline invalidation coalescing | Repeated texture cache invalidation for consecutive overlapping or adjacent translated intervals in `FlushCaching`'s batch. No sort, allocation, or unwritten gap is introduced. | 0–0.15 within index flush; zero benefit for already disjoint/coalesced batches | `NXBOX_D3D12_INVALIDATION_COALESCE=0` |
+
+The estimated total is 0.4–2.15 ms/frame, with no guaranteed lower bound. Larger
+savings require evidence of more redundancy on console; skipping whole buffer
+synchronization or image preparation without write tracking would be unsafe.
+
+The usage memo remembers exact `(offset, size)` operations, rather than inferring
+coverage from byte containment. Usage bits only accumulate until
+`ResetUsageTracking`, which clears both the bitset and memo. Eviction merely
+repeats a scan. Every `MarkUsage` still updates the buffer tick and calls
+`Context::Retain`, including when retention starts another recording. Resource
+content versions, uploads, storage write tracking, binding resolution and resource
+leases are unchanged. The opt-out restores the prior behavior, including the old
+last-range memo if `NXBOX_D3D12_BINDING_CACHE` was separately enabled.
+
+Descriptor reads retain table content comparison, refresh/invalidate bits and all
+image/sampler resolution and preparation. No descriptor bytes, host pointers or
+GPU address translations survive the read. The direct path rechecks the mapping
+on every call, drains the GPU pipeline first, and falls back for crossing pages,
+reserved/unmapped GPU pages or absent device pointers. The fallback retains the
+original split-read/zero-fill behavior. This deliberately avoids assuming that
+unchanged table registers imply unchanged TIC/TSC memory. Vulkan/OpenGL do not
+implement the optional runtime hook and keep `DescriptorTable::Read`'s default
+path. Render-target preparation, including the second alias-coherency pass, is
+unchanged.
+
+Invalidations retain the original pending-query report publication **before**
+either cache is touched. Texture invalidations preserve the exact address union
+and the original lock boundary. Buffer invalidation retains every original range:
+its conditional pending-download cancellation must not gain a broader predicate.
+Query-cache and shader-cache invalidation also retain the original intervals and
+ordering. Empty and overflowing intervals pass through unchanged. The `FlushCaching` call and pipeline drain
+remain unconditional; an empty accumulator already has a cheap check.
+
+`test_p48_cache_cpu` compiles production helpers and method bodies with ASan and
+UBSan and executes:
+
+- 3,000 draws with alternating/random usage ranges, frame resets, recording-tick
+  changes during retention and a null resource. Production usage words, buffer
+  ticks and retention counts match unconditional tracking. Default-on performs
+  245 scans versus 12,131; the opt-out performs all 12,131.
+- 24,000 small reads against the production general `MemoryOperation`/
+  `ReadBlockImpl` walker, covering big/small pages, continuous/discontinuous
+  device mappings, reserved/unmapped pages, crossing boundaries and zero sizes.
+  Four production descriptor tables detect byte writes, remaps, table switches
+  and invalidations. The actual D3D12 runtime hook runs with its switch enabled
+  and disabled. Missing physical device pages retain zero-fill behavior.
+- 5,000 randomized invalidation batches: 160,000 callbacks become 36,041 with
+  identical byte coverage. The production texture `WriteMemory` body also yields
+  identical per-image flags, write notifications and untrack counts across the
+  original/coalesced batches. Opt-out preserves each original interval in order;
+  explicit cases cover reverse overlap, adjacency, empty ranges and overflow.
+
+The existing graphics-binding fixture explicitly selects the old usage fallback;
+the existing descriptor-table fixture adds the new memory entry point. The image
+lookup and sampler-slot fixtures provide a stub runtime with no descriptor hook,
+exercising the unchanged shared fallback. Their original assertions remain in place.
+The invalidation wiring test recognizes the texture coalescer while preserving
+its original buffer, query and shader ordering assertions.
+
+On console, compare defaults, each opt-out separately, and all three off in the
+same warmed MK8D race, Odyssey and Wonder scenes. Keep profiling configuration,
+GPU accuracy, resolution and pipeline mode fixed. Record the three target scopes,
+GPU-thread CPU per draw/frame, draw counts, upload bytes, barriers, submissions,
+guest query writes and frame-rate variance. Check matched-frame images through
+loading, storage/compute writes, small/8-bit index conversion, CPU/inline
+TIC/TSC edits, table/channel changes, sampled aliases/bloom and long runs with
+resource recycling. Verify query reports and device-removal/validation logs.
+Also repeat with profiling off. Host call reductions do not establish console
+image equality or the requested 2 ms/frame saving.
+
+Host validation used the installed Python 3.14, Homebrew fmt/OpenSSL pkg-config
+metadata and an existing cached FontTools package. No packages were installed.
+The final full invocation was:
+
+```sh
+mkdir -p /private/tmp/p48-verified
+cd tests/port
+TMPDIR=/private/tmp/p48-verified \
+PATH=/opt/homebrew/bin:$PATH \
+PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig \
+PYTHONPATH=/Users/miguel/.cache/uv/archive-v0/uIDCMW0xewgmeAP3 \
+python3 -m unittest -q
+```
+
+```text
+Ran 1000 tests in 551.487s
+FAILED (failures=1, skipped=45)
+```
+
+The sole failure remains
+`test_d3d12_query_gpu_reports.GpuQueryReports.test_reports_keep_snapshots_and_batch_guest_writes`:
+its source assertion expects `return false;`, while the existing host-managed
+predicate fallback returns `!Settings::IsGPULevelHigh()`. Neither that test nor the
+query implementation was changed. An eight-test query/presenter check using
+HEAD's original extracted source reproduced exactly this one failure; the
+presenter errors recorded under p47 did not recur. There are no new failures.
+
+The focused invocation also passed:
+
+```sh
+TMPDIR=/private/tmp/p48-tests python3 -m unittest -q \
+  test_d3d12_cached_invalidation test_p48_cache_cpu \
+  test_texture_cache_fastpath test_texture_alias_sync \
+  test_graphics_binding_cache test_host_memory
+```
+
+```text
+Ran 20 tests in 12.435s
+OK
+```
+
+The new Python test passes Ruff checks/formatting, changed C++ regions were run
+through clang-format with the repository style, and `git diff --check` is clean.
+Scratch directories, generated bytecode and temporary logs were removed. No
+console build, rendering comparison or performance measurement was performed.

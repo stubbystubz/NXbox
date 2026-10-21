@@ -54,8 +54,10 @@ void Buffer::MarkUsage(u64 offset, u64 size) {
     if (!context || !resource)
         return;
     // Retention remains unconditional: Retain can open a new command list. Usage
-    // bits only need another update when the range changes (or tracking resets).
-    if (!binding_cache || !usage_cached || offset != usage_offset || size != usage_size) {
+    // bits only need each exact range once until tracking resets.
+    if (usage_reuse
+            ? usage_ranges.Insert(offset, size)
+            : (!binding_cache || !usage_cached || offset != usage_offset || size != usage_size)) {
         usage.Track(offset, size);
         usage_offset = offset;
         usage_size = size;

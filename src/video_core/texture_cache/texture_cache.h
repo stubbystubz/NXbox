@@ -456,7 +456,13 @@ SamplerId TextureCache<P>::GetSamplerId(u32 index, bool compute) {
         return NULL_SAMPLER_ID;
     }
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    auto const [descriptor, is_new] = [&] {
+        if constexpr (requires { this->runtime.ReadDescriptor(table, *gpu_memory, index); }) {
+            return this->runtime.ReadDescriptor(table, *gpu_memory, index);
+        } else {
+            return table.Read(*gpu_memory, index);
+        }
+    }();
     auto& slots = channel_state->resolved_samplers[compute ? 1 : 0];
     auto& resolved = slots[index % slots.size()];
     const bool cache_enabled = sampler_slot_fastpath;
@@ -742,7 +748,13 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
         }
     };
     // Is new (on the tegra engine side)?
-    auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
+    auto const [descriptor, is_new] = [&] {
+        if constexpr (requires { this->runtime.ReadDescriptor(table, *gpu_memory, index); }) {
+            return this->runtime.ReadDescriptor(table, *gpu_memory, index);
+        } else {
+            return table.Read(*gpu_memory, index);
+        }
+    }();
     if (is_new) {
         if (IsValidEntry(*gpu_memory, descriptor)) {
             // Is new (registered view) on the texture cache side?

@@ -42,6 +42,7 @@ struct Channel {
 };
 template <class P>
 struct TextureCache {
+    P runtime{}; // No descriptor-read hook: exercise the shared default path.
     Channel storage;
     Channel* channel_state = &storage;
     int memory = 0;

@@ -33,6 +33,7 @@
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_view.h"
 #include "video_core/renderer_d3d12/d3d12_feedback.h"
+#include "video_core/renderer_d3d12/d3d12_invalidation_ranges.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 #include "video_core/renderer_d3d12/d3d12_render_area.h"
@@ -3834,15 +3835,21 @@ void RasterizerD3D12::InnerInvalidation(std::span<const std::pair<DAddr, std::si
     for (const auto& [addr, size] : sequences)
         query_runtime.FlushPendingReports(addr, size);
 
+    static const bool coalesce = [] {
+        const char* value = std::getenv("NXBOX_D3D12_INVALIDATION_COALESCE");
+        return !value || std::string_view{value} != "0";
+    }();
     // FlushCaching drains guest inline writes, even when CPU inner invalidation is skipped.
     // Match Vulkan: make those bytes CPU-owned before the next buffer synchronization.
     {
         std::scoped_lock lock{texture_cache.mutex};
-        for (const auto& [addr, size] : sequences) {
+        ForEachInvalidationRange(sequences, coalesce, [&](DAddr addr, u64 size) {
             texture_cache.WriteMemory(addr, size);
-        }
+        });
     }
     {
+        // Buffer invalidation conditionally cancels pending downloads. Preserve
+        // those per-range decisions rather than broadening their predicates.
         std::scoped_lock lock{buffer_cache.mutex};
         for (const auto& [addr, size] : sequences) {
             buffer_cache.WriteMemory(addr, size);
