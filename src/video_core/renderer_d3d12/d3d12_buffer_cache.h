@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstdlib>
+#include <string_view>
 
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/buffer_cache/memory_tracker_base.h"
@@ -11,6 +12,7 @@
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 #include "video_core/renderer_d3d12/d3d12_ring_allocator.h"
 #include "video_core/renderer_d3d12/d3d12_upload_cache.h"
+#include "video_core/renderer_d3d12/d3d12_usage_cache.h"
 
 namespace D3D12 {
 class BufferCacheRuntime;
@@ -33,6 +35,7 @@ public:
     void MarkUsage(u64 offset, u64 size);
     void ResetUsageTracking() {
         usage.Reset();
+        usage_ranges.Clear();
         usage_cached = false;
     }
     u64 LastUsageTick() const {
@@ -46,6 +49,11 @@ private:
     u64 tick{};
     u64 usage_offset{}, usage_size{};
     bool usage_cached{};
+    UsageCache usage_ranges;
+    bool usage_reuse{[] {
+        const char* value = std::getenv("NXBOX_D3D12_USAGE_REUSE");
+        return !value || std::string_view{value} != "0";
+    }()};
     bool binding_cache{BisectEnabled("NXBOX_D3D12_BINDING_CACHE")};
 };
 class BufferCacheRuntime {

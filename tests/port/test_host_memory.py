@@ -62,6 +62,9 @@ namespace Tegra {
 struct MemoryManager {
     mutable GPUVAddr last_address{};
     u64 value = 42;
+    void ReadBlockUnsafeSmall(GPUVAddr address, void* out, size_t size) const {
+        ReadBlockUnsafe(address, out, size);
+    }
     void ReadBlockUnsafe(GPUVAddr address, void* out, size_t size) const {
         assert(size == sizeof(value));
         last_address = address;

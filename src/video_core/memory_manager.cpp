@@ -405,6 +405,39 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
     ReadBlockImpl(gpu_src_addr, dest_buffer, size, VideoCommon::CacheType::None, true);
 }
 
+void MemoryManager::ReadBlockUnsafeSmall(GPUVAddr gpu_src_addr, void* dest_buffer,
+                                         std::size_t size) const {
+    DrainGpuPipeline();
+    // No pointer survives this call. Re-read mappings and bytes on every lookup,
+    // including CPU stores, inline writes, downloads and address-space changes.
+    const auto offset = gpu_src_addr & page_mask;
+    if (size != 0 && size <= page_size - offset && gpu_src_addr < address_space_size &&
+        size <= address_space_size - gpu_src_addr) {
+        DAddr device_addr{};
+        const auto big_entry = GetEntry(gpu_src_addr, true);
+        if (big_entry == EntryType::Mapped) {
+            device_addr =
+                (DAddr(big_page_table_dev[gpu_src_addr >> big_page_bits]) << cpu_page_bits) +
+                (gpu_src_addr & big_page_mask);
+        } else if (big_entry == EntryType::Free &&
+                   GetEntry(gpu_src_addr, false) == EntryType::Mapped) {
+            device_addr = (DAddr(page_table[gpu_src_addr >> page_bits]) << cpu_page_bits) + offset;
+        } else {
+            ReadBlockUnsafe(gpu_src_addr, dest_buffer, size);
+            return;
+        }
+        // Non-contiguous big pages use device-memory reads in the general path.
+        // A pointer is safe only within a single physical device page as well.
+        if (size <= Core::DEVICE_PAGESIZE - (device_addr & Core::DEVICE_PAGEMASK)) {
+            if (const auto* pointer = memory.GetPointer<u8>(device_addr)) {
+                std::memcpy(dest_buffer, pointer, size);
+                return;
+            }
+        }
+    }
+    ReadBlockUnsafe(gpu_src_addr, dest_buffer, size);
+}
+
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     DrainGpuPipeline();
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {

@@ -37,7 +37,8 @@ class CachedInvalidationTests(unittest.TestCase):
             (ROOT / "src/video_core/renderer_vulkan/vk_rasterizer.cpp").read_text(),
             "void RasterizerVulkan::InnerInvalidation",
         )
-        # Preserve the order and exact invalidated ranges for all four caches.
+        # Preserve cache ordering. The texture batch coalesces the exact union;
+        # test_p48_cache_cpu executes its production WriteMemory equivalence.
         calls = r"(?:texture_cache|buffer_cache|query_cache|(?:default_)?pipeline_cache)(?:\.|->)(?:WriteMemory|InvalidateRegion)\(addr, size\);"
         normalize = lambda s: s.replace("default_pipeline_cache->", "pipeline_cache.")
         self.assertEqual(
@@ -45,11 +46,16 @@ class CachedInvalidationTests(unittest.TestCase):
             re.findall(calls, vulkan),
         )
         for cache in ("texture_cache", "buffer_cache"):
+            iteration = (
+                r"ForEachInvalidationRange\(sequences, coalesce, \[&\]\(DAddr addr, u64 size\) \{\s*"
+                if cache == "texture_cache"
+                else r"for \(const auto& \[addr, size\] : sequences\) \{\s*"
+            )
             self.assertRegex(
                 native,
                 rf"std::scoped_lock lock\{{{cache}\.mutex\}};\s*"
-                rf"for \(const auto& \[addr, size\] : sequences\) \{{\s*"
-                rf"{cache}\.WriteMemory\(addr, size\);",
+                + iteration
+                + rf"{cache}\.WriteMemory\(addr, size\);",
             )
 
     def test_buffer_write_restores_upload_eligibility_and_cancels_stale_downloads(self):

@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <optional>
+#include <string_view>
 #include "video_core/renderer_d3d12/d3d12_blit_image.h"
 #include "video_core/renderer_d3d12/d3d12_compute_pass.h"
 #include "video_core/renderer_d3d12/d3d12_context.h"
@@ -24,6 +26,15 @@ public:
     explicit TextureCacheRuntime(Context& context)
         : context{context}, upload{context, D3D12_HEAP_TYPE_UPLOAD},
           readback{context, D3D12_HEAP_TYPE_READBACK} {}
+    template <typename T>
+    auto ReadDescriptor(VideoCommon::DescriptorTable<T>& table, const Tegra::MemoryManager& memory,
+                        u32 index) {
+        static const bool small_read = [] {
+            const char* value = std::getenv("NXBOX_D3D12_DESCRIPTOR_READ");
+            return !value || std::string_view{value} != "0";
+        }();
+        return table.Read(memory, index, small_read);
+    }
     void Finish() {
         context.Finish(FrameCount::ForcedSubmitTextureDownload);
     }
