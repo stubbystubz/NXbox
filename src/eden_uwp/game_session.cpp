@@ -871,6 +871,8 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
     Settings::values.button_layout.SetValue(button_layout == ButtonLayout::Position ? "position"
                                                                                     : "name");
     gamepad->SetButtonLayout(button_layout);
+    gamepad->SetMaxPlayers(RendererSettings::ReadMaxPlayers(std::filesystem::path(winrt::to_string(
+        winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()))));
     XboxGamepad::Configure(gamepad);
     RegisterUnsupportedEngines();
     SCOPE_EXIT {
@@ -1228,7 +1230,6 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
     // without this the controller stays at its construction default (NpadStyleIndex::None,
     // "Controller type 0 is not supported") until the guest happens to touch HID first.
     system.HIDCore().ReloadInputDevices();
-    auto* controller = system.HIDCore().GetEmulatedControllerByIndex(0);
     auto measured_at = std::chrono::steady_clock::now();
     auto measured_frames = window.FrameCount();
     auto last_frame_count = measured_frames;
@@ -1320,9 +1321,8 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
         }
         timing_probe.Poll(timing_now());
         session_ui.errors->CompleteDismissed();
-        gamepad->Poll(*controller, system.HIDCore().GetSupportedStyleTag(),
-                      session_ui.overlay_open.load(std::memory_order_acquire) ||
-                          session_ui.errors->Pending());
+        gamepad->Poll(system.HIDCore(), session_ui.overlay_open.load(std::memory_order_acquire) ||
+                                            session_ui.errors->Pending());
         switch (gamepad->HomeCombo()) {
         case HomeComboAction::Prompt:
             Diagnostic("HOME_COMBO action=Prompt");

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <cstdlib>
 #include "eden_uwp/button_layout.h"
+#include "eden_uwp/gamepad_slots.h"
 #include "eden_uwp/title_settings.h"
 
 namespace EdenXbox::RendererSettings {
@@ -184,6 +186,49 @@ inline bool SaveFsr(const std::filesystem::path& local, bool enabled) {
     in.close();
     std::ofstream out(file, std::ios::trunc);
     out << content << "upscaler=" << (enabled ? "fsr1" : "bilinear") << '\n';
+    out.close();
+    return !out.fail();
+}
+// Invalid text keeps the default; numeric values are clamped to the supported range.
+inline int ParseMaxPlayers(const std::string& text) {
+    char* end = nullptr;
+    const long value = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str() || *end != '\0')
+        return 4;
+    return value < 1 ? 1 : value > 4 ? 4 : static_cast<int>(value);
+}
+inline int ReadMaxPlayers(const std::filesystem::path& local) {
+    std::ifstream in(local / "eden_settings.txt");
+    int value = 4;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = TitleSettings::ParseLine(line);
+        if (entry && entry->label == "max_players")
+            value = ParseMaxPlayers(entry->value);
+    }
+    if (const char* override_value = std::getenv("NXBOX_MAX_PLAYERS"))
+        value = ParseMaxPlayers(override_value);
+    return value;
+}
+inline bool SaveMaxPlayers(const std::filesystem::path& local, int value) {
+    const auto file = local / "eden_settings.txt";
+    std::error_code error;
+    const bool exists = std::filesystem::exists(file, error);
+    if (error)
+        return false;
+    std::ifstream in(file);
+    if (exists && !in)
+        return false;
+    std::string content;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = TitleSettings::ParseLine(line);
+        if (!entry || entry->label != "max_players")
+            content += line + '\n';
+    }
+    if (in.bad())
+        return false;
+    in.close();
+    std::ofstream out(file, std::ios::trunc);
+    out << content << "max_players=" << ClampMaxPlayers(value) << '\n';
     out.close();
     return !out.fail();
 }

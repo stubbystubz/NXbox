@@ -51,6 +51,8 @@ add_executable(eden-uwp WIN32
     http_vfs_file.cpp
     http_vfs_file.h
     gamepad.h
+    gamepad_devices.h
+    gamepad_slots.h
     button_layout.h
     usb_library.cpp
     usb_library.h

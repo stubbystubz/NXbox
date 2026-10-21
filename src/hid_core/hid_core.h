@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "common/common_funcs.h"
@@ -45,6 +46,17 @@ public:
 
     void SetSupportedStyleTag(NpadStyleTag style_tag);
     NpadStyleTag GetSupportedStyleTag() const;
+
+    // Frontends must not reconnect player IDs excluded by the guest's supported list.
+    void SetSupportedPlayerMask(u32 mask) {
+        supported_player_mask.store(mask, std::memory_order_release);
+    }
+    bool IsSupportedPlayer(std::size_t index, bool handheld = false) const {
+        if (index >= 8 || (handheld && index != 0))
+            return false;
+        const auto bit = handheld ? 8 : index;
+        return (supported_player_mask.load(std::memory_order_acquire) & (1u << bit)) != 0;
+    }
 
     /// Counts the connected players from P1-P8
     s8 GetPlayerCount() const;
@@ -90,6 +102,7 @@ public:
     std::unique_ptr<EmulatedDevices> devices;
     Kernel::KernelCore& kernel;
     NpadStyleTag supported_style_tag{NpadStyleSet::All};
+    std::atomic<u32> supported_player_mask{0x1ff};
     NpadIdType last_active_controller{NpadIdType::Handheld};
 };
 

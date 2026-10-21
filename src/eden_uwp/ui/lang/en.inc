@@ -433,3 +433,6 @@
     {Text::FrameGenerationTitle, L"Frame generation"},
     {Text::FrameGenerationHint, L"Creates intermediate frames for smoother motion. May cause small "
                                 L"image artifacts and add input delay."},
+
+    {Text::MaxPlayersTitle, L"Local players"},
+    {Text::MaxPlayersHint, L"Each connected controller becomes a player, up to 4."},

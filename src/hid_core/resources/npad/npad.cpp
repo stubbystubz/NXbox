@@ -503,6 +503,17 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
     }
 
     std::scoped_lock lock{*applet_resource_holder.shared_mutex};
+    // Publish the active resource's ID policy for host frontends. Recompute here so applet
+    // switches and system-policy resets cannot leave a stale limit from an inactive client.
+    const auto* active_data = npad_resource.GetActiveData();
+    u32 player_mask = 0;
+    for (u32 index = 0; index < 8; ++index) {
+        if (active_data->IsNpadIdTypeSupported(static_cast<Core::HID::NpadIdType>(index)))
+            player_mask |= 1u << index;
+    }
+    if (active_data->IsNpadIdTypeSupported(Core::HID::NpadIdType::Handheld))
+        player_mask |= 1u << 8;
+    hid_core.SetSupportedPlayerMask(player_mask);
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; ++aruid_index) {
         const auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
 

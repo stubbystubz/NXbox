@@ -214,6 +214,13 @@ public:
     void SetSupportedNpadStyleTag(NpadStyleTag supported_styles);
 
     /**
+     * Checks the current controller type against the supported_style_tag
+     * @param use_temporary_value If true tmp_npad_type will be used
+     * @return true if the controller is supported
+     */
+    bool IsControllerSupported(bool use_temporary_value = false) const;
+
+    /**
      * Sets the connected status to true
      * @param use_temporary_value If true tmp_npad_type will be used
      */
@@ -489,13 +496,6 @@ private:
      * @return true if the controller style is fullkey
      */
     bool IsControllerFullkey(bool use_temporary_value = false) const;
-
-    /**
-     * Checks the current controller type against the supported_style_tag
-     * @param use_temporary_value If true tmp_npad_type will be used
-     * @return true if the controller is supported
-     */
-    bool IsControllerSupported(bool use_temporary_value = false) const;
 
     /**
      * Updates the button status of the controller

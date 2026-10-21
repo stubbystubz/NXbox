@@ -240,6 +240,7 @@ public:
         frame_pacing_ = RendererSettings::ReadFramePacing(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
         button_layout_ = RendererSettings::ReadButtonLayout(local_state_);
+        max_players_ = RendererSettings::ReadMaxPlayers(local_state_);
         std::ifstream resolution_settings(local_state_ / "eden_settings.txt");
         settings_resolution_ = TitleSettings::ReadResolution(resolution_settings);
         if (return_home_) {
@@ -972,6 +973,14 @@ private:
         if (SelectedSetting() == Setting::Renderer) {
             renderer_choice_ = renderer_backend_ == RendererSettings::kOpenGL ? 1 : 0;
             renderer_open_ = true;
+            return;
+        }
+        if (SelectedSetting() == Setting::MaxPlayers) {
+            const int next = max_players_ % 4 + 1;
+            if (RendererSettings::SaveMaxPlayers(local_state_, next))
+                max_players_ = next;
+            else
+                Toast(Tr(Text::ButtonLayoutSaveFailed), now);
             return;
         }
         if (SelectedSetting() == Setting::ButtonLayout) {
@@ -1834,6 +1843,7 @@ private:
                                       : resolution == 6 ? Text::Resolution2X
                                       : resolution == 7 ? Text::Resolution3X
                                                         : Text::Resolution1X;
+        const auto max_players_label = std::to_wstring(max_players_);
         const bool ftp_running = ftp_.Running();
         const auto ftp_address = ftp_running ? ftp_.Address() : Tr(Text::NextendoOff);
         const auto ftp_credentials = ftp_running
@@ -1881,6 +1891,8 @@ private:
               Tr(button_layout_ == ButtonLayout::Position ? Text::ButtonLayoutPositionShort
                                                           : Text::ButtonLayoutNameShort),
               Theme::kTextSecondary, Tr(Text::ButtonLayoutHint)},
+             {Tr(Text::MaxPlayersTitle), max_players_label.c_str(), Theme::kTextSecondary,
+              Tr(Text::MaxPlayersHint)},
              {Tr(Text::ResolutionTitle), Tr(resolution_label), Theme::kTextSecondary,
               Tr(Text::ResolutionMemoryHint)},
              {Tr(Text::UpscalerTitle), Tr(fsr_ ? Text::UpscalerFsr : Text::UpscalerBilinear),
@@ -2171,6 +2183,7 @@ private:
     bool async_shaders_ = true;
     bool fsr_ = true;
     bool xbox_button_icons_ = true;
+    int max_players_ = 4;
     ButtonLayout button_layout_ = ButtonLayout::Name;
     int renderer_backend_ = RendererSettings::kDirectX12;
     int settings_resolution_ = TitleSettings::kDefaultResolution;

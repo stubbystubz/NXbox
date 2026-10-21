@@ -11,6 +11,7 @@
 #include <winrt/Windows.Storage.h>
 
 #include "eden_uwp/diagnostic.h"
+#include "eden_uwp/gamepad_devices.h"
 #include "eden_uwp/input_script.h"
 
 #include <cstdint>
@@ -134,9 +135,9 @@ Input::~Input() {
 
 void Input::PollGamepads(std::array<bool, kButtonCount>& held) const {
     using namespace winrt::Windows::Gaming::Input;
-    const auto pads = Gamepad::Gamepads();
-    for (std::uint32_t pad_index = 0; pad_index < pads.Size(); ++pad_index) {
-        const GamepadReading reading = pads.GetAt(pad_index).GetCurrentReading();
+    const auto pads = SnapshotGamepads();
+    if (pads[0]) {
+        const GamepadReading reading = ReadGamepad(pads[0]);
         const auto pressed = [&reading](GamepadButtons flag) {
             return (reading.Buttons & flag) != GamepadButtons::None;
         };

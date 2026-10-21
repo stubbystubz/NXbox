@@ -454,3 +454,6 @@
     {Text::FrameGenerationHint,
      L"Cria quadros intermediários para ficar mais fluido. Pode causar pequenos defeitos na imagem "
      L"e um pouco mais de atraso nos comandos."},
+
+    {Text::MaxPlayersTitle, L"Jogadores locais"},
+    {Text::MaxPlayersHint, L"Cada controle conectado vira um jogador, até 4."},
