@@ -112,6 +112,19 @@ void WriteArgument(Stream& stream, RecordArray<T> value) {
     const std::byte padding[16]{};
     stream.Write(padding, (-bytes) & 15);
 }
+// Same byte layout as WriteArgument; no queue routing or boundary check per array.
+template <class T>
+void CopyArgument(std::byte*&, T) {}
+template <class T>
+void CopyArgument(std::byte*& output, RecordArray<T> value) {
+    const size_t bytes = sizeof(T) * value.count;
+    if (bytes)
+        std::memcpy(output, value.data, bytes);
+    output += bytes;
+    const size_t padding = (-bytes) & 15;
+    std::memset(output, 0, padding);
+    output += padding;
+}
 template <auto Invoke, class Pack, size_t... I>
 void ReplayPack(void* target, const Pack& pack, const std::byte* base, std::index_sequence<I...>) {
     Invoke(target, RecordGet<I>(pack).Resolve(base)...);
@@ -141,6 +154,15 @@ void EncodeCall(Stream& stream, Args... args) {
     const auto first = offset;
     Call call{MakeRecordPack(offset, args...)};
     (HoldArgument(args), ...);
+    if constexpr (requires { stream.template TryBegin<Call>(size_t{}); }) {
+        if (auto* packet = stream.template TryBegin<Call>(offset - sizeof(Call))) {
+            std::memcpy(packet, &call, sizeof(call));
+            std::memset(packet + sizeof(call), 0, first - sizeof(call));
+            auto* output = packet + first;
+            (CopyArgument(output, args), ...);
+            return;
+        }
+    }
     stream.template Begin<Call>(offset - sizeof(Call));
     stream.Write(&call, sizeof(call));
     const std::byte padding[16]{};

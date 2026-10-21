@@ -175,7 +175,7 @@ int main() {
             self.assertLess(current.index(prerequisite), hit)
         for slow_work in (
             "Pso::GraphicsPsoState state;",
-            "GraphicsPipelineKey request{};",
+            "GraphicsPipelineKey rebuilt_request;",
             "FillGraphicsState(*maxwell3d, state)",
             "request = cached_graphics_request;",
             "prewarmed_graphics.contains(request)",
