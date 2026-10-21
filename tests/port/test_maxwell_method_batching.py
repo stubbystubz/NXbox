@@ -26,6 +26,7 @@ class MaxwellMethodBatchingTests(unittest.TestCase):
                 "--repeat",
                 "1",
                 "--sanitize",
+                "--ab",
             ],
             check=True,
             timeout=60,

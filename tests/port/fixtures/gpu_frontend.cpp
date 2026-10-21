@@ -106,6 +106,10 @@ struct Maxwell3D {
     unsigned effects{}, bulk_calls{}, sink_calls{}, macro_calls{}, dispatch_calls{};
     bool fail_dispatch{};
     const bool method_batching{Tegra::MaxwellMethodBatchingEnabled()};
+    bool repeat_writes{[] {
+        const char* value = std::getenv("NXBOX_MAXWELL_REPEAT_WRITES");
+        return !value || value[0] != '0' || value[1] != '\0';
+    }()};
     bool captured_dirty{}, refresh{};
     std::vector<u32> captured;
     std::vector<std::pair<GPUVAddr, size_t>> captured_segments;
@@ -364,6 +368,48 @@ int main() {
             assert(scalar.regs.reg_array == batch.regs.reg_array);
             assert(scalar.shadow_state.reg_array == batch.shadow_state.reg_array);
             assert(scalar.dirty.flags == batch.dirty.flags && batch.dirty.flags.any());
+        }
+    }
+
+    // Compare scattered ordinary registers with scalar dispatch and the opt-out.
+    // Include empty, unchanged, changed-then-restored and pre-dirtied packets.
+    for (u32 mode = 0; mode < 4; ++mode) {
+        for (u32 count : {0u, 1u, 2u, 4u, 16u, 256u}) {
+            for (u32 pattern = 0; pattern < 4; ++pattern) {
+                Maxwell3D scalar, enabled, disabled;
+                enabled.repeat_writes = true;
+                disabled.repeat_writes = false;
+                for (u32 reg = 0; reg < Maxwell3D::Regs::NUM_REGS; reg += 31) {
+                    if (scalar.execution_mask[reg])
+                        continue;
+                    for (auto* current : {&scalar, &enabled, &disabled}) {
+                        current->shadow_state.shadow_ram_control =
+                            static_cast<Maxwell3D::Regs::ShadowRamControl>(mode);
+                        current->regs.reg_array[reg] = 7;
+                        current->shadow_state.reg_array[reg] = 11;
+                        current->dirty.flags.reset();
+                        current->dirty.flags[13] = true;
+                    }
+                    std::vector<u32> words(count, 7);
+                    for (u32 i = 0; i < count; ++i) {
+                        if (pattern == 1)
+                            words[i] = i + 100;
+                        if (pattern == 2)
+                            words[i] = (i + 1 == count) ? 7 : 9;
+                        if (pattern == 3)
+                            words[i] = i % 3 == 0 ? 7 : 11;
+                        scalar.CallMethod(system, reg, words[i], i + 1 == count);
+                    }
+                    enabled.CallMultiMethod(system, reg, words.data(), count, count);
+                    disabled.CallMultiMethod(system, reg, words.data(), count, count);
+                    for (auto* current : {&enabled, &disabled}) {
+                        assert(current->regs.reg_array == scalar.regs.reg_array);
+                        assert(current->shadow_state.reg_array == scalar.shadow_state.reg_array);
+                        assert(current->dirty.flags == scalar.dirty.flags);
+                        assert(current->dispatch_calls == 0);
+                    }
+                }
+            }
         }
     }
 

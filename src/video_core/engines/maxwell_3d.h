@@ -3223,6 +3223,10 @@ private:
     void ConsumeSinkImpl(Core::System& system) override;
 
     const bool method_batching{MaxwellMethodBatchingEnabled()};
+    const bool repeat_writes{[] {
+        const char* value = std::getenv("NXBOX_MAXWELL_REPEAT_WRITES");
+        return !value || value[0] != '0' || value[1] != '\0';
+    }()};
     u32 MethodProfileKey(u32 method) const;
     template <bool Profile = false>
     void CallMethodImpl(Core::System& system, u32 method, u32 method_argument, bool is_last_call);

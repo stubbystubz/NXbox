@@ -599,6 +599,42 @@ void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* bas
             // writes, but dirty flags must match scalar dispatch (also in Track/Replay).
             if (amount != 0 && executing_macro == 0 && !execution_mask[method]) {
                 Common::MaxwellMethodProfile::Shadow<decltype(profile)::value>(amount, [&] {
+                    // No observer can see intermediate ordinary register values. Remember
+                    // whether any value changed, so restored registers still dirty both tables.
+                    // Shader discovery observes intermediate program bases, and detailed profiling
+                    // needs the original per-write accounting.
+                    if (frontend_fastpath && repeat_writes &&
+                        !(Common::GpuProfile::recording_enabled &&
+                          Common::GpuProfile::MethodProfilingEnabled()) &&
+                        method != MAXWELL3D_REG_INDEX(program_region.address_high) &&
+                        method != MAXWELL3D_REG_INDEX(program_region.address_low)) {
+                        const auto control = shadow_state.shadow_ram_control;
+                        if (control == Regs::ShadowRamControl::Replay) {
+                            ProcessDirtyRegistersImpl(method, shadow_state.reg_array[method]);
+                            return;
+                        }
+                        const u32 original = regs.reg_array[method];
+                        const u32 last = base_start[amount - 1];
+                        bool changed = last != original;
+                        if (!changed) {
+                            for (u32 i = 0; i + 1 < amount; ++i) {
+                                if (base_start[i] != original) {
+                                    changed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (changed) {
+                            regs.reg_array[method] = last;
+                            dirty.flags[dirty.tables[0][method]] = true;
+                            dirty.flags[dirty.tables[1][method]] = true;
+                        }
+                        if (control == Regs::ShadowRamControl::Track ||
+                            control == Regs::ShadowRamControl::TrackWithFilter) {
+                            shadow_state.reg_array[method] = last;
+                        }
+                        return;
+                    }
                     for (u32 i = 0; i < amount; ++i) {
                         ProcessDirtyRegisters(method, ProcessShadowRam(method, base_start[i]));
                     }

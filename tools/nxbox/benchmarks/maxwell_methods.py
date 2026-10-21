@@ -29,6 +29,16 @@ parser.add_argument("--frames", type=int, default=3000)
 parser.add_argument("--repeat", type=int, default=5)
 parser.add_argument("--sanitize", action="store_true")
 parser.add_argument("--emit-source", type=Path)
+parser.add_argument(
+    "--breakdown",
+    action="store_true",
+    help="Clock exclusive DMA/Maxwell and method classes (instrumented, not throughput)",
+)
+parser.add_argument(
+    "--ab",
+    action="store_true",
+    help="Alternate repeated-write opt-out/on and verify draw-state traces",
+)
 args = parser.parse_args()
 if args.frames < 1 or args.repeat < 1:
     parser.error("--frames and --repeat must be positive")
@@ -118,7 +128,7 @@ prefix = (
     prefix[: prefix.index("struct Rasterizer {")]
     + """struct Rasterizer {
     std::uint64_t draws{}, checksum{};
-    __attribute__((noinline)) void Draw(bool indexed, u32 instances) { ++draws; checksum += indexed + instances; }
+    __attribute__((noinline)) void Draw(bool indexed, u32 instances);
     void Clear(u32) {} void DrawIndirect() {} void WaitForIdle() {}
     void FragmentBarrier() {} void InvalidateGPUCache() {} void TiledCacheBarrier() {}
 };
@@ -284,10 +294,40 @@ with tempfile.TemporaryDirectory(prefix="nxbox-maxwell-bench-") as directory:
         ],
         check=True,
     )
-    for _ in range(args.repeat):
-        for profile in ("0", "1"):
-            subprocess.run(
-                [str(binary), str(args.frames), profile],
-                check=True,
-                env=dict(os.environ, NXBOX_GPU_METHOD_PROFILE="0"),
+    environments = ("0", "1") if args.ab else (os.environ.get("NXBOX_MAXWELL_REPEAT_WRITES", "1"),)
+    if args.ab:
+        traces = []
+        for enabled in environments:
+            result = subprocess.check_output(
+                [str(binary), "2", "0", "verify"],
+                text=True,
+                env=dict(
+                    os.environ,
+                    NXBOX_GPU_METHOD_PROFILE="0",
+                    NXBOX_D3D12_METHOD_PROFILE="0",
+                    NXBOX_MAXWELL_REPEAT_WRITES=enabled,
+                ),
             )
+            traces.append(result.split("trace=", 1)[1].strip())
+        if traces[0] != traces[1]:
+            raise AssertionError(f"Draw-state traces differ: {traces}")
+        print(f"A/B draw-state trace={traces[0]} OK", flush=True)
+    for iteration in range(args.repeat):
+        for profile in ("0", "1"):
+            for enabled in environments if iteration % 2 == 0 else environments[::-1]:
+                print(f"repeat_writes={enabled} ", end="", flush=True)
+                subprocess.run(
+                    [
+                        str(binary),
+                        str(args.frames),
+                        profile,
+                        *(["breakdown"] if args.breakdown else []),
+                    ],
+                    check=True,
+                    env=dict(
+                        os.environ,
+                        NXBOX_GPU_METHOD_PROFILE="0",
+                        NXBOX_D3D12_METHOD_PROFILE="0",
+                        NXBOX_MAXWELL_REPEAT_WRITES=enabled,
+                    ),
+                )
