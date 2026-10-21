@@ -41,6 +41,7 @@ struct Resource {
 };
 using ResourcePtr = std::shared_ptr<Resource>;
 namespace D3D12::Present {
+void Diagnostic(const char*) {}
 constexpr unsigned FrameSlots = D3D12::Present::MaxFrameSlots;
 constexpr unsigned MaxPasses = 256, FxaaPass = 6, EasuPass = 7;
 enum class Filter { Bilinear, Bicubic, Gaussian, ScaleForce, Area, Fsr };
@@ -74,6 +75,14 @@ struct Pipeline {
         return value;
     }
 };
+struct TemporalUpscaler {
+    template <class T>
+    explicit TemporalUpscaler(T&) {}
+    void Reset() {}
+    ResourcePtr Upscale(const ResourcePtr& source, const ResourcePtr&, unsigned, unsigned) {
+        return source;
+    }
+};
 struct Impl {
     struct Context {
         u64 waited{};
@@ -82,6 +91,10 @@ struct Impl {
         }
     } context;
     bool begun{true};
+    bool temporal_enabled{}, temporal_used{}, temporal_single_layer{true};
+    std::unique_ptr<TemporalUpscaler> temporal;
+    Crop temporal_crop{};
+    unsigned temporal_transform{};
     unsigned cursor{}, frame_index{};
     std::array<std::array<Pipeline, 3>, 6> final{};
     struct Pass {

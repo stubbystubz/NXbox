@@ -53,6 +53,8 @@ public:
     ~Presenter();
     // Two swapchain slots; previous_tick must cover every use of this slot.
     void BeginFrame(unsigned frame_index, u64 previous_tick);
+    void SetCompositeLayerCount(unsigned count);
+    ResourcePtr Motion() const;
     void DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target, D3D12_VIEWPORT viewport,
                    D3D12_RECT scissor, Options options);
     HRESULT Present(IDXGISwapChain3* swapchain, bool vsync, unsigned interval = 1);

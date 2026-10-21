@@ -15,6 +15,7 @@ foreach(width 2 3 4)
 endforeach()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/present.hlsl" PRESENT_HLSL)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/frame_generation.hlsl" FRAME_GENERATION_HLSL)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/temporal_upscaler.hlsl" TEMPORAL_UPSCALER_HLSL)
 set_property(
   DIRECTORY
   APPEND
@@ -22,7 +23,8 @@ set_property(
            "${PROJECT_SOURCE_DIR}/externals/FidelityFX-FSR/ffx-fsr/ffx_a.h"
            "${PROJECT_SOURCE_DIR}/externals/FidelityFX-FSR/ffx-fsr/ffx_fsr1.h"
            "${CMAKE_CURRENT_SOURCE_DIR}/present.hlsl"
-           "${CMAKE_CURRENT_SOURCE_DIR}/frame_generation.hlsl")
+           "${CMAKE_CURRENT_SOURCE_DIR}/frame_generation.hlsl"
+           "${CMAKE_CURRENT_SOURCE_DIR}/temporal_upscaler.hlsl")
 # Keep literal tokens below MSVC's size limit; concatenate at startup.
 set(PRESENT_SOURCE
     "#define A_GPU 1\n#define A_HLSL 1\n${FFX_A_SOURCE}\n#define FSR_EASU_F 1\n#define FSR_RCAS_F 1\n#define FSR_RCAS_PASSTHROUGH_ALPHA 1\n${FFX_FSR_SOURCE}\n${PRESENT_HLSL}"
@@ -40,4 +42,4 @@ configure_file(shader_source.h.in d3d12_present_shader_source.h @ONLY)
 target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_sources(video_core PRIVATE present.cpp present.h present_math.h
                frame_generation.cpp frame_generation.h frame_generation_policy.h
-               frame_pacing_policy.h)
+               frame_pacing_policy.h temporal_upscaler.cpp temporal_upscaler.h)

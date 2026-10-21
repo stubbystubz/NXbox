@@ -24,17 +24,22 @@ inline int Read(const std::filesystem::path& local) {
     }
     return backend;
 }
-inline bool ReadFrameGeneration(const std::filesystem::path& local) {
+inline unsigned ReadFrameGenerationMode(const std::filesystem::path& local) {
     std::ifstream in(local / "eden_settings.txt");
-    bool enabled = false;
+    unsigned enabled = 0;
     for (std::string line; std::getline(in, line);) {
         const auto entry = TitleSettings::ParseLine(line);
-        if (entry && entry->label == "frame_generation")
-            enabled = entry->value == "1";
+        if (entry && (entry->label == "frame_generation" || entry->label == "frame_gen"))
+            enabled = entry->value == "4" || entry->value == "4x"                          ? 4
+                      : entry->value == "1" || entry->value == "2" || entry->value == "2x" ? 2
+                                                                                           : 0;
     }
     return enabled;
 }
-inline bool SaveFrameGeneration(const std::filesystem::path& local, bool enabled) {
+inline bool ReadFrameGeneration(const std::filesystem::path& local) {
+    return ReadFrameGenerationMode(local) != 0;
+}
+inline bool SaveFrameGenerationMode(const std::filesystem::path& local, unsigned mode) {
     const auto file = local / "eden_settings.txt";
     std::error_code error;
     const bool exists = std::filesystem::exists(file, error);
@@ -46,16 +51,19 @@ inline bool SaveFrameGeneration(const std::filesystem::path& local, bool enabled
     std::string content;
     for (std::string line; std::getline(in, line);) {
         const auto entry = TitleSettings::ParseLine(line);
-        if (!entry || entry->label != "frame_generation")
+        if (!entry || (entry->label != "frame_generation" && entry->label != "frame_gen"))
             content += line + '\n';
     }
     if (in.bad())
         return false;
     in.close();
     std::ofstream out(file, std::ios::trunc);
-    out << content << "frame_generation=" << (enabled ? 1 : 0) << '\n';
+    out << content << "frame_generation=" << (mode == 4 ? 4 : mode ? 1 : 0) << '\n';
     out.close();
     return !out.fail();
+}
+inline bool SaveFrameGeneration(const std::filesystem::path& local, bool enabled) {
+    return SaveFrameGenerationMode(local, enabled ? 2 : 0);
 }
 inline bool ReadFramePacing(const std::filesystem::path& local) {
     std::ifstream in(local / "eden_settings.txt");
@@ -156,17 +164,24 @@ inline bool SaveAsyncShaders(const std::filesystem::path& local, bool enabled) {
     out.close();
     return !out.fail();
 }
-inline bool ReadFsr(const std::filesystem::path& local) {
+inline std::string ReadUpscaler(const std::filesystem::path& local) {
     std::ifstream in(local / "eden_settings.txt");
-    bool enabled = true;
+    std::string enabled = "fsr1";
     for (std::string line; std::getline(in, line);) {
         const auto entry = TitleSettings::ParseLine(line);
         if (entry && entry->label == "upscaler")
-            enabled = entry->value != "bilinear";
+            enabled = entry->value == "temporal"   ? "temporal"
+                      : entry->value == "bilinear" ? "bilinear"
+                                                   : "fsr1";
     }
     return enabled;
 }
-inline bool SaveFsr(const std::filesystem::path& local, bool enabled) {
+inline bool ReadFsr(const std::filesystem::path& local) {
+    return ReadUpscaler(local) != "bilinear";
+}
+inline bool SaveUpscaler(const std::filesystem::path& local, std::string_view mode) {
+    if (mode != "bilinear" && mode != "fsr1" && mode != "temporal")
+        return false;
     const auto file = local / "eden_settings.txt";
     std::error_code error;
     const bool exists = std::filesystem::exists(file, error);
@@ -185,9 +200,12 @@ inline bool SaveFsr(const std::filesystem::path& local, bool enabled) {
         return false;
     in.close();
     std::ofstream out(file, std::ios::trunc);
-    out << content << "upscaler=" << (enabled ? "fsr1" : "bilinear") << '\n';
+    out << content << "upscaler=" << mode << '\n';
     out.close();
     return !out.fail();
+}
+inline bool SaveFsr(const std::filesystem::path& local, bool enabled) {
+    return SaveUpscaler(local, enabled ? "fsr1" : "bilinear");
 }
 // Invalid text keeps the default; numeric values are clamped to the supported range.
 inline int ParseMaxPlayers(const std::string& text) {

@@ -13,6 +13,7 @@
 #include "video_core/renderer_d3d12/d3d12_present/fps_bitmap.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/temporal_upscaler.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
 namespace D3D12::Present {
@@ -47,13 +48,25 @@ struct Presenter::Impl {
     // Final passes use RGBA8 with each layer blend; preprocessing uses float RGBA.
     std::array<std::array<ComPtr<ID3D12PipelineState>, 3>, 6> final;
     std::array<ComPtr<ID3D12PipelineState>, PassCount> intermediate;
-    std::array<std::array<ResourcePtr, 2>, FrameSlots> scratch;
-    std::array<std::array<Extent, 2>, FrameSlots> scratch_extent{};
+    std::array<std::array<ResourcePtr, 3>, FrameSlots> scratch;
+    std::array<std::array<Extent, 3>, FrameSlots> scratch_extent{};
     unsigned frame_index{};
     unsigned srv_stride{}, rtv_stride{}, cursor{};
     bool begun{};
+    bool temporal_enabled{}, temporal_used{}, temporal_single_layer{true};
+    std::unique_ptr<TemporalUpscaler> temporal;
+    Crop temporal_crop{};
+    unsigned temporal_transform{};
 
     explicit Impl(Context& context_) : context{context_} {
+        char preference[16]{}, override_value[16]{};
+        GetEnvironmentVariableA("NXBOX_UPSCALER_SETTING", preference, sizeof(preference));
+        GetEnvironmentVariableA("NXBOX_TEMPORAL", override_value, sizeof(override_value));
+        temporal_enabled = std::string_view(preference) == "temporal";
+        if (std::string_view(override_value) == "0")
+            temporal_enabled = false;
+        if (std::string_view(override_value) == "1")
+            temporal_enabled = true;
         D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_0};
         Check(context.Device()->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model,
                                                     sizeof(model)),
@@ -225,12 +238,25 @@ Presenter::~Presenter() {
         LOG_ERROR(Render, "D3D12 presentation teardown: {}", error.what());
     }
 }
+void Presenter::SetCompositeLayerCount(unsigned count) {
+    impl->temporal_single_layer = count == 1;
+}
+ResourcePtr Presenter::Motion() const {
+    if (!impl->temporal_used || !impl->temporal_single_layer || !impl->temporal ||
+        impl->temporal_transform || impl->temporal_crop.left != 0 || impl->temporal_crop.top != 0 ||
+        impl->temporal_crop.right != 1 || impl->temporal_crop.bottom != 1)
+        return {};
+    return impl->temporal->Motion();
+}
 void Presenter::BeginFrame(unsigned frame_index, u64 previous_tick) {
     if (frame_index >= FrameSlots)
         throw std::invalid_argument("Invalid presentation frame slot");
     impl->context.WaitSubmitted(previous_tick, "present upscale");
     impl->frame_index = frame_index;
     impl->cursor = frame_index * MaxPasses;
+    if (!impl->temporal_used && impl->temporal)
+        impl->temporal->Reset();
+    impl->temporal_used = false;
     impl->begun = true;
 }
 void Presenter::DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target,
@@ -270,7 +296,8 @@ void Presenter::DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target
         layer.guest_extent);
     const bool upscale =
         options.filter == Filter::Fsr && NeedsUpscale(extent, output, crop, layer.transform);
-    const unsigned needed = 1 + unsigned(options.fxaa) + (upscale ? 1 : 0);
+    const unsigned needed = 1 + unsigned(options.fxaa) + (upscale ? 1 : 0) +
+                            unsigned(upscale && impl->temporal_enabled);
     if (needed > (impl->frame_index + 1) * MaxPasses - impl->cursor)
         throw std::runtime_error("Presentation descriptor capacity exceeded");
     Constants constants{{},
@@ -291,10 +318,47 @@ void Presenter::DrawLayer(const Layer& layer, D3D12_CPU_DESCRIPTOR_HANDLE target
         // Rotation is applied only in the final composition; upscale in source axes.
         const Extent fsr_extent =
             (layer.transform & 4) ? Extent{output.height, output.width} : output;
-        source =
-            Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentEasu, [&] {
-                return impl->Preprocess(EasuPass, 1, source, view, fsr_extent, constants);
-            });
+        ResourcePtr accumulated;
+        // The first opaque layer is the compositor base. Keep overlays spatial;
+        // they must not accumulate unrelated per-layer history or multiply memory.
+        if (impl->temporal_enabled && impl->temporal_single_layer && !impl->temporal_used &&
+            blend == 0 && !layer.transform && crop.left == 0 && crop.top == 0 && crop.right == 1 &&
+            crop.bottom == 1) {
+            try {
+                impl->temporal_used = true;
+                if (impl->temporal_crop.left != crop.left || impl->temporal_crop.top != crop.top ||
+                    impl->temporal_crop.right != crop.right ||
+                    impl->temporal_crop.bottom != crop.bottom ||
+                    impl->temporal_transform != layer.transform)
+                    if (impl->temporal)
+                        impl->temporal->Reset();
+                impl->temporal_crop = crop;
+                impl->temporal_transform = layer.transform;
+                if (!impl->temporal)
+                    impl->temporal = std::make_unique<TemporalUpscaler>(impl->context);
+                const Extent native_extent{
+                    std::max(1u, static_cast<unsigned>(
+                                     std::ceil(extent.width * (crop.right - crop.left)))),
+                    std::max(1u, static_cast<unsigned>(
+                                     std::ceil(extent.height * (crop.bottom - crop.top))))};
+                const auto native = impl->Preprocess(0, 2, source, view, native_extent, constants);
+                const auto spatial =
+                    impl->Preprocess(EasuPass, 1, source, view, fsr_extent, constants);
+                accumulated =
+                    impl->temporal->Upscale(native, spatial, fsr_extent.width, fsr_extent.height);
+                if (!accumulated)
+                    accumulated = spatial;
+            } catch (...) {
+                impl->temporal_enabled = false;
+                Diagnostic("D3D12 temporal upscaler disabled for session: preparation failed");
+            }
+        }
+        source = accumulated ? accumulated
+                             : Common::MaxwellMethodProfile::Measure(
+                                   Common::MaxwellMethodProfile::PresentEasu, [&] {
+                                       return impl->Preprocess(EasuPass, 1, source, view,
+                                                               fsr_extent, constants);
+                                   });
         view = View(fsr_extent);
         constants.crop = {};
         constants.source_width = float(fsr_extent.width);

@@ -97,6 +97,10 @@ if(Python3_Interpreter_FOUND AND HLSL_DXC_EXECUTABLE)
     COMMAND ${CMAKE_COMMAND} -E env "DXC=${HLSL_DXC_EXECUTABLE}"
       ${Python3_EXECUTABLE} -B -m unittest discover
       -s ${CMAKE_CURRENT_SOURCE_DIR} -p test_d3d12_fsr.py -k test_hlsl_dxc)
+  add_test(NAME d3d12-temporal-frame-generation-dxc
+    COMMAND ${CMAKE_COMMAND} -E env "DXC=${HLSL_DXC_EXECUTABLE}"
+      ${Python3_EXECUTABLE} -B -m unittest discover
+      -s ${CMAKE_CURRENT_SOURCE_DIR} -p test_p59_upscaling.py -k test_shader_entries)
 endif()
 if(TARGET hlsl-ir-tests AND HLSL_DXC_EXECUTABLE)
   foreach(fixture vertex fragment compute waves resources arithmetic msaa msaa_array msaa_depth msaa_array_depth clip intsample intsample_array global global_windows)

@@ -55,6 +55,12 @@ inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
      3},
     {Text::SettingsAbout, {Setting::Version, Setting::Credits}, 2},
 }};
+inline constexpr std::array<unsigned, 3> kFrameGenerationModes{0, 2, 4};
+inline constexpr std::array<Text, 3> kFrameGenerationChoices{
+    Text::FrameGenerationOff, Text::FrameGeneration2x, Text::FrameGeneration4x};
+inline constexpr std::array<Text, 3> kUpscalerChoices{Text::UpscalerBilinear, Text::UpscalerFsr,
+                                                      Text::UpscalerTemporal};
+inline constexpr std::array<const char*, 3> kUpscalerModes{"bilinear", "fsr1", "temporal"};
 // Keep seven full-height settings rows visible as focus moves through larger categories.
 inline constexpr int SettingsFirstVisibleRow(int selected) {
     return selected > 6 ? selected - 6 : 0;

@@ -426,10 +426,14 @@
 
     {Text::UpscalerTitle, L"Upscaler"}, {Text::UpscalerBilinear, L"Bilinear"},
     {Text::UpscalerFsr, L"FSR 1"},
+    {Text::UpscalerTemporal, L"Temporal (experimental)"},
     {Text::UpscalerHint, L"DirectX 12 upscaling for smaller frames. Applies on next launch."},
 
     {Text::FramePacingTitle, L"Steady frame pacing"},
     {Text::FramePacingHint, L"Spaces frames evenly when the game runs below 60 fps. Smoother motion without changing performance."},
+    {Text::FrameGenerationOff, L"Off"},
+    {Text::FrameGeneration2x, L"2x"},
+    {Text::FrameGeneration4x, L"4x"},
     {Text::FrameGenerationTitle, L"Frame generation"},
     {Text::FrameGenerationHint, L"Creates intermediate frames for smoother motion. May cause small "
                                 L"image artifacts and add input delay."},
