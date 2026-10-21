@@ -11,6 +11,12 @@ inline std::atomic<bool> enabled{false};
 inline std::atomic<bool> forced{false};
 inline std::atomic<std::uint64_t> generation{0};
 inline std::atomic<std::uint64_t> guest_presents{0};
+inline std::atomic<std::uint64_t> displayed_presents{0};
+inline std::atomic<bool> frame_generation{false};
+inline void Presented() {
+    if (enabled.load(std::memory_order_relaxed))
+        displayed_presents.fetch_add(1, std::memory_order_relaxed);
+}
 inline bool EnvironmentForces(const char* value) {
     return value && std::string_view(value) == "1";
 }

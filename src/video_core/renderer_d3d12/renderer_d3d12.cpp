@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <stdexcept>
 #include <dxgi1_4.h>
@@ -18,6 +19,8 @@
 #include "eden_uwp/renderer_boundary.h"
 #include "eden_uwp/thread_profile.h"
 #include "video_core/capture.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 #include "video_core/renderer_d3d12/d3d12_resolution.h"
@@ -63,6 +66,11 @@ struct RendererD3D12::Impl {
     ComPtr<IDXGISwapChain3> swapchain;
     std::unique_ptr<Present::Presenter> upscaler;
     std::unique_ptr<Present::FpsCounter> fps_counter;
+    std::unique_ptr<Present::FrameGenerator> frame_generator;
+    bool frame_generation_enabled{};
+    bool frame_generation_failed{};
+    Present::FrameGenerationCadence frame_generation_cadence;
+    std::chrono::steady_clock::time_point previous_game_frame{};
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> root;
@@ -180,6 +188,15 @@ struct RendererD3D12::Impl {
         GetEnvironmentVariableA("NXBOX_SHOW_FPS", show_fps, sizeof(show_fps));
         if (Common::FpsOverlay::EnvironmentForces(show_fps))
             Common::FpsOverlay::Initialize(true, show_fps);
+        char frame_gen[16]{}, frame_gen_setting[16]{};
+        if (GetEnvironmentVariableA("NXBOX_FRAME_GEN", frame_gen, sizeof(frame_gen)) != 1)
+            frame_gen[0] = 0;
+        if (GetEnvironmentVariableA("NXBOX_FRAME_GEN_SETTING", frame_gen_setting,
+                                    sizeof(frame_gen_setting)) != 1)
+            frame_gen_setting[0] = 0;
+        frame_generation_enabled =
+            Present::FrameGenerationEnabled(std::string_view(frame_gen_setting) == "1", frame_gen);
+        Common::FpsOverlay::frame_generation.store(frame_generation_enabled);
         const auto& info = window.GetWindowInfo();
         if (info.type != Core::Frontend::WindowSystemType::Windows || !info.render_surface) {
 #ifdef NXBOX_UWP
@@ -435,8 +452,41 @@ struct RendererD3D12::Impl {
             height = new_height;
             AcquireBuffers();
         }
-        const UINT index = swapchain->GetCurrentBackBufferIndex();
+        UINT index = swapchain->GetCurrentBackBufferIndex();
         Draw(layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
+        if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds =
+                previous_game_frame.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double>(now - previous_game_frame).count();
+            previous_game_frame = now;
+            ResourcePtr generated;
+            try {
+                if (!frame_generator)
+                    frame_generator = std::make_unique<Present::FrameGenerator>(context);
+                unsigned source_width = 0, source_height = 0;
+                for (const auto& layer : layers) {
+                    const bool rotated = (static_cast<unsigned>(layer.transform_flags) & 4) != 0;
+                    source_width = std::max(source_width, rotated ? layer.height : layer.width);
+                    source_height = std::max(source_height, rotated ? layer.width : layer.height);
+                }
+                frame_generator->SetSourceExtent(source_width, source_height);
+                generated = frame_generator->Generate(buffers[index],
+                                                      frame_generation_cadence.Observe(seconds));
+            } catch (const std::exception&) {
+                frame_generation_failed = true;
+                Diagnostic("D3D12 frame generation disabled for session: initialization failed");
+            } catch (...) {
+                frame_generation_failed = true;
+                Diagnostic(
+                    "D3D12 frame generation disabled for session: unknown initialization failure");
+            }
+            frame_generation_cadence.Completed(bool(generated));
+            if (generated)
+                PresentGenerated(generated, rasterizer, index);
+            context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET);
+        }
         // Only the display target receives host diagnostics; Capture() never reaches this path.
         if (!layers.empty()) {
             Common::FpsOverlay::DrawIfEnabled([&] {
@@ -468,9 +518,31 @@ struct RendererD3D12::Impl {
         }
         context.LogInfoQueue();
         Check(status, "Present", context.Device());
+        if (frame_generation_enabled)
+            Common::FpsOverlay::Presented();
         Check(context.Device()->GetDeviceRemovedReason(), "after Present", context.Device());
         if (log_present)
             Diagnostic("D3D12 Present complete");
+    }
+    void PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
+        // The complete real image is safe in Current(), before touching the swapchain.
+        const auto copy = [&](const ResourcePtr& destination, const ResourcePtr& source) {
+            context.Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            context.Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST);
+            context.Retain(source);
+            context.Retain(destination);
+            context.Commands()->CopyResource(destination->handle.Get(), source->handle.Get());
+        };
+        copy(buffers[index], generated);
+        context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
+        present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
+        rasterizer.NotifyFencesSubmitted();
+        context.Acknowledge(present_ticks[index]);
+        Check(swapchain->Present(1, 0), "Present generated frame", context.Device());
+        Common::FpsOverlay::Presented();
+        index = swapchain->GetCurrentBackBufferIndex();
+        context.WaitSubmitted(present_ticks[index], "frame generation real frame");
+        copy(buffers[index], frame_generator->Current());
     }
 };
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& window,

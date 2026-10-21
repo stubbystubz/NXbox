@@ -447,3 +447,8 @@
     {Text::UpscalerFsr, L"FSR 1"},
     {Text::UpscalerHint,
      L"Ampliação no DirectX 12 para quadros menores. Vale na próxima execução."},
+
+    {Text::FrameGenerationTitle, L"Geração de quadros"},
+    {Text::FrameGenerationHint,
+     L"Cria quadros intermediários para ficar mais fluido. Pode causar pequenos defeitos na imagem "
+     L"e um pouco mais de atraso nos comandos."},
