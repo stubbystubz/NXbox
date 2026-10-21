@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <optional>
@@ -16,6 +17,14 @@
 #include <vector>
 
 namespace D3D12 {
+inline bool RecordPacketReservationEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_RECORD_PACKET_RESERVE");
+        return !value || value[0] != '0' || value[1] != '\0';
+    }();
+    return enabled;
+}
+
 // One producer and one consumer. Only chunk boundaries synchronize; neither a command
 // nor its variable payload needs to fit in one chunk. Published bytes are immutable.
 template <size_t ChunkSize = 256 * 1024, size_t ChunkCount = 32>
@@ -30,8 +39,9 @@ public:
     };
     // More room absorbs bursts of short submissions while the native recorder catches up.
     // The bound still applies to payloads and COM holds; a slow consumer backpressures safely.
-    explicit RecordStream(size_t capacity = ChunkCount, bool direct = true)
-        : active_chunks{capacity}, direct_replay{direct} {
+    explicit RecordStream(size_t capacity = ChunkCount, bool direct = true,
+                          bool reserve = RecordPacketReservationEnabled())
+        : active_chunks{capacity}, reserve_packets{reserve}, direct_replay{direct} {
         if (capacity < 2 || capacity > ChunkCount)
             throw std::invalid_argument("invalid D3D12 recording capacity");
         chunks = std::make_unique<Chunk[]>(capacity);
@@ -155,22 +165,18 @@ public:
         else
             RepeatPacket<Command, 1>(command);
     }
+    // Reserve only an unpublished, contiguous packet. Leave exact-boundary and split
+    // packets to Write, which owns publication and backpressure. Routing must happen
+    // before touching this queue's repeat state or cursor.
+    template <class Command>
+    std::byte* TryBegin(size_t extra = 0) {
+        if (destination)
+            return destination->template TryBegin<Command>(extra);
+        return ReservePacket(MakeHeader<Command>(extra));
+    }
     template <class Command>
     void Begin(size_t extra = 0) {
-        const Header header{[](void* target, const std::byte* data, bool execute) {
-                                Command command;
-                                std::memcpy(&command, data, sizeof(command));
-                                // Even failed/abandoned recordings release all encoded COM holds.
-                                try {
-                                    if (execute)
-                                        command.Replay(target, data);
-                                } catch (...) {
-                                    command.Release(data);
-                                    throw;
-                                }
-                                command.Release(data);
-                            },
-                            sizeof(Command) + extra};
+        const auto header = MakeHeader<Command>(extra);
         Write(&header, sizeof(header));
     }
     template <class Wait>
@@ -185,6 +191,38 @@ public:
     bool metrics{};
     uint64_t waits{}, wait_ns{}; // Producer only; sampled by the producer's frame profile.
 private:
+    std::byte* ReservePacket(const Header& header) {
+        if (!reserve_packets)
+            return nullptr;
+        if (header.size > ChunkSize - write_offset ||
+            sizeof(Header) >= ChunkSize - write_offset - header.size)
+            return nullptr;
+        auto& chunk = chunks[write_index];
+        if (!write_offset && chunk.used.load(std::memory_order_acquire))
+            return nullptr;
+        repeat_replay = nullptr;
+        auto* packet = chunk.data.data() + write_offset;
+        std::memcpy(packet, &header, sizeof(header));
+        write_offset += sizeof(Header) + header.size;
+        return packet + sizeof(Header);
+    }
+    template <class Command>
+    static Header MakeHeader(size_t extra) {
+        return {[](void* target, const std::byte* data, bool execute) {
+                    Command command;
+                    std::memcpy(&command, data, sizeof(command));
+                    // Even failed/abandoned recordings release all encoded COM holds.
+                    try {
+                        if (execute)
+                            command.Replay(target, data);
+                    } catch (...) {
+                        command.Release(data);
+                        throw;
+                    }
+                    command.Release(data);
+                },
+                sizeof(Command) + extra};
+    }
     // Keep compact packets and the packets following them aligned for direct
     // replay. The legacy format remains available with DIRECT_REPLAY=0.
     template <class Command, size_t Alignment>
@@ -224,6 +262,15 @@ private:
         const auto start = write_offset;
         const Header header{replay, prefix + stride};
         const uint32_t count = 1;
+        if (auto* payload = ReservePacket(header)) {
+            std::memcpy(payload, &count, sizeof(count));
+            std::memcpy(payload + sizeof(count), padding, prefix - sizeof(count));
+            std::memcpy(payload + prefix, &command, sizeof(command));
+            std::memcpy(payload + prefix + sizeof(command), padding, stride - sizeof(command));
+            repeat_offset = start;
+            repeat_replay = replay;
+            return;
+        }
         // Write handles tiny chunks and backpressure, including split packets.
         Write(&header, sizeof(header));
         Write(&count, sizeof(count));
@@ -296,6 +343,7 @@ private:
     std::unique_ptr<Chunk[]> chunks;
     const size_t active_chunks;
     size_t write_index{}, write_offset{}, read_index{}, read_offset{}, read_limit{};
+    bool reserve_packets{}; // Producer only; latched before recording starts.
     bool direct_replay{};   // Latched before the recorder starts.
     Replay repeat_replay{}; // Producer only; points only into the unpublished tail.
     size_t repeat_offset{};

@@ -48,6 +48,16 @@
 #include "video_core/transform_feedback.h"
 
 namespace D3D12 {
+bool PipelineKeyFastpathEnabled() noexcept {
+    static const bool enabled = [] {
+        char value[2]{};
+        return !(GetEnvironmentVariableA("NXBOX_D3D12_PIPELINE_KEY_FASTPATH", value,
+                                         sizeof(value)) == 1 &&
+                 value[0] == '0');
+    }();
+    return enabled;
+}
+
 namespace {
 bool PipelineLookupFastpathEnabled() {
     static const bool enabled = [] {
@@ -1437,7 +1447,15 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
     }
     Pso::GraphicsPsoState state;
     Pso::TopologyInfo topology{};
-    GraphicsPipelineKey request{};
+    // FillGraphicsState clears every state byte, and compute_request assigns all hashes.
+    // A cached request can be read in place; keep rebuilding separate for verification
+    // and never mutate the cached request during shader-specific vertex-read lowering.
+    const bool fast_key = PipelineKeyFastpathEnabled();
+    GraphicsPipelineKey rebuilt_request;
+    if (!fast_key)
+        rebuilt_request = {};
+    GraphicsPipelineKey& request =
+        fast_key && reuse && !StateVerifyEnabled() ? cached_graphics_request : rebuilt_request;
     const auto compute_request = [&]() -> bool {
         if (const auto* reason = UnsupportedState(
                 maxwell3d->regs, static_cast<u32>(maxwell3d->draw_manager.draw_state.topology))) {
@@ -1578,7 +1596,8 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
         cached_topology = topology;
         graphics_state_inputs.Store(inputs);
     } else {
-        request = cached_graphics_request;
+        if (&request != &cached_graphics_request)
+            request = cached_graphics_request;
         topology = cached_topology;
         state = request.state;
     }

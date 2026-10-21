@@ -51,9 +51,14 @@ struct GraphicsPipelineKey {
 };
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+bool PipelineKeyFastpathEnabled() noexcept;
+
 struct GraphicsPipelineKeyHash {
+    // Both switches are latched for the process lifetime. Snapshot once per hash table,
+    // rather than calling the switch accessors on every lookup and bucket rehash.
+    bool fast{StateFastpathEnabled() && PipelineKeyFastpathEnabled()};
     size_t operator()(const GraphicsPipelineKey& key) const noexcept {
-        if (!StateFastpathEnabled())
+        if (!fast)
             return static_cast<size_t>(Pso::HashBytes(&key, sizeof(key)));
         return static_cast<size_t>(
             Common::CityHash64(reinterpret_cast<const char*>(&key), sizeof(key)));
