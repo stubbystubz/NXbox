@@ -183,7 +183,7 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
 // Dynarmic's generated-code fallback is separate: x64 uses SEH/unwind tables.
 namespace {
 void* g_section_owner{};
-bool (*g_section_fault)(void*, size_t, size_t){};
+bool (*g_section_fault)(void*, size_t, size_t, size_t){};
 std::atomic<u8*> g_backing_base{nullptr};
 std::atomic<size_t> g_backing_size{0};
 PFN_VirtualAllocFromApp g_pfn_virtual_alloc_from_app{nullptr};
@@ -225,7 +225,8 @@ LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
     }
     if (g_section_fault) {
         return g_section_fault(g_section_owner, ep->ExceptionRecord->ExceptionInformation[1],
-                               ep->ExceptionRecord->ExceptionInformation[0])
+                               ep->ExceptionRecord->ExceptionInformation[0],
+                               reinterpret_cast<size_t>(ep->ExceptionRecord->ExceptionAddress))
                    ? EXCEPTION_CONTINUE_EXECUTION
                    : EXCEPTION_CONTINUE_SEARCH;
     }
@@ -555,6 +556,8 @@ class HostMemory::Impl {
     struct Region {
         HANDLE handle{};
         std::set<size_t> aliases;
+        bool private_backing{};
+        std::atomic<bool> backed{false};
     };
 
 public:
@@ -590,8 +593,8 @@ public:
             }
             if (ready) {
                 g_section_owner = this;
-                g_section_fault = [](void* owner, size_t address, size_t access) {
-                    return static_cast<Impl*>(owner)->Fault(address, access);
+                g_section_fault = [](void* owner, size_t address, size_t access, size_t pc) {
+                    return static_cast<Impl*>(owner)->Fault(address, access, pc);
                 };
                 bool faults_ready{};
                 try {
@@ -600,6 +603,8 @@ public:
                     faults_ready = false;
                 }
                 if (faults_ready) {
+                    probing_faults = false;
+                    fastmem_enabled.store(true, std::memory_order_release);
                     LOG_INFO(HW_Memory,
                              "NXBOX MEMORY mode=fastmem backing=regional_sections "
                              "region_kib=64 arena_gib={} committed_mib=0 probe=passed veh=ready "
@@ -722,6 +727,8 @@ public:
                 if (failed != mappings.begin())
                     (--failed)->second.fault_disabled = true;
                 ++alias_failures;
+                DisableFastmem("alias_protect_failed",
+                               reinterpret_cast<size_t>(virtual_base + begin));
             }
             it = mappings.lower_bound(end);
         }
@@ -743,7 +750,7 @@ public:
             const size_t count = (std::min)(length, RegionLength(index) - offset % RegionSize);
             if (value == 0 && offset % RegionSize == 0 && count == RegionLength(index)) {
                 DropRegion(index);
-            } else if (regions[index].handle || value != 0) {
+            } else if (regions[index].handle || regions[index].private_backing || value != 0) {
                 if (!EnsureRegion(index))
                     throw std::bad_alloc{};
                 std::memset(backing_base + offset, value, count);
@@ -764,12 +771,40 @@ public:
     void EnableDirectMappedAddress() {
         UNREACHABLE();
     }
+    bool PrepareBackingPage(const u8* pointer) {
+        if (!virtual_base)
+            return true; // Private backing retains the demand-commit VEH.
+        const size_t offset =
+            reinterpret_cast<size_t>(pointer) - reinterpret_cast<size_t>(backing_base);
+        if (offset >= backing_size)
+            return true; // Debug/rasterizer pointers may belong to another allocation.
+        const size_t index = offset / RegionSize;
+        if (regions[index].backed.load(std::memory_order_acquire))
+            return true;
+        std::scoped_lock lock{mutex};
+        if (EnsureRegion(index))
+            return true;
+        DisableFastmem("native_backing_unavailable", reinterpret_cast<size_t>(pointer));
+        return false;
+    }
+    std::atomic<bool> fastmem_enabled{false};
     const size_t backing_size;
     const size_t virtual_size;
     u8* backing_base{};
     u8* virtual_base{};
 
 private:
+    void DisableFastmem(const char* reason, size_t address, size_t pc = 0, size_t access = 0) {
+        if (fastmem_enabled.exchange(false, std::memory_order_acq_rel)) {
+            LOG_WARNING(HW_Memory,
+                        "NXBOX MEMORY fallback=page_table scope=new_emission fastmem=disabled "
+                        "reason={} target={} pc={} access={} "
+                        "backing_base={} arena_base={} error={} existing_aliases=retained",
+                        reason, reinterpret_cast<void*>(address), reinterpret_cast<void*>(pc),
+                        access, static_cast<void*>(backing_base), static_cast<void*>(virtual_base),
+                        GetLastError());
+        }
+    }
     bool InstallHandler() {
         probe_stage = "veh_install_failed";
         g_backing_committed.store(0, std::memory_order_relaxed);
@@ -890,16 +925,20 @@ private:
         return true;
     }
 
-    bool EnsureRegion(size_t index) {
+    bool EnsureRegion(size_t index, size_t pc = 0, size_t address = 0, size_t access = 0) {
         auto& region = regions[index];
-        if (region.handle)
+        if (region.handle || region.private_backing) {
+            region.backed.store(true, std::memory_order_release);
             return true;
+        }
         probe_stage = "create_section_failed";
         HANDLE handle = create_section(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_COMMIT,
                                        RegionLength(index), nullptr);
-        if (!handle)
-            return ApiFailure("CreateFileMappingFromApp", nullptr, RegionLength(index),
-                              PAGE_READWRITE | SEC_COMMIT);
+        if (!handle) {
+            ApiFailure("CreateFileMappingFromApp", nullptr, RegionLength(index),
+                       PAGE_READWRITE | SEC_COMMIT);
+            return TryPrivateRegion(index, pc, address, access);
+        }
         probe_stage = "map_backing_failed";
         void* view =
             map_view(handle, process, backing_base + index * RegionSize, 0, RegionLength(index),
@@ -908,14 +947,35 @@ private:
             ApiFailure("MapViewOfFile3FromApp", backing_base + index * RegionSize,
                        RegionLength(index), PAGE_READWRITE);
             CloseHandle(handle);
-            return false;
+            return TryPrivateRegion(index, pc, address, access);
         }
         region.handle = handle;
         g_backing_committed.fetch_add(RegionLength(index), std::memory_order_relaxed);
+        region.backed.store(true, std::memory_order_release);
         return true;
     }
 
-    bool Fault(size_t address, size_t access) {
+    bool TryPrivateRegion(size_t index, size_t pc, size_t address, size_t access) {
+        // No section/view was published for this fresh region, so no guest data
+        // can be lost. Preserve its address: canonical/JIT pointers remain valid.
+        // Never hide a failed startup probe with this runtime-only recovery.
+        if (probing_faults)
+            return false;
+        auto* base = backing_base + index * RegionSize;
+        const bool ready = reserve(process, base, RegionLength(index),
+                                   MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                                   PAGE_READWRITE, nullptr, 0) == base;
+        DisableFastmem(ready ? "private_backing_recovery" : "private_backing_failed",
+                       address ? address : reinterpret_cast<size_t>(base), pc, access);
+        if (!ready)
+            return ApiFailure("VirtualAlloc2FromApp", base, RegionLength(index), PAGE_READWRITE);
+        regions[index].private_backing = true;
+        g_backing_committed.fetch_add(RegionLength(index), std::memory_order_relaxed);
+        regions[index].backed.store(true, std::memory_order_release);
+        return true;
+    }
+
+    bool Fault(size_t address, size_t access, size_t pc) {
         if (access != 0 && access != 1)
             return false;
         std::scoped_lock lock{mutex};
@@ -925,7 +985,44 @@ private:
             // Another core may have satisfied the same fault while we waited for the lock.
             // The linear backing is always RW; only read/write faults within it are claimed.
             ++backing_faults;
-            return EnsureRegion(index);
+            MEMORY_BASIC_INFORMATION info{};
+            const bool queried =
+                VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info));
+            bool ready{};
+            if ((regions[index].handle || regions[index].private_backing) &&
+                (!queried || info.State != MEM_COMMIT || info.Protect != PAGE_READWRITE)) {
+                regions[index].backed.store(false, std::memory_order_release);
+                // A retained section also preserves bytes if its backing view was
+                // lost. Remap it into the placeholder; never replace existing data
+                // with a fresh private allocation.
+                DWORD old{};
+                if (queried && info.State == MEM_COMMIT) {
+                    ready = protect(backing_base + index * RegionSize, RegionLength(index),
+                                    PAGE_READWRITE, &old);
+                } else if (queried && info.State == MEM_RESERVE && regions[index].handle) {
+                    auto* base = backing_base + index * RegionSize;
+                    ready = map_view(regions[index].handle, process, base, 0, RegionLength(index),
+                                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == base;
+                }
+                DisableFastmem(ready ? "backing_view_restored" : "backing_state_invalid", address,
+                               pc, access);
+                regions[index].backed.store(ready, std::memory_order_release);
+            } else {
+                ready = EnsureRegion(index, pc, address, access);
+            }
+            // Report the first post-probe native backing fault, including the actual
+            // VM state before resolution. First-chance records alone lack disposition.
+            if (!probing_faults && (!reported_backing_fault || !ready)) {
+                reported_backing_fault = true;
+                LOG_WARNING(HW_Memory,
+                            "NXBOX MEMORY fault region=backing pc={} target={} access={} "
+                            "offset={:#x} state={:#x} protection={:#x} resolved={}",
+                            reinterpret_cast<void*>(pc), reinterpret_cast<void*>(address), access,
+                            backing_offset, info.State, info.Protect, ready);
+            }
+            if (!ready)
+                DisableFastmem("backing_map_failed", address, pc, access);
+            return ready;
         }
         const size_t offset = address - reinterpret_cast<size_t>(virtual_base);
         if (offset >= virtual_size)
@@ -939,17 +1036,30 @@ private:
         // A protection fault is redirected to a native callback by Dynarmic. That
         // callback accesses linear backing, not this alias. Materialize it before
         // handing off, so the fallback does not immediately take a second AV.
-        if (!EnsureRegion(mapping.host / RegionSize)) {
+        if (!EnsureRegion(mapping.host / RegionSize, pc, address, access)) {
+            DisableFastmem("alias_backing_failed", address, pc, access);
             mapping.fault_disabled = true;
             ++alias_failures;
             return false;
         }
         const DWORD flags = mapping.protection;
+        if (regions[mapping.host / RegionSize].private_backing)
+            return false; // Private recovery cannot be aliased; use the canonical pointer.
         if (mapping.fault_disabled || flags == PAGE_NOACCESS ||
             (access == 1 && flags != PAGE_READWRITE))
             return false;
-        if (mapping.mapped)
-            return true; // Concurrent fault already satisfied.
+        if (!fastmem_enabled.load(std::memory_order_acquire) && !probing_faults)
+            return false;
+        if (mapping.mapped) {
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) &&
+                info.State == MEM_COMMIT &&
+                (info.Protect == PAGE_READWRITE || (access == 0 && info.Protect == PAGE_READONLY)))
+                return true; // Concurrent fault already satisfied.
+            DisableFastmem("alias_state_invalid", address, pc, access);
+            mapping.fault_disabled = true;
+            return false;
+        }
         probe_stage = "map_alias_failed";
         if (map_view(regions[mapping.host / RegionSize].handle, process, virtual_base + start,
                      mapping.host % RegionSize, mapping.length, MEM_REPLACE_PLACEHOLDER,
@@ -958,6 +1068,7 @@ private:
                        mapping.protection);
             mapping.fault_disabled = true;
             ++alias_failures;
+            DisableFastmem("alias_map_failed", address, pc, access);
             return false;
         }
         mapping.mapped = true;
@@ -977,18 +1088,27 @@ private:
 
     void DropRegion(size_t index) {
         auto& region = regions[index];
-        if (!region.handle)
+        // As with native loads/stores, reclamation requires quiescent users of this region.
+        region.backed.store(false, std::memory_order_release);
+        if (!region.handle && !region.private_backing)
             return;
         for (const size_t offset : region.aliases) {
             UnmapView(offset, mappings.at(offset));
         }
-        if (!unmap_view(process, backing_base + index * RegionSize, MEM_PRESERVE_PLACEHOLDER)) {
-            ApiFailure("UnmapViewOfFile2", backing_base + index * RegionSize, RegionLength(index),
-                       0);
+        const bool unmapped =
+            region.private_backing
+                ? VirtualFree(backing_base + index * RegionSize, 0,
+                              MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)
+                : unmap_view(process, backing_base + index * RegionSize, MEM_PRESERVE_PLACEHOLDER);
+        if (!unmapped) {
+            ApiFailure(region.private_backing ? "VirtualFree" : "UnmapViewOfFile2",
+                       backing_base + index * RegionSize, RegionLength(index), 0);
             throw std::bad_alloc{};
         }
-        CloseHandle(region.handle);
+        if (region.handle)
+            CloseHandle(region.handle);
         region.handle = nullptr;
+        region.private_backing = false;
         g_backing_committed.fetch_sub(RegionLength(index), std::memory_order_relaxed);
         reclaimed_bytes += RegionLength(index);
     }
@@ -1085,6 +1205,8 @@ private:
     // Clear may fault on the private fallback backing while holding this lock.
     std::recursive_mutex mutex;
     bool probe_mapped{};
+    bool probing_faults{true};
+    bool reported_backing_fault{};
     DWORD probe_error{};
     const char* probe_stage = "section_alias_probe_failed";
     size_t backing_faults{};
@@ -1499,6 +1621,16 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 #endif
     std::memset(backing_base + physical_offset, fill_value, length);
 }
+
+#ifdef YUZU_UWP_APPCONTAINER
+bool HostMemory::PrepareBackingPage(const u8* pointer) {
+    return impl && impl->PrepareBackingPage(pointer);
+}
+
+const std::atomic<bool>* HostMemory::FastmemEnabledFlag() const {
+    return impl ? &impl->fastmem_enabled : nullptr;
+}
+#endif
 
 void HostMemory::EnableDirectMappedAddress() {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))

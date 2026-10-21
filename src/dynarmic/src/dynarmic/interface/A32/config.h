@@ -9,6 +9,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -142,6 +143,14 @@ struct UserConfig {
     /// what you wish for emulated memory to be. If the host page faults on an address, the JIT
     /// will fallback to calling the MemoryRead*/MemoryWrite* callbacks.
     std::optional<uintptr_t> fastmem_pointer = std::nullopt;
+
+    /// Optional session latch. Its owner must outlive the JIT. Existing valid aliases
+    /// remain alive; subsequent emission uses the page table after a regional failure.
+    const std::atomic<bool>* fastmem_enabled = nullptr;
+    bool IsFastmemEnabled() const {
+        return fastmem_pointer.has_value() &&
+               (!fastmem_enabled || fastmem_enabled->load(std::memory_order_acquire));
+    }
 
     /// This selects other optimizations than can't otherwise be disabled by setting other
     /// configuration options. This includes:

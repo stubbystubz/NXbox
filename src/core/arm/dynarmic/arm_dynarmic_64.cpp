@@ -307,6 +307,10 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
         }
     }
 
+#ifdef NXBOX_UWP
+    config.fastmem_enabled = m_system.DeviceMemory().buffer.FastmemEnabledFlag();
+#endif
+
     // Multi-process state
     config.processor_id = std::uint8_t(m_core_index);
     config.global_monitor = &m_exclusive_monitor.monitor;

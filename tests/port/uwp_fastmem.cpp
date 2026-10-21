@@ -49,6 +49,10 @@ struct ApiError {
     DWORD error;
 };
 std::vector<ApiError> api_errors;
+std::vector<std::string> fallback_reasons;
+void TestLog(const char*, const char* reason, void*, void*, size_t, void*, void*, DWORD) {
+    fallback_reasons.emplace_back(reason);
+}
 void TestLog(const char*, const char*, const char* api, void* address, size_t size,
              DWORD protection, DWORD error) {
     api_errors.push_back({api, address, size, protection, error});
@@ -63,6 +67,7 @@ struct EXCEPTION_RECORD {
     unsigned NumberParameters;
     std::uintptr_t ExceptionInformation[2];
     DWORD ExceptionFlags{};
+    void* ExceptionAddress{};
 };
 struct CONTEXT {
     u64 Rip, Rsp;
@@ -76,6 +81,7 @@ struct EXCEPTION_POINTERS {
 };
 struct MEMORY_BASIC_INFORMATION {
     size_t RegionSize;
+    DWORD State{}, Protect{};
 };
 using Handler = LONG (*)(EXCEPTION_POINTERS*);
 using PFN_VirtualAllocFromApp = void* (*)(void*, size_t, DWORD, DWORD);
@@ -104,6 +110,8 @@ struct Segment {
     Section* section{};
     size_t offset{};
     DWORD mapping_protection{};
+    DWORD protection{};
+    bool private_backing{};
 };
 std::map<size_t, Segment> segments;
 std::map<void*, size_t> reservations;
@@ -114,6 +122,7 @@ int fail_at{};
 size_t committed{}, sections{}, peak{};
 bool force_noaccess_alias{};
 bool reject_fault_maps{}, suppress_veh{}, in_handler{};
+bool reject_private_replacement{};
 unsigned probe_accesses{};
 DWORD last_error = 5;
 Handler handler{};
@@ -152,11 +161,27 @@ void Reset() {
     last_error = 5;
     force_noaccess_alias = false;
     reject_fault_maps = suppress_veh = in_handler = false;
+    reject_private_replacement = false;
     probe_accesses = 0;
     api_errors.clear();
+    fallback_reasons.clear();
     assert(!handler);
 }
 void* Reserve(HANDLE process, void* base, size_t size, DWORD type, DWORD flags, void*, unsigned) {
+    if (type == (MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER)) {
+        assert(process == GetCurrentProcess() && base && flags == PAGE_READWRITE);
+        auto it = segments.find(reinterpret_cast<size_t>(base));
+        assert(it != segments.end() && it->second.length == size && !it->second.section &&
+               !it->second.private_backing);
+        if (Fail("private_replace") || reject_private_replacement)
+            return nullptr;
+        assert(mmap(base, size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1,
+                    0) == base);
+        it->second.private_backing = true;
+        it->second.protection = it->second.mapping_protection = flags;
+        committed += size;
+        return base;
+    }
     assert(process == GetCurrentProcess() && !base &&
            type == (MEM_RESERVE | MEM_RESERVE_PLACEHOLDER));
     assert(flags == PAGE_NOACCESS);
@@ -214,6 +239,7 @@ void* Map(HANDLE handle, HANDLE process, void* base, std::uint64_t offset, size_
     it->second.section = section;
     it->second.offset = offset;
     it->second.mapping_protection = flags;
+    it->second.protection = flags;
     ++section->views;
     return base;
 }
@@ -237,15 +263,17 @@ int Protect(void* base, size_t size, DWORD flags, DWORD* old) {
         return false;
     }
     --it;
-    const auto& view = it->second;
+    auto& view = it->second;
     // FromApp cannot widen beyond the access granted at mapping time, or span
     // views.
-    if (!view.section || size > view.length || address - it->first > view.length - size ||
+    if ((!view.section && !view.private_backing) || size > view.length ||
+        address - it->first > view.length - size ||
         (Protection(flags) & ~Protection(view.mapping_protection)) != 0) {
         last_error = 87;
         return false;
     }
-    *old = view.mapping_protection;
+    *old = view.protection;
+    view.protection = flags;
     return true; // Host 16 KiB pages cannot enforce individual Windows 4 KiB
                  // permissions.
 }
@@ -286,9 +314,8 @@ bool Accessible(const volatile u8* address, bool write) {
         return false;
     --it;
     const auto& view = it->second;
-    return offset - it->first < view.length && view.section &&
-           (write ? view.mapping_protection == PAGE_READWRITE
-                  : view.mapping_protection != PAGE_NOACCESS);
+    return offset - it->first < view.length && (view.section || view.private_backing) &&
+           (write ? view.protection == PAGE_READWRITE : view.protection != PAGE_NOACCESS);
 }
 
 // Model Windows' VEH-before-SEH dispatch, rather than unconditionally calling
@@ -348,6 +375,16 @@ int VirtualFree(void* base, size_t size, DWORD flags) {
     if (Fail("free"))
         return false;
     if (flags == (MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+        auto private_it = segments.find(address);
+        if (private_it != segments.end() && private_it->second.private_backing) {
+            assert(size == 0);
+            const size_t length = private_it->second.length;
+            assert(mmap(base, length, PROT_NONE, MAP_FIXED | MAP_ANON | MAP_PRIVATE, -1, 0) ==
+                   base);
+            private_it->second = Segment{length};
+            committed -= length;
+            return true;
+        }
         auto it = segments.upper_bound(address);
         assert(it != segments.begin());
         --it;
@@ -379,10 +416,17 @@ int VirtualFree(void* base, size_t size, DWORD flags) {
     return true;
 }
 size_t VirtualQuery(void* base, MEMORY_BASIC_INFORMATION* out, size_t) {
-    auto it = Mock::segments.find(reinterpret_cast<size_t>(base));
-    if (it == Mock::segments.end())
+    const size_t address = reinterpret_cast<size_t>(base);
+    auto it = Mock::segments.upper_bound(address);
+    if (it == Mock::segments.begin())
+        return 0;
+    --it;
+    if (address - it->first >= it->second.length)
         return 0;
     out->RegionSize = it->second.length;
+    const bool committed_view = it->second.section || it->second.private_backing;
+    out->State = committed_view ? MEM_COMMIT : MEM_RESERVE;
+    out->Protect = committed_view ? it->second.protection : PAGE_NOACCESS;
     return sizeof(*out);
 }
 
@@ -452,8 +496,8 @@ bool Fault(void* address, size_t access = 1) {
         assert(it != Mock::segments.begin());
         const auto& view = std::prev(it)->second;
         if (view.section) {
-            assert(view.mapping_protection != PAGE_NOACCESS);
-            assert(access != 1 || view.mapping_protection == PAGE_READWRITE);
+            assert(view.protection != PAGE_NOACCESS);
+            assert(access != 1 || view.protection == PAGE_READWRITE);
         }
     }
     return handled;
@@ -609,30 +653,37 @@ int main() { setenv("NXBOX_FASTMEM", "1", 1); // UWP fastmem is opt-in
             // A failed alias operation leaves page-table access to the backing
             // available.
             assert(Fault(memory.backing_base + 4096));
-            // Failed alias APIs disable this view; a new guest mapping can try
-            // again.
-            if (std::string_view{api} != "create")
-                assert(!Fault(memory.virtual_base));
+            // Any regional API failure latches page-table emission for this session.
+            assert(!memory.fastmem_enabled.load());
             memory.Map(0, 4096, 8192, MemoryPermission::ReadWrite);
-            assert(Fault(memory.virtual_base));
-            Mock::Store(memory.virtual_base, 33);
-            assert(memory.backing_base[4096] == 33);
-            memory.Protect(0, 8192, true, false, false);
             assert(!Fault(memory.virtual_base));
-            assert(!Fault(memory.virtual_base + 4096));
-            assert(Fault(memory.virtual_base, 0));
-            assert(memory.virtual_base[0] == 33);
-            // A RO view must be remapped before a later permission upgrade.
-            const int maps = Mock::calls["map"];
-            memory.Protect(0, 4096, true, true, false);
-            assert(Fault(memory.virtual_base));
-            assert(Mock::calls["map"] > maps);
-            assert(!Fault(memory.virtual_base + 4096));
-            assert(Fault(memory.virtual_base + 4096, 0));
-            assert(Mock::calls["protect"] == 2); // Only compatible probe transitions.
+            assert(memory.PrepareBackingPage(memory.backing_base + 4096));
+            memory.backing_base[4096] = 33;
+            assert(memory.backing_base[4096] == 33);
         }
         Mock::Reset();
     }
+    {
+        HostMemory::Impl memory(4 * region, 32 * region);
+        assert(memory.Init());
+        memory.Map(0, 4096, 8192, MemoryPermission::ReadWrite);
+        assert(Fault(memory.virtual_base));
+        Mock::Store(memory.virtual_base, 33);
+        memory.Protect(0, 8192, true, false, false);
+        assert(!Fault(memory.virtual_base));
+        assert(!Fault(memory.virtual_base + 4096));
+        assert(Fault(memory.virtual_base, 0));
+        assert(memory.virtual_base[0] == 33);
+        // A RO view must be remapped before a later permission upgrade.
+        const int maps = Mock::calls["map"];
+        memory.Protect(0, 4096, true, true, false);
+        assert(Fault(memory.virtual_base));
+        assert(Mock::calls["map"] > maps);
+        assert(!Fault(memory.virtual_base + 4096));
+        assert(Fault(memory.virtual_base + 4096, 0));
+        assert(Mock::calls["protect"] == 2); // Only compatible probe transitions.
+    }
+    Mock::Reset();
     {
         HostMemory::Impl memory(4 * region, 32 * region);
         assert(memory.Init());
