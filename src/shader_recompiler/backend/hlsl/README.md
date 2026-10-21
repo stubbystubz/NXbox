@@ -85,13 +85,20 @@ range-checked guest-address lookup, select only the first matching storage
 range, and reuse storage operation semantics. Invalid ranges return zero or
 ignore stores. Native 64-bit storage/global atomics use
 `InterlockedCompareExchange64`, require `Profile::support_int64_atomics`, and
-require SM 6.6. Mixed-width shared memory uses one uint64 backing array with
+require SM 6.6. Without native buffer support, `hlsl_emulate_int64_atomics`
+(default true) selects split-word 32-bit atomics: add with carry, or per-word CAS
+for the other operations. The pair is not a linearizable 64-bit transaction;
+returned values and cross-word min/max updates can tear under contention. See
+[the October bug investigation](../../../../docs/known-bugs-oct21.md).
+Mixed-width shared memory uses one uint64 backing array with
 native CAS for narrow operations, preserving byte aliasing and wide exchange
 atomicity; it requires `Profile::support_shared_int64_atomics` and SM 6.6.
-There is no unsafe two-independent-word substitute for a wide exchange.
+Shared wide exchange has no split-word substitute.
 
-`RequiredShaderModel(program)` returns 60 or 66. The renderer must select the
-corresponding DXC target and expose the matching D3D12 capabilities in Profile.
+`RequiredShaderModel(program)` returns a conservative 60 or 66 from IR alone,
+including atomics that can now be emulated. D3D12 selects SM 6.6 for emitted native
+buffer atomic intrinsics and SM 6.0 for their split-word fallback. Callers must
+expose matching device capabilities in Profile.
 `IsHelperInvocation` uses SM 6.6 `IsHelperLane`. A shader requiring 6.6 must
 fall back if the device/compiler target cannot provide it.
 

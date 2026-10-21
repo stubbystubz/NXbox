@@ -27,30 +27,36 @@ DxilBlob TrackedDxil(std::vector<u8> bytes) {
 }
 } // namespace
 
-const wchar_t* StageTarget(Shader::Stage stage) {
+const wchar_t* StageTarget(Shader::Stage stage, bool native64) {
     switch (stage) {
     case Shader::Stage::VertexA:
     case Shader::Stage::VertexB:
-        return L"vs_6_0";
+        return native64 ? L"vs_6_6" : L"vs_6_0";
     case Shader::Stage::TessellationControl:
-        return L"hs_6_0";
+        return native64 ? L"hs_6_6" : L"hs_6_0";
     case Shader::Stage::TessellationEval:
-        return L"ds_6_0";
+        return native64 ? L"ds_6_6" : L"ds_6_0";
     case Shader::Stage::Geometry:
-        return L"gs_6_0";
+        return native64 ? L"gs_6_6" : L"gs_6_0";
     case Shader::Stage::Fragment:
-        return L"ps_6_0";
+        return native64 ? L"ps_6_6" : L"ps_6_0";
     case Shader::Stage::Compute:
     default:
-        return L"cs_6_0";
+        return native64 ? L"cs_6_6" : L"cs_6_0";
     }
 }
 
 DxilBlob DxcCache::Compile(std::string_view hlsl, Shader::Stage stage, u64 pipeline_hash,
                            DiskPipelineCache* disk) {
     auto* const stats = active_build_stats;
-    const wchar_t* target = StageTarget(stage);
+    // The emitter only writes this intrinsic after checking SM 6.6 + OPTIONS11.
+    const bool native64 = hlsl.find(".InterlockedCompareExchange64(") != std::string_view::npos;
+    const wchar_t* target = StageTarget(stage, native64);
     u64 hash = Pso::HashBytes(hlsl.data(), hlsl.size());
+    if (native64) {
+        constexpr u64 sm66_salt = 0x4458435F534D3636ULL;
+        hash = Pso::HashBytes(&sm66_salt, sizeof(sm66_salt), hash);
+    }
     const auto stage_value = static_cast<u32>(stage);
     hash = Pso::HashBytes(&stage_value, sizeof(stage_value), hash);
     if (DxcStrictEnabled()) {

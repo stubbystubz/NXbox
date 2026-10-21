@@ -126,7 +126,7 @@ class FpsOverlayTests(unittest.TestCase):
         guarded = present.split("FpsOverlay::DrawIfEnabled([&]", 1)[1].split("});", 1)[0]
         self.assertIn("std::make_unique<Present::FpsCounter>", guarded)
         self.assertIn("fps_counter->Draw(Rtv(index), width, height)", guarded)
-        self.assertLess(present.index("Draw(layout"), present.index("fps_counter->Draw"))
+        self.assertLess(present.index("Draw(output_layout"), present.index("fps_counter->Draw"))
         self.assertLess(
             present.index("fps_counter->Draw"), present.index("D3D12_RESOURCE_STATE_PRESENT")
         )

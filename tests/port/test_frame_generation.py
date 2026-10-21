@@ -304,6 +304,21 @@ int main() {
         )
         source = source.replace("        RecordPresentation();", "")
         source = source.replace("UINT index =", "const UINT index =")
+        # Normalize the independent output-size policy before freezing command order.
+        source = source.replace(
+            """        const auto size = OutputSize(layout.width, layout.height);
+        const auto new_width = size.width;
+        const auto new_height = size.height;""",
+            """        const auto new_width = std::max(1u, layout.width);
+        const auto new_height = std::max(1u, layout.height);""",
+        )
+        start = source.index("        auto output_layout = layout;")
+        end = source.index("        Draw(output_layout,", start)
+        remap = source[start:end]
+        self.assertIn("output_layout.width = width;", remap)
+        self.assertIn("output_layout.height = height;", remap)
+        source = source[:start] + source[end:]
+        source = source.replace("Draw(output_layout,", "Draw(layout,")
         normalized = re.sub(r"\s+", "", source)
         self.assertEqual(
             hashlib.sha256(normalized.encode()).hexdigest(),

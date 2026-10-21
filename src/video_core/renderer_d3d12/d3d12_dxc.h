@@ -18,8 +18,8 @@ namespace D3D12 {
 
 using DxilBlob = std::shared_ptr<const std::vector<u8>>;
 
-// DXC target profile for a stage: vs_6_0, hs_6_0, ds_6_0, gs_6_0, ps_6_0, cs_6_0.
-const wchar_t* StageTarget(Shader::Stage stage);
+// DXC stage target: SM 6.0 normally, SM 6.6 for native buffer int64 atomics.
+const wchar_t* StageTarget(Shader::Stage stage, bool native64 = false);
 
 // HLSL -> DXIL through the packaged dxcompiler.dll (ShaderCompiler, entry "main"), memoized by
 // a 64-bit hash of (target, source); the source is kept to rule out hash collisions.
