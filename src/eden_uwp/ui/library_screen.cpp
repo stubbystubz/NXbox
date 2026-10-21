@@ -237,6 +237,7 @@ public:
         async_shaders_ = RendererSettings::ReadAsyncShaders(local_state_);
         fsr_ = RendererSettings::ReadFsr(local_state_);
         frame_generation_ = RendererSettings::ReadFrameGeneration(local_state_);
+        frame_pacing_ = RendererSettings::ReadFramePacing(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
         button_layout_ = RendererSettings::ReadButtonLayout(local_state_);
         std::ifstream resolution_settings(local_state_ / "eden_settings.txt");
@@ -1006,6 +1007,13 @@ private:
         if (SelectedSetting() == Setting::FrameGeneration) {
             if (RendererSettings::SaveFrameGeneration(local_state_, !frame_generation_))
                 frame_generation_ = !frame_generation_;
+            else
+                Toast(Tr(Text::ResolutionSaveFailed), now);
+            return;
+        }
+        if (SelectedSetting() == Setting::FramePacing) {
+            if (RendererSettings::SaveFramePacing(local_state_, !frame_pacing_))
+                frame_pacing_ = !frame_pacing_;
             else
                 Toast(Tr(Text::ResolutionSaveFailed), now);
             return;
@@ -1880,6 +1888,8 @@ private:
              {Tr(Text::FrameGenerationTitle),
               Tr(frame_generation_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
               Tr(Text::FrameGenerationHint)},
+             {Tr(Text::FramePacingTitle), Tr(frame_pacing_ ? Text::NextendoOn : Text::NextendoOff),
+              Theme::kTextSecondary, Tr(Text::FramePacingHint)},
              {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::ShowFpsHint)},
              {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
@@ -2156,6 +2166,7 @@ private:
     int renderer_choice_ = 0;
     bool resolution_global_ = false;
     bool frame_generation_ = false;
+    bool frame_pacing_ = false;
     bool shader_preload_ = true;
     bool async_shaders_ = true;
     bool fsr_ = true;

@@ -237,6 +237,7 @@ struct FrameProfile {
     u64 recorder_waits{}, recorder_wait_ns{};
     std::unordered_map<u64,u64> transitions;
     std::unordered_map<std::string_view,std::pair<u64,u64>> waits;
+    D3D12::Present::PresentGapSamples present_gaps, present_call_gaps;
     std::function<std::string()> guest_visibility;
     void BindRecordingThread() {}
     void Switch(int) {}

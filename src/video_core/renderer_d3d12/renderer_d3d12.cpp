@@ -21,6 +21,7 @@
 #include "video_core/capture.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 #include "video_core/renderer_d3d12/d3d12_resolution.h"
@@ -67,6 +68,12 @@ struct RendererD3D12::Impl {
     std::unique_ptr<Present::Presenter> upscaler;
     std::unique_ptr<Present::FpsCounter> fps_counter;
     std::unique_ptr<Present::FrameGenerator> frame_generator;
+    bool frame_pacing_enabled{};
+    Present::FramePacingPolicy frame_pacing;
+    std::chrono::steady_clock::time_point previous_pacing_frame{};
+    std::chrono::steady_clock::time_point previous_present_return{};
+    DXGI_FRAME_STATISTICS previous_statistics{};
+    bool have_statistics{};
     bool frame_generation_enabled{};
     bool frame_generation_failed{};
     Present::FrameGenerationCadence frame_generation_cadence;
@@ -197,6 +204,14 @@ struct RendererD3D12::Impl {
         frame_generation_enabled =
             Present::FrameGenerationEnabled(std::string_view(frame_gen_setting) == "1", frame_gen);
         Common::FpsOverlay::frame_generation.store(frame_generation_enabled);
+        char pacing[16]{}, pacing_setting[16]{};
+        if (GetEnvironmentVariableA("NXBOX_FRAME_PACING", pacing, sizeof(pacing)) != 1)
+            pacing[0] = 0;
+        if (GetEnvironmentVariableA("NXBOX_FRAME_PACING_SETTING", pacing_setting,
+                                    sizeof(pacing_setting)) != 1)
+            pacing_setting[0] = 0;
+        frame_pacing_enabled =
+            Present::FramePacingEnabled(std::string_view(pacing_setting) == "1", pacing);
         const auto& info = window.GetWindowInfo();
         if (info.type != Core::Frontend::WindowSystemType::Windows || !info.render_surface) {
 #ifdef NXBOX_UWP
@@ -436,6 +451,17 @@ struct RendererD3D12::Impl {
     }
     void Present(const Layout::FramebufferLayout& layout,
                  std::span<const Tegra::FramebufferConfig> layers, RasterizerD3D12& rasterizer) {
+        unsigned pacing_interval = 1;
+        if (frame_pacing_enabled) {
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds =
+                previous_pacing_frame.time_since_epoch().count() == 0
+                    ? 0.0
+                    : std::chrono::duration<double>(now - previous_pacing_frame).count();
+            previous_pacing_frame = now;
+            pacing_interval =
+                frame_pacing.Observe(seconds, frame_generation_enabled || layers.empty());
+        }
         // Each swapchain buffer owns a descriptor slice; wait only when reusing it.
         context.Collect();
         const auto new_width = std::max(1u, layout.width);
@@ -513,16 +539,67 @@ struct RendererD3D12::Impl {
             const EdenXbox::ThreadProfile::Scope present_scope{
                 EdenXbox::ThreadProfile::Wait::Present};
             status = Common::MaxwellMethodProfile::Measure(
-                Common::MaxwellMethodProfile::PresentSwapchain,
-                [&] { return swapchain->Present(1, 0); });
+                Common::MaxwellMethodProfile::PresentSwapchain, [&] {
+                    if (frame_pacing_enabled)
+                        return PresentPaced(pacing_interval);
+                    return swapchain->Present(1, 0);
+                });
         }
         context.LogInfoQueue();
         Check(status, "Present", context.Device());
+        RecordPresentation();
         if (frame_generation_enabled)
             Common::FpsOverlay::Presented();
         Check(context.Device()->GetDeviceRemovedReason(), "after Present", context.Device());
         if (log_present)
             Diagnostic("D3D12 Present complete");
+    }
+    HRESULT PresentPaced(unsigned interval) {
+        bool accepted_pacing = false;
+        const auto result = Present::SubmitPaced(
+            interval,
+            [&](unsigned sync, bool nonblocking) {
+                const auto status =
+                    swapchain->Present(sync, nonblocking ? DXGI_PRESENT_DO_NOT_WAIT : 0);
+                accepted_pacing = nonblocking && status == S_OK;
+                return status;
+            },
+            DXGI_ERROR_WAS_STILL_DRAWING, DXGI_ERROR_INVALID_CALL);
+        frame_pacing.Completed(accepted_pacing);
+        return result;
+    }
+    void RecordPresentation() {
+        auto& profile = context.Profile();
+        if (!profile.Enabled())
+            return;
+        // CPU return times are deliberately separate from observed display times.
+        const auto now = std::chrono::steady_clock::now();
+        if (previous_present_return.time_since_epoch().count())
+            profile.present_call_gaps.Add(
+                std::chrono::duration<double>(now - previous_present_return).count());
+        previous_present_return = now;
+        DXGI_FRAME_STATISTICS stats{};
+        if (swapchain->GetFrameStatistics(&stats) != S_OK) {
+            have_statistics = false; // Unsupported/occluded/disjoint: no invented display sample.
+            return;
+        }
+        if (have_statistics && stats.PresentCount == previous_statistics.PresentCount)
+            return;
+        if (have_statistics && stats.PresentCount == previous_statistics.PresentCount + 1 &&
+            stats.SyncRefreshCount > previous_statistics.SyncRefreshCount &&
+            stats.SyncQPCTime.QuadPart > previous_statistics.SyncQPCTime.QuadPart &&
+            stats.PresentRefreshCount > previous_statistics.PresentRefreshCount) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            const double refresh_seconds =
+                double(stats.SyncQPCTime.QuadPart - previous_statistics.SyncQPCTime.QuadPart) /
+                (double(frequency.QuadPart) *
+                 (stats.SyncRefreshCount - previous_statistics.SyncRefreshCount));
+            profile.present_gaps.Add(refresh_seconds * (stats.PresentRefreshCount -
+                                                        previous_statistics.PresentRefreshCount));
+        }
+        previous_statistics = stats;
+        have_statistics = true;
     }
     void PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
         // The complete real image is safe in Current(), before touching the swapchain.
@@ -540,6 +617,7 @@ struct RendererD3D12::Impl {
         context.Acknowledge(present_ticks[index]);
         Check(swapchain->Present(1, 0), "Present generated frame", context.Device());
         Common::FpsOverlay::Presented();
+        RecordPresentation();
         index = swapchain->GetCurrentBackBufferIndex();
         context.WaitSubmitted(present_ticks[index], "frame generation real frame");
         copy(buffers[index], frame_generator->Current());

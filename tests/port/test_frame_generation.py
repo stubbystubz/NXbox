@@ -121,6 +121,19 @@ int main(int, char** argv) {
             else:
                 self.assertEqual(source.count(marker), 1)
                 source = source.replace(marker, "")
+        # Pacing off bypasses this branch and retains the frozen original call.
+        start = source.index("        unsigned pacing_interval = 1;")
+        end = source.index("        // Each swapchain buffer", start)
+        source = source[:start] + source[end:]
+        source = source.replace(
+            """[&] {
+                    if (frame_pacing_enabled)
+                        return PresentPaced(pacing_interval);
+                    return swapchain->Present(1, 0);
+                }""",
+            "[&] { return swapchain->Present(1, 0); }",
+        )
+        source = source.replace("        RecordPresentation();", "")
         source = source.replace("UINT index =", "const UINT index =")
         normalized = re.sub(r"\s+", "", source)
         self.assertEqual(
@@ -268,6 +281,7 @@ struct Generator { ResourcePtr real; ResourcePtr Current() { return real; } };
 void Check(int value, const char*, void*) { assert(value == 0); }
 namespace Common::FpsOverlay { unsigned displayed{}; void Presented() { ++displayed; } }
 struct Presenter {
+    void RecordPresentation() {}
     Context context;
     std::array<ResourcePtr, 2> buffers;
     std::array<unsigned, 2> present_ticks{7, 8};

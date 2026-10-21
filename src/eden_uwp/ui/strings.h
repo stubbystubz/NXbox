@@ -21,6 +21,8 @@ enum class Text {
     SettingsAbout,
     FrameGenerationTitle,
     FrameGenerationHint,
+    FramePacingTitle,
+    FramePacingHint,
     UpscalerTitle,
     UpscalerBilinear,
     UpscalerFsr,

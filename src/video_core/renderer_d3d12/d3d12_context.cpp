@@ -789,6 +789,15 @@ void FrameProfile::EndFrame(bool presented) {
             std::exchange(recorder_waits, 0),
             static_cast<double>(std::exchange(recorder_wait_ns, 0)) /
                 (1000000.0 * std::max<u64>(frames, 1)));
+        line += fmt::format(
+            " present_gap_samples={} present_gap_p50_ms={:.3f} present_gap_p95_ms={:.3f}"
+            " present_call_gap_samples={} present_call_gap_p50_ms={:.3f} "
+            "present_call_gap_p95_ms={:.3f}",
+            present_gaps.count, present_gaps.Percentile(50), present_gaps.Percentile(95),
+            present_call_gaps.count, present_call_gaps.Percentile(50),
+            present_call_gaps.Percentile(95));
+        present_gaps.Clear();
+        present_call_gaps.Clear();
         // Queue waits use the same exclusive clock, but must not rank as CPU work.
         line += fmt::format(
             " gpu_queue_idle_wall_ms={:.3f}",

@@ -448,6 +448,8 @@
     {Text::UpscalerHint,
      L"Ampliação no DirectX 12 para quadros menores. Vale na próxima execução."},
 
+    {Text::FramePacingTitle, L"Ritmo de quadros estável"},
+    {Text::FramePacingHint, L"Distribui os quadros em intervalos iguais quando o jogo não chega a 60 fps. Fica mais suave, sem mudar o desempenho."},
     {Text::FrameGenerationTitle, L"Geração de quadros"},
     {Text::FrameGenerationHint,
      L"Cria quadros intermediários para ficar mais fluido. Pode causar pequenos defeitos na imagem "

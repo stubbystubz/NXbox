@@ -55,6 +55,39 @@ inline bool SaveFrameGeneration(const std::filesystem::path& local, bool enabled
     out.close();
     return !out.fail();
 }
+inline bool ReadFramePacing(const std::filesystem::path& local) {
+    std::ifstream in(local / "eden_settings.txt");
+    bool enabled = false;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = TitleSettings::ParseLine(line);
+        if (entry && entry->label == "frame_pacing")
+            enabled = entry->value == "1";
+    }
+    return enabled;
+}
+inline bool SaveFramePacing(const std::filesystem::path& local, bool enabled) {
+    const auto file = local / "eden_settings.txt";
+    std::error_code error;
+    const bool exists = std::filesystem::exists(file, error);
+    if (error)
+        return false;
+    std::ifstream in(file);
+    if (exists && !in)
+        return false;
+    std::string content;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = TitleSettings::ParseLine(line);
+        if (!entry || entry->label != "frame_pacing")
+            content += line + '\n';
+    }
+    if (in.bad())
+        return false;
+    in.close();
+    std::ofstream out(file, std::ios::trunc);
+    out << content << "frame_pacing=" << (enabled ? 1 : 0) << '\n';
+    out.close();
+    return !out.fail();
+}
 inline bool ReadShaderPreload(const std::filesystem::path& local) {
     std::ifstream in(local / "eden_settings.txt");
     bool enabled = true;

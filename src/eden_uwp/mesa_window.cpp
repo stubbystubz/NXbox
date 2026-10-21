@@ -38,6 +38,8 @@ void LoadRuntimeEnvironment() {
     _putenv_s("NXBOX_D3D12_FSR", RendererSettings::ReadFsr(env_file.parent_path()) ? "1" : "0");
     _putenv_s("NXBOX_FRAME_GEN_SETTING",
               RendererSettings::ReadFrameGeneration(env_file.parent_path()) ? "1" : "0");
+    _putenv_s("NXBOX_FRAME_PACING_SETTING",
+              RendererSettings::ReadFramePacing(env_file.parent_path()) ? "1" : "0");
     bool async_shaders_override = false;
     std::ifstream env_in(env_file);
     std::string line;
