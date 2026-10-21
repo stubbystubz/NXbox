@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include "common/maxwell_method_profile.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 using u32 = unsigned;
@@ -86,10 +87,13 @@ struct Cache {
     std::mutex mutex;
     View* selected = nullptr;
     GuestMemory* memory = nullptr;
+    unsigned lookups = 0;
     unsigned gpu_pixel = 76, downloads = 0, prepares = 0, snapshots = 0;
-    std::pair<View*, bool> TryFindFramebufferImageView(const Tegra::FramebufferConfig&,
-                                                       u64 address) {
+    std::pair<View*, bool> TryFindFramebufferImageView(const Tegra::FramebufferConfig&, u64 address,
+                                                       bool gpu_lookup, bool diagnose) {
         assert(address == 629936128);
+        assert(gpu_lookup == bool(EXPECT_GPU_LOOKUP));
+        assert(diagnose == (lookups++ == 0));
         return {selected, false};
     }
     View* PrepareImageForPresentation(View* view) {
@@ -132,6 +136,7 @@ struct RasterizerD3D12 {
     Cache texture_cache;
     Runtime texture_runtime;
     bool presentation_logged = false;
+    bool presentation_lookup_logged = false;
     RasterizerD3D12() {
         texture_cache.memory = &device_memory;
     }
@@ -168,11 +173,13 @@ int main() {
     auto fallback = rasterizer.FramebufferTexture(config);
     assert(fallback.resource->pixel == expected_pixel);
     assert(rasterizer.texture_cache.downloads == downloads_per_fallback);
+    setenv("NXBOX_D3D12_PRESENT_GPU_LOOKUP", EXPECT_GPU_LOOKUP ? "0" : "1", 1);
     View cached;
     cached.resource = std::make_shared<Resource>();
+    cached.resource->pixel = 76;
     rasterizer.texture_cache.selected = &cached;
     auto direct = rasterizer.FramebufferTexture(config);
-    assert(direct.resource == cached.resource);
+    assert(direct.resource == cached.resource && direct.resource->pixel == 76);
     assert(rasterizer.texture_cache.downloads == downloads_per_fallback &&
            rasterizer.texture_cache.prepares == 1);
     assert(rasterizer.texture_cache.snapshots == 1);

@@ -272,7 +272,8 @@ public:
 
     /// Try to find a cached image view in the given CPU address
     [[nodiscard]] std::pair<ImageView*, bool> TryFindFramebufferImageView(
-        const Tegra::FramebufferConfig& config, DAddr cpu_addr);
+        const Tegra::FramebufferConfig& config, DAddr cpu_addr, bool gpu_lookup = false,
+        bool diagnose = false);
 
     /// Return true when there are uncommitted images to be downloaded
     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
