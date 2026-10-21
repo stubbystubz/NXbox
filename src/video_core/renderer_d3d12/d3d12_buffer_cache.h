@@ -11,6 +11,7 @@
 #include "video_core/renderer_d3d12/d3d12_context.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 #include "video_core/renderer_d3d12/d3d12_ring_allocator.h"
+#include "video_core/renderer_d3d12/d3d12_uniform_stream.h"
 #include "video_core/renderer_d3d12/d3d12_upload_cache.h"
 #include "video_core/renderer_d3d12/d3d12_usage_cache.h"
 
@@ -59,7 +60,8 @@ private:
 class BufferCacheRuntime {
 public:
     BufferCacheRuntime(Context& context, BindingState& bindings)
-        : context{context}, bindings{bindings}, upload{context, D3D12_HEAP_TYPE_UPLOAD},
+        : context{context}, bindings{bindings},
+          upload{context, D3D12_HEAP_TYPE_UPLOAD, [this] { uniform_stream.Clear(); }},
           readback{context, D3D12_HEAP_TYPE_READBACK},
           uniform_snapshots{context, D3D12_HEAP_TYPE_DEFAULT, [this] {
                                 uniform_copies.Clear();
@@ -203,6 +205,7 @@ private:
     FrameCount upload_source{FrameCount::OtherUploadBytes};
     BindingState& bindings;
     const u64 memory_target{NativeBufferMemoryTarget(context.MemoryUsage())};
+    UniformStream<StagingBufferRef> uniform_stream;
     StagingRing upload;
     StagingRing readback;
     StagingRing uniform_snapshots;

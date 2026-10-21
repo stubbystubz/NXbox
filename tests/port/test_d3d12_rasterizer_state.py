@@ -169,7 +169,10 @@ struct QueryCache {
 };
 #define UNREACHABLE() std::abort()
 PRODUCTION_DISPATCH
+using GraphicsPipeline = struct Pipeline;
 struct Pipeline {
+    const Pipeline* AsNative() const { return nullptr; } // Exercise the fallback seam.
+    StageTableCounts StageCounts(size_t stage) const { return CountStageTables(*stages[stage]); }
     std::array<const Shader::Info*, 5> stages{};
     virtual ~Pipeline() = default;
     __attribute__((noinline)) virtual const Shader::Info* StageInfo(size_t stage) const {

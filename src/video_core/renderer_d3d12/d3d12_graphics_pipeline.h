@@ -66,9 +66,13 @@ public:
     const Shader::Info* StageInfo(size_t stage) const override {
         return stage_infos[stage] ? &*stage_infos[stage] : nullptr;
     }
-    // The Info must outlive the pipeline (it lives with the translated program).
+    StageTableCounts StageCounts(size_t stage) const {
+        return stage_counts[stage];
+    }
+    // Derived counts follow the pipeline-owned immutable metadata.
     void SetStageInfo(size_t stage, const Shader::Info* info) {
         stage_infos[stage] = *info;
+        stage_counts[stage] = CountStageTables(*info);
     }
     std::array<u32, 16> RootConstants(const DrawInputs& inputs) const override {
         Shader::Backend::HLSL::RootConstants constants;
@@ -115,6 +119,7 @@ private:
     u32 topology{};
     std::optional<Shader::RuntimeInfo> transform_feedback;
     std::array<std::optional<Shader::Info>, NUM_GRAPHICS_STAGES> stage_infos{};
+    std::array<StageTableCounts, NUM_GRAPHICS_STAGES> stage_counts{};
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
 };
