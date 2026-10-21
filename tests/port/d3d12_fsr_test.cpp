@@ -3,7 +3,9 @@
 #include <cassert>
 #include <memory>
 #include <vector>
+#include "common/maxwell_method_profile.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_math.h"
+#include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
 using UINT64 = unsigned long long;
 using u64 = unsigned long long;
 constexpr unsigned D3D12_SRV_DIMENSION_TEXTURE2DARRAY = 1;
@@ -39,7 +41,7 @@ struct Resource {
 };
 using ResourcePtr = std::shared_ptr<Resource>;
 namespace D3D12::Present {
-constexpr unsigned FrameSlots = 2;
+constexpr unsigned FrameSlots = D3D12::Present::MaxFrameSlots;
 constexpr unsigned MaxPasses = 256, FxaaPass = 6, EasuPass = 7;
 enum class Filter { Bilinear, Bicubic, Gaussian, ScaleForce, Area, Fsr };
 enum class Blend { Opaque, Premultiplied, Coverage };
@@ -122,11 +124,13 @@ int main() {
     slots.BeginFrame(1, 91);
     assert(slots.impl->frame_index == 1 && slots.impl->cursor == 256);
     assert(slots.impl->context.waited == 91);
+    slots.BeginFrame(2, 93);
+    assert(slots.impl->frame_index == 2);
     slots.BeginFrame(0, 92);
     assert(slots.impl->frame_index == 0 && slots.impl->cursor == 0);
     assert(slots.impl->context.waited == 92);
     try {
-        slots.BeginFrame(2, 93);
+        slots.BeginFrame(3, 93);
         assert(false);
     } catch (const std::invalid_argument&) {
     }

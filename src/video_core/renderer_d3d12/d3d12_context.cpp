@@ -1416,6 +1416,8 @@ void Context::Wait(u64 tick, std::string_view site) {
     LogInfoQueue();
 }
 void Context::WaitSubmitted(u64 tick, std::string_view site) {
+    const Common::MaxwellMethodProfile::NamedScope present_profile{
+        Common::MaxwellMethodProfile::PresentWait, Common::MaxwellMethodProfile::InPresentation()};
     const NxboxWait::Scope wait_diag_scope{NxboxWait::Kind::Fence, GetCurrentThreadId(), site,
                                       std::array<std::uint64_t, 1>{tick}};
     Acknowledge(tick);
@@ -1712,6 +1714,9 @@ bool Context::FlushDrawsIfDue() {
     return true;
 }
 void Context::Finish(FrameCount reason) {
+    const Common::MaxwellMethodProfile::NamedScope present_profile{
+        Common::MaxwellMethodProfile::PresentFinish,
+        Common::MaxwellMethodProfile::InPresentation()};
     Wait(Submit(reason), "finish");
 }
 void Context::Retain(const ResourcePtr& resource) {
@@ -2121,7 +2126,12 @@ struct BufferHeapPool {
             void* mapped{};
             const D3D12_RANGE range{
                 0, type == D3D12_HEAP_TYPE_READBACK ? static_cast<SIZE_T>(desc.Width) : 0};
-            Check(resource->handle->Map(0, &range, &mapped), "Map placed buffer", device);
+            {
+                const Common::MaxwellMethodProfile::NamedScope map_profile{
+                    Common::MaxwellMethodProfile::PresentMap,
+                    Common::MaxwellMethodProfile::InPresentation()};
+                Check(resource->handle->Map(0, &range, &mapped), "Map placed buffer", device);
+            }
             resource->mapped = {static_cast<u8*>(mapped), static_cast<size_t>(desc.Width)};
         }
         return resource;
@@ -2263,7 +2273,12 @@ ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_
         void* mapped{};
         D3D12_RANGE read_range{0, heap == D3D12_HEAP_TYPE_READBACK ? static_cast<SIZE_T>(desc.Width)
                                                                    : 0};
-        Check(resource->handle->Map(0, &read_range, &mapped), "Map staging", device.Get());
+        {
+            const Common::MaxwellMethodProfile::NamedScope map_profile{
+                Common::MaxwellMethodProfile::PresentMap,
+                Common::MaxwellMethodProfile::InPresentation()};
+            Check(resource->handle->Map(0, &read_range, &mapped), "Map staging", device.Get());
+        }
         resource->mapped = {static_cast<u8*>(mapped), static_cast<size_t>(desc.Width)};
     }
     return resource;

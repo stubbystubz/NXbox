@@ -268,7 +268,7 @@ class ViewCastTests(unittest.TestCase):
 
     def test_creation_with_and_without_device10(self):
         source = (BACKEND / "d3d12_context.cpp").read_text()
-        driver = RESOURCE_DRIVER.replace(
+        driver = '#include "common/maxwell_method_profile.h"\n' + RESOURCE_DRIVER.replace(
             "// CREATE_RESOURCE", method(source, "ResourcePtr Context::CreateResource(")
         )
         for definitions in ((), ("-D__ID3D12Device10_INTERFACE_DEFINED__",)):

@@ -4270,6 +4270,8 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
     if (OnGpuPipeline())
         return RunGpuPipeline([&] { return FramebufferTexture(config); });
 
+    const Common::MaxwellMethodProfile::NamedScope lookup_profile{
+        Common::MaxwellMethodProfile::PresentLookup};
     std::scoped_lock lock{texture_cache.mutex};
     auto [view, scaled] =
         texture_cache.TryFindFramebufferImageView(config, config.address + config.offset);
@@ -4292,7 +4294,9 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
                    " height=" + std::to_string(desc.Height) + " scaled=" + std::to_string(scaled));
     };
     if (view && view->ImageHandle()) {
-        view = texture_cache.PrepareImageForPresentation(view);
+        view = Common::MaxwellMethodProfile::Measure(
+            Common::MaxwellMethodProfile::PresentPrepare,
+            [&] { return texture_cache.PrepareImageForPresentation(view); });
         if (!view || !view->ImageHandle())
             return {};
         auto description = view->Description();
@@ -4329,8 +4333,13 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
         return !(value && value[0] == '0');
     }();
     if (download_before_fallback)
-        texture_cache.DownloadMemory(config.address + config.offset, 1);
-    auto resource = texture_runtime.UploadFramebuffer(device_memory, config);
+        Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentDownload, [&] {
+            texture_cache.DownloadMemory(config.address + config.offset, 1);
+        });
+    auto resource =
+        Common::MaxwellMethodProfile::Measure(Common::MaxwellMethodProfile::PresentUpload, [&] {
+            return texture_runtime.UploadFramebuffer(device_memory, config);
+        });
     if (!resource)
         return {};
     D3D12_SHADER_RESOURCE_VIEW_DESC description{};

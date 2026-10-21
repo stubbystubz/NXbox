@@ -67,6 +67,10 @@ They use the same gate and phase clock, so Submit/FenceWait/download phase time
 is still excluded. See [the sync audit](SYNC-METHODS.md) for interval definitions,
 blocking paths and the independent opt-in `NXBOX_D3D12_SYNC_FAST=1` mitigation.
 
+D3D12 Composite also emits `composite_rest` and `present_*` subdivisions under
+the same gate. See [the presentation cost audit](PRESENT-COST.md) for intervals,
+excluded GPU waits, whole-frame copies and the independent PRESENT_FAST opt-in.
+
 A collector reads FrameProfile's cumulative **exclusive Maxwell phase clock**
 using its existing QueryPerformanceCounter clock (100 ns units). Phase changes
 into macro execution, renderer/cache/upload work or waits automatically pause

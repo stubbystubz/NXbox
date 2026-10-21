@@ -37,10 +37,18 @@ class PresentImageSelectionTests(unittest.TestCase):
         body = source.split(signature, 1)[1].split("\n}\n", 1)[0]
         presenter = signature + body + "\n}\n"
         harness = (ROOT / "tests/port/fixtures/present_framebuffer.cpp").read_text()
-        for value in (None, "0", "1"):
-            with self.subTest(fallback_download=value), tempfile.TemporaryDirectory() as directory:
+        for value, fast in (
+            (v, f) for v in (None, "0", "1") for f in (None, "0", "1", "10", "true")
+        ):
+            with (
+                self.subTest(fallback_download=value, fast=fast),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 environment = os.environ.copy()
                 environment.pop("NXBOX_PRESENT_FALLBACK_DOWNLOAD", None)
+                environment.pop("NXBOX_D3D12_PRESENT_FAST", None)
+                if fast is not None:
+                    environment["NXBOX_D3D12_PRESENT_FAST"] = fast
                 if value is not None:
                     environment["NXBOX_PRESENT_FALLBACK_DOWNLOAD"] = value
                 compile_run(
@@ -52,6 +60,7 @@ class PresentImageSelectionTests(unittest.TestCase):
                         "-Wall",
                         "-Wextra",
                         f"-DEXPECT_FALLBACK_DOWNLOAD={int(value != '0')}",
+                        f"-DEXPECT_FAST={int(fast == '1')}",
                     ],
                 )
 

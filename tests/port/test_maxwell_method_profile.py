@@ -59,6 +59,54 @@ NXBOX METHOD_PROFILE cb_data=1,
 class MethodProfilePortTests(unittest.TestCase):
     compile_and_run = frontend.GpuFrontendHotPathTests.compile_and_run
 
+    def test_presentation_scopes_ancestry_disabled_and_exception_unwinding(self):
+        self.compile_and_run(
+            r"""
+#include <cassert>
+#include <stdexcept>
+#include "common/maxwell_method_profile.h"
+using namespace Common::MaxwellMethodProfile;
+struct Clock : Collector {
+    Common::GpuProfile::Tick now{}, reads{};
+    Common::GpuProfile::Tick ReadTicks() override { ++reads; return now; }
+};
+int main() {
+    Clock clock;
+    { NamedScope disabled{CompositeRest}; assert(!InPresentation()); }
+    assert(!clock.reads);
+    collector = &clock;
+    { NamedScope disabled{PresentMap, false}; assert(!clock.active); }
+    assert(!clock.reads && !InPresentation());
+    {
+        NamedScope composite{CompositeRest};
+        assert(InPresentation());
+        clock.now = 2;
+        {
+            NamedScope draw{PresentDraw};
+            clock.now = 4;
+            { NamedScope download{PresentDownload}; clock.now = 9; }
+            clock.now = 12;
+        }
+        clock.now = 15;
+    }
+    assert(clock.samples[CompositeRest].ticks == 5);
+    assert(clock.samples[PresentDraw].ticks == 5);
+    assert(clock.samples[PresentDownload].ticks == 5);
+    assert(!InPresentation() && !clock.active);
+    try {
+        NamedScope lookup{PresentLookup};
+        assert(InPresentation());
+        NamedScope finish{PresentFinish, InPresentation()};
+        ++clock.now;
+        throw std::runtime_error("test");
+    } catch (const std::runtime_error&) {}
+    assert(!clock.active && !InPresentation());
+    assert(clock.samples[PresentFinish].count == 1);
+    collector = nullptr;
+}
+"""
+        )
+
     def test_exclusive_phase_clock_nested_runs_exceptions_and_windows(self):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
         production = frontend.method(source, "FrameProfile::ReadTicks")

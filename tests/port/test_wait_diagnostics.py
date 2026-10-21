@@ -129,6 +129,7 @@ int main() {
             )
             (temp / "common/gpu_thread_profile.h").write_text(
                 "#pragma once\nnamespace Common::GpuProfile {\n"
+                "using Tick = unsigned long long;\n"
                 "enum class Wait { SyncpointHost, SyncpointGuest };\n"
                 "struct WaitScope { explicit WaitScope(Wait) {} }; }\n"
             )
