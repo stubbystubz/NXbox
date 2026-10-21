@@ -61,7 +61,7 @@ void SyncpointManager::DeregisterHostAction(u32 syncpoint_id, const ActionHandle
     DeregisterAction(host_action_storage[syncpoint_id], handle);
 }
 
-void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
+void SyncpointManager::IncrementGuest(u32 syncpoint_id, std::function<void()> before_actions) {
     // Guest actions include presentation, which can synchronously dispatch to the
     // draw builder. That worker also increments syncpoints: never wait for it
     // while owning guard. Detach ready actions before releasing the lock so each
@@ -78,6 +78,9 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
         }
         ready.splice(ready.end(), actions, actions.begin(), end);
         wait_guest_cv.notify_all();
+    }
+    if (before_actions) {
+        before_actions();
     }
     for (auto& entry : ready) {
         // Presentation runs here on the GPU thread; time it apart from the sync method.

@@ -50,7 +50,9 @@ public:
 
     void DeregisterHostAction(u32 syncpoint_id, const ActionHandle& handle);
 
-    void IncrementGuest(u32 syncpoint_id);
+    // Publish the guest value, then publish the backend fence before running ready actions.
+    // The hook runs without guard: presentation actions can block on another worker.
+    void IncrementGuest(u32 syncpoint_id, std::function<void()> before_actions = {});
 
     void IncrementHost(u32 syncpoint_id);
 

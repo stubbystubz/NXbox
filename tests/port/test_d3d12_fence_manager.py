@@ -42,7 +42,10 @@ namespace Host1x {
 struct SyncpointManager {
     std::atomic<int> guest{}, host{};
     u32 GetGuestSyncpointValue(u32) const { return guest.load(); }
-    void IncrementGuest(u32) { ++guest; }
+    void IncrementGuest(u32, std::function<void()> before_actions = {}) {
+        ++guest;
+        if (before_actions) before_actions();
+    }
     void IncrementHost(u32) { ++host; }
 };
 }
@@ -589,13 +592,15 @@ int main() {
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             for batching, fast in (("0", "0"), ("1", "0"), ("0", "1"), ("1", "1")):
-                with self.subTest(fence_batching=batching, sync_fast=fast):
-                    env = dict(
-                        os.environ,
-                        NXBOX_D3D12_FENCE_BATCHING=batching,
-                        NXBOX_D3D12_SYNC_FAST=fast,
-                    )
-                    subprocess.run([str(binary)], check=True, timeout=10, env=env)
+                for overlap in ("0", "1"):
+                    with self.subTest(fence_batching=batching, sync_fast=fast, overlap=overlap):
+                        env = dict(
+                            os.environ,
+                            NXBOX_D3D12_FENCE_BATCHING=batching,
+                            NXBOX_D3D12_SYNC_FAST=fast,
+                            NXBOX_D3D12_OVERLAP_SYNCPOINT=overlap,
+                        )
+                        subprocess.run([str(binary)], check=True, timeout=10, env=env)
 
     def test_fencing_thread_wakes_when_a_deferred_tick_is_submitted(self):
         with tempfile.TemporaryDirectory(prefix="nxbox-fence-wakeup-") as temp:
