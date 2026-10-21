@@ -19,6 +19,8 @@ enum class Text {
     SettingsOnline,
     SettingsSystem,
     SettingsAbout,
+    FrameGenerationTitle,
+    FrameGenerationHint,
     UpscalerTitle,
     UpscalerBilinear,
     UpscalerFsr,

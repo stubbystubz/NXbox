@@ -26,6 +26,7 @@ enum class Setting {
     ButtonLayout,
     Resolution,
     Upscaler,
+    FrameGeneration,
     ShowFps,
     Version,
     FtpServer,
@@ -33,15 +34,15 @@ enum class Setting {
 };
 struct SettingsCategory {
     Text title;
-    std::array<Setting, 9> rows;
+    std::array<Setting, 10> rows;
     int count;
 };
 inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
     {Text::SettingsGraphics,
      {Setting::Renderer, Setting::ShaderPreload, Setting::AsyncShaders, Setting::XboxButtonIcons,
-      Setting::ButtonLayout, Setting::Resolution, Setting::Upscaler, Setting::ShowFps,
-      Setting::InternetArt},
-     9},
+      Setting::ButtonLayout, Setting::Resolution, Setting::Upscaler, Setting::FrameGeneration,
+      Setting::ShowFps, Setting::InternetArt},
+     10},
     {Text::NavShop, {Setting::Sources, Setting::Usb}, 2},
     {Text::SettingsOnline, {Setting::Nextendo, Setting::Multiplayer, Setting::FtpServer}, 3},
     {Text::AccountSection,

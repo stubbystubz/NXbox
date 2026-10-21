@@ -236,6 +236,7 @@ public:
         shader_preload_ = RendererSettings::ReadShaderPreload(local_state_);
         async_shaders_ = RendererSettings::ReadAsyncShaders(local_state_);
         fsr_ = RendererSettings::ReadFsr(local_state_);
+        frame_generation_ = RendererSettings::ReadFrameGeneration(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
         button_layout_ = RendererSettings::ReadButtonLayout(local_state_);
         std::ifstream resolution_settings(local_state_ / "eden_settings.txt");
@@ -998,6 +999,13 @@ private:
         if (SelectedSetting() == Setting::AsyncShaders) {
             if (RendererSettings::SaveAsyncShaders(local_state_, !async_shaders_))
                 async_shaders_ = !async_shaders_;
+            else
+                Toast(Tr(Text::ResolutionSaveFailed), now);
+            return;
+        }
+        if (SelectedSetting() == Setting::FrameGeneration) {
+            if (RendererSettings::SaveFrameGeneration(local_state_, !frame_generation_))
+                frame_generation_ = !frame_generation_;
             else
                 Toast(Tr(Text::ResolutionSaveFailed), now);
             return;
@@ -1869,6 +1877,9 @@ private:
               Tr(Text::ResolutionMemoryHint)},
              {Tr(Text::UpscalerTitle), Tr(fsr_ ? Text::UpscalerFsr : Text::UpscalerBilinear),
               Theme::kTextSecondary, Tr(Text::UpscalerHint)},
+             {Tr(Text::FrameGenerationTitle),
+              Tr(frame_generation_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+              Tr(Text::FrameGenerationHint)},
              {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::ShowFpsHint)},
              {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
@@ -2144,6 +2155,7 @@ private:
     bool renderer_open_ = false;
     int renderer_choice_ = 0;
     bool resolution_global_ = false;
+    bool frame_generation_ = false;
     bool shader_preload_ = true;
     bool async_shaders_ = true;
     bool fsr_ = true;

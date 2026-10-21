@@ -367,6 +367,7 @@ struct FpsCounter::Impl {
     ComPtr<ID3D12RootSignature> root;
     ComPtr<ID3D12PipelineState> pipeline;
     Common::FpsOverlay::Sample sample;
+    Common::FpsOverlay::Sample displayed_sample;
 
     explicit Impl(Context& context_) : context{context_} {
         D3D12_ROOT_PARAMETER parameter{};
@@ -423,6 +424,14 @@ struct FpsCounter::Impl {
             static_cast<unsigned>(std::clamp(std::round(sample.milliseconds * 10), 0.0, 999999.0));
         std::array<char, 32> text{};
         std::snprintf(text.data(), text.size(), "%u FPS  %u.%u ms", fps, tenths / 10, tenths % 10);
+        if (frame_generation.load(std::memory_order_relaxed)) {
+            displayed_sample.Update(Sample::Clock::now(),
+                                    displayed_presents.load(std::memory_order_relaxed),
+                                    generation.load(std::memory_order_relaxed));
+            const auto displayed =
+                static_cast<unsigned>(std::clamp(std::round(displayed_sample.fps), 0.0, 9999.0));
+            std::snprintf(text.data(), text.size(), "%u FPS / %u FPS", displayed, fps);
+        }
         FpsConstants constants;
         constants.length = static_cast<unsigned>(std::char_traits<char>::length(text.data()));
         for (unsigned i = 0; i < constants.length; ++i)

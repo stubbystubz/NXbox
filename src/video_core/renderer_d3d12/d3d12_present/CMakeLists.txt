@@ -14,13 +14,15 @@ foreach(width 2 3 4)
       "${FFX_A_SOURCE}")
 endforeach()
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/present.hlsl" PRESENT_HLSL)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/frame_generation.hlsl" FRAME_GENERATION_HLSL)
 set_property(
   DIRECTORY
   APPEND
   PROPERTY CMAKE_CONFIGURE_DEPENDS
            "${PROJECT_SOURCE_DIR}/externals/FidelityFX-FSR/ffx-fsr/ffx_a.h"
            "${PROJECT_SOURCE_DIR}/externals/FidelityFX-FSR/ffx-fsr/ffx_fsr1.h"
-           "${CMAKE_CURRENT_SOURCE_DIR}/present.hlsl")
+           "${CMAKE_CURRENT_SOURCE_DIR}/present.hlsl"
+           "${CMAKE_CURRENT_SOURCE_DIR}/frame_generation.hlsl")
 # Keep literal tokens below MSVC's size limit; concatenate at startup.
 set(PRESENT_SOURCE
     "#define A_GPU 1\n#define A_HLSL 1\n${FFX_A_SOURCE}\n#define FSR_EASU_F 1\n#define FSR_RCAS_F 1\n#define FSR_RCAS_PASSTHROUGH_ALPHA 1\n${FFX_FSR_SOURCE}\n${PRESENT_HLSL}"
@@ -36,4 +38,5 @@ while(offset LESS PRESENT_SOURCE_LENGTH)
 endwhile()
 configure_file(shader_source.h.in d3d12_present_shader_source.h @ONLY)
 target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
-target_sources(video_core PRIVATE present.cpp present.h present_math.h)
+target_sources(video_core PRIVATE present.cpp present.h present_math.h
+               frame_generation.cpp frame_generation.h frame_generation_policy.h)

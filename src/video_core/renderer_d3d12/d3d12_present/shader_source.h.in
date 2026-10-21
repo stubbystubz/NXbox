@@ -9,4 +9,7 @@ inline std::string BuildShaderSource() {
 @SHADER_SOURCE_PARTS@
     return source;
 }
+inline std::string BuildFrameGenerationShaderSource() {
+    return R"NXHLSL(@FRAME_GENERATION_HLSL@)NXHLSL";
+}
 }

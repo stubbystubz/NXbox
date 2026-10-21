@@ -427,3 +427,7 @@
     {Text::UpscalerTitle, L"Upscaler"}, {Text::UpscalerBilinear, L"Bilinear"},
     {Text::UpscalerFsr, L"FSR 1"},
     {Text::UpscalerHint, L"DirectX 12 upscaling for smaller frames. Applies on next launch."},
+
+    {Text::FrameGenerationTitle, L"Frame generation"},
+    {Text::FrameGenerationHint, L"Creates intermediate frames for smoother motion. May cause small "
+                                L"image artifacts and add input delay."},
