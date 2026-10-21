@@ -579,13 +579,29 @@ bool Server::Start(const fs::path& local_state) {
     std::lock_guard lock(state_->mutex);
     try {
         state_->ip.clear();
+        // The console also has internal virtual adapters with private addresses; prefer the
+        // one carrying the internet connection, else fall back to the first private IPv4.
+        winrt::guid lan_adapter{};
+        if (const auto profile = Connectivity::NetworkInformation::GetInternetConnectionProfile())
+            if (const auto adapter = profile.NetworkAdapter())
+                lan_adapter = adapter.NetworkAdapterId();
+        std::string fallback;
         for (const auto& host : Connectivity::NetworkInformation::GetHostNames()) {
             const auto address = winrt::to_string(host.CanonicalName());
-            if (host.Type() == HostNameType::Ipv4 && PrivateIPv4(address)) {
+            if (host.Type() != HostNameType::Ipv4 || !PrivateIPv4(address))
+                continue;
+            const auto info = host.IPInformation();
+            if (info && info.NetworkAdapter() &&
+                info.NetworkAdapter().NetworkAdapterId() == lan_adapter) {
                 state_->ip = address;
                 break;
             }
+            if (fallback.empty())
+                fallback = address;
         }
+        if (state_->ip.empty())
+            state_->ip = fallback;
+        Diagnostic("FTP address " + state_->ip);
         if (state_->ip.empty())
             return false;
         using winrt::Windows::Security::Cryptography::CryptographicBuffer;
