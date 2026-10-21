@@ -28,7 +28,7 @@ SPDX-License-Identifier: GPL-3.0-or-later
 </p>
 
 > [!IMPORTANT]
-> **NXbox is paused from October 25, 2026.** The project is being archived indefinitely for financial reasons: building an emulator this way depends on a paid AI subscription that I can no longer afford, and it ends on October 25. Thank you to everyone who tested on their own console and sent logs and reports. If you want to carry the project on, reach me on [Discord](https://discord.gg/2SxEDzVyJM) or at miguel@nspx.dev and I'll add you as an editor. When I've saved a little money, I'll be back. Voluntary donations help me come back sooner: Bitcoin `bc1qm64el0gp0kvk7zqhl89x0vkngu2skqxd26vpjg` ([QR code](#support-the-project)).
+> **NXbox is paused from October 24, 2026.** The project is being archived indefinitely for financial reasons: building an emulator this way depends on a paid AI subscription that I can no longer afford, and it ends on October 25. Thank you to everyone who tested on their own console and sent logs and reports. Until then I'll try to get the games you've asked for so far working and bug-free, so that work is valued, not thrown away. If you want to carry the project on, reach me on [Discord](https://discord.gg/2SxEDzVyJM) or at miguel@nspx.dev and I'll add you as an editor. When I've saved a little money, I'll be back. Meanwhile I'll focus on school; if all goes well and I pass the year, I expect to pick NXbox back up at the end of 2026. I'm not expecting donations: this was always a hobby, and sadly it had to be paused. I also can't promise great performance in games.
 >
 > *The project is paused, its legacy preserved. Not a dream abandoned, just a future postponed.*
 
@@ -44,9 +44,9 @@ SPDX-License-Identifier: GPL-3.0-or-later
   <a href="docs/nxbox-port.md">Port notes</a>
 </p>
 
-<!-- Donation address: change it here, in the pause notice above and in "Support the project". -->
+<!-- Donation address: change it here and in "Support the project" only. -->
 <p align="center">
-  <a href="#support-the-project"><img alt="Support with Bitcoin" src="https://img.shields.io/badge/Bitcoin-donate%20to%20bring%20NXbox%20back-F7931A?logo=bitcoin&logoColor=white&style=for-the-badge"></a><br>
+  <a href="#support-the-project"><img alt="Support with Bitcoin" src="https://img.shields.io/badge/Bitcoin-support%20the%20project-F7931A?logo=bitcoin&logoColor=white"></a><br>
   <sub><code>bc1qm64el0gp0kvk7zqhl89x0vkngu2skqxd26vpjg</code></sub>
 </p>
 
