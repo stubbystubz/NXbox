@@ -13,9 +13,20 @@ struct FrameGenerator::Impl {
     Context& context;
     FrameGenerationPolicy policy;
     ComPtr<ID3D12RootSignature> root;
-    ComPtr<ID3D12DescriptorHeap> heap;
+    struct Slot {
+        ComPtr<ID3D12DescriptorHeap> heap;
+        ResourcePtr readback;
+        // Heap ownership lasts through the final dispatch, not just the statistic copy.
+        u64 tick{}, sample_tick{}, sample_id{};
+        unsigned cells{};
+        bool pending{};
+    };
+    std::array<Slot, 3> slots;
+    unsigned next_slot{};
+    u64 sample_id{}, completed_sample{};
+    double latest_difference{};
     std::array<ComPtr<ID3D12PipelineState>, 4> pipelines;
-    ResourcePtr previous, current, real, output, luma, motion, stats, readback, zero;
+    ResourcePtr previous, current, real, output, luma, motion, stats, zero;
     unsigned width{}, height{}, bx{}, by{};
     unsigned output_width{}, output_height{}, source_width{}, source_height{};
     bool history{};
@@ -71,8 +82,10 @@ struct FrameGenerator::Impl {
         heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
         heap_desc.NumDescriptors = 10;
         heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-        Check(context.Device()->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap)),
-              "Frame generation descriptors");
+        for (auto& slot : slots) {
+            Check(context.Device()->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&slot.heap)),
+                  "Frame generation descriptors");
+        }
         ShaderCompiler compiler;
         const auto source = BuildFrameGenerationShaderSource();
         constexpr std::array entries{L"LumaCS", L"MotionCS", L"WarpCS", L"DownsampleCS"};
@@ -104,7 +117,8 @@ struct FrameGenerator::Impl {
         luma.reset();
         motion.reset();
         stats.reset();
-        readback.reset();
+        for (auto& slot : slots)
+            slot.readback.reset();
         zero.reset();
     }
     void Allocate(unsigned w, unsigned h) {
@@ -112,7 +126,7 @@ struct FrameGenerator::Impl {
         if (output_width == w && output_height == h && width == extent.width &&
             height == extent.height)
             return;
-        history = false;
+        ResetHistory();
         previous.reset();
         current.reset();
         real.reset();
@@ -138,7 +152,8 @@ struct FrameGenerator::Impl {
             buffer.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
             stats = context.CreateResource(buffer, D3D12_HEAP_TYPE_DEFAULT,
                                            D3D12_RESOURCE_STATE_COMMON);
-            readback = context.CreateBuffer(256, D3D12_HEAP_TYPE_READBACK);
+            for (auto& slot : slots)
+                slot.readback = context.CreateBuffer(256, D3D12_HEAP_TYPE_READBACK);
             zero = context.CreateBuffer(256, D3D12_HEAP_TYPE_UPLOAD);
             std::memset(zero->mapped.data(), 0, 256);
         }
@@ -147,8 +162,8 @@ struct FrameGenerator::Impl {
         output_width = w;
         output_height = h;
     }
-    void Views() {
-        auto cpu = heap->GetCPUDescriptorHandleForHeapStart();
+    void Views(Slot& slot) {
+        auto cpu = slot.heap->GetCPUDescriptorHandleForHeapStart();
         const auto stride = context.Device()->GetDescriptorHandleIncrementSize(
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         for (const auto& resource : {previous, current, luma, motion, real ? real : current}) {
@@ -184,14 +199,14 @@ struct FrameGenerator::Impl {
         context.Retain(destination);
         context.Commands()->CopyResource(destination->handle.Get(), source->handle.Get());
     }
-    void Dispatch(unsigned pass, unsigned w, unsigned h) {
+    void Dispatch(Slot& slot, unsigned pass, unsigned w, unsigned h) {
         context.InvalidateRecordedState();
         context.MarkWork("frame generation");
         auto* commands = context.Commands();
-        ID3D12DescriptorHeap* heaps[]{heap.Get()};
+        ID3D12DescriptorHeap* heaps[]{slot.heap.Get()};
         commands->SetDescriptorHeaps(1, heaps);
         commands->SetComputeRootSignature(root.Get());
-        commands->SetComputeRootDescriptorTable(0, heap->GetGPUDescriptorHandleForHeapStart());
+        commands->SetComputeRootDescriptorTable(0, slot.heap->GetGPUDescriptorHandleForHeapStart());
         const std::array<unsigned, 6> constants{width, height, bx, by, output_width, output_height};
         commands->SetComputeRoot32BitConstants(1, 6, constants.data(), 0);
         commands->SetPipelineState(pipelines[pass].Get());
@@ -203,26 +218,67 @@ struct FrameGenerator::Impl {
             profile->Target({w, h, static_cast<u32>(output->handle->GetDesc().Format), 0, 0});
         }
         commands->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+        slot.tick = context.CurrentTick();
+    }
+    void ResetHistory() {
+        history = false;
+        latest_difference = 0;
+        completed_sample = 0;
+        // Discard decisions without releasing in-flight heap/readback ownership.
+        for (auto& slot : slots)
+            slot.pending = false;
+    }
+    void ReadDifferences() {
+        for (auto& slot : slots) {
+            if (!slot.pending || !context.IsFree(slot.sample_tick))
+                continue;
+            if (slot.sample_id > completed_sample) {
+                std::uint32_t sum{};
+                std::memcpy(&sum, slot.readback->mapped.data(), sizeof(sum));
+                latest_difference = double(sum) / (4095.0 * slot.cells);
+                completed_sample = slot.sample_id;
+            }
+            slot.pending = false;
+        }
+    }
+    Slot* AcquireSlot() {
+        for (unsigned i = 0; i < slots.size(); ++i) {
+            const auto index = (next_slot + i) % slots.size();
+            auto& slot = slots[index];
+            if (slot.tick && !context.IsFree(slot.tick))
+                continue;
+            next_slot = (index + 1) % slots.size();
+            return &slot;
+        }
+        return nullptr;
     }
     ResourcePtr Generate(const ResourcePtr& source, double seconds) {
         if (seconds > 0 && !policy.CanGenerate(true, seconds, 0)) {
-            history = false;
+            ResetHistory();
             Count(&Tally::slow_or_fast);
             return {}; // Fast games do not copy history or wait for GPU completion.
         }
         Initialize();
-        // Single private descriptor set, reused only after all prior dispatches complete.
-        context.Finish(FrameCount::ForcedSubmitPresent);
         const auto desc = source->handle->GetDesc();
         Allocate(static_cast<unsigned>(desc.Width), desc.Height);
+        ReadDifferences();
+        auto* available = AcquireSlot();
+        if (!available) {
+            ResetHistory();
+            Count(&Tally::no_history);
+            return {}; // Backpressure skips the effect, never waits for a descriptor heap.
+        }
+        auto& slot = *available;
         if (history)
             std::swap(previous, current);
-        Views();
+        Views(slot);
+        for (const auto& resource : {previous, current, real, output, luma, motion, stats, zero})
+            context.Retain(resource);
         if (real) {
             Copy(real, source);
             context.Transition(real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             context.Transition(current, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            Dispatch(3, width, height);
+            Dispatch(slot, 3, width, height);
             context.GlobalUavBarrier();
         } else {
             Copy(current, source);
@@ -233,38 +289,36 @@ struct FrameGenerator::Impl {
             Count(had_history ? &Tally::slow_or_fast : &Tally::no_history);
             return {};
         }
-        for (const auto& resource :
-             {previous, current, output, luma, motion, stats, readback, zero})
-            context.Retain(resource);
+        context.Retain(slot.readback);
+        // Use the newest completed earlier sample. A cut may generate one extra
+        // midpoint (more if the GPU is behind); startup assumes no difference.
+        const double difference = latest_difference;
         context.Transition(previous, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         context.Transition(current, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         Copy(stats, zero);
         context.Transition(stats, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         context.Transition(luma, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Dispatch(0, bx, by);
+        Dispatch(slot, 0, bx, by);
         context.GlobalUavBarrier();
         context.Transition(stats, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        context.Commands()->CopyBufferRegion(readback->handle.Get(), 0, stats->handle.Get(), 0, 4);
-        context.Finish(FrameCount::ForcedSubmitPresent);
-        std::uint32_t sum{};
-        std::memcpy(&sum, readback->mapped.data(), sizeof(sum));
-        const double difference = double(sum) / (4095.0 * bx * by);
+        context.Commands()->CopyBufferRegion(slot.readback->handle.Get(), 0, stats->handle.Get(), 0,
+                                             4);
+        slot.tick = slot.sample_tick = context.CurrentTick();
+        slot.sample_id = ++sample_id;
+        slot.cells = bx * by;
+        slot.pending = true;
         if (!policy.CanGenerate(true, seconds, difference)) {
             Count(&Tally::too_different, difference);
             return {};
         }
         Count(&Tally::generated, difference);
-        // The readback wait retired the luma batch. Retain both warp sources in
-        // this new batch too, including if recording fails before the final copy.
-        context.Retain(previous);
-        context.Retain(current);
         context.Transition(luma, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         context.Transition(motion, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Dispatch(1, bx, by);
+        Dispatch(slot, 1, bx, by);
         context.GlobalUavBarrier();
         context.Transition(motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
         context.Transition(output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        Dispatch(2, output_width, output_height);
+        Dispatch(slot, 2, output_width, output_height);
         context.GlobalUavBarrier();
         return output;
     }
@@ -286,7 +340,7 @@ ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds) 
     }
     // Context retains recorded uses until completion. Release unused/partial
     // allocations immediately so a failed effect cannot starve the real renderer.
-    // Root, heap and PSOs stay alive until renderer teardown drains the queue.
+    // Root, heaps and PSOs stay alive until renderer teardown drains the queue.
     impl->ReleaseResources();
     return {};
 }

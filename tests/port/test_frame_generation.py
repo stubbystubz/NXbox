@@ -99,6 +99,175 @@ int main(int, char** argv) {
         with tempfile.TemporaryDirectory() as directory:
             compile_run(driver, Path(directory), extra_flags=["-Wall", "-Wextra", "-Werror"])
 
+    def test_async_generation_uses_completed_samples_and_free_slots(self):
+        source = (
+            ROOT / "src/video_core/renderer_d3d12/d3d12_present/frame_generation.cpp"
+        ).read_text()
+        methods = "\n".join(
+            function(source, signature)
+            for signature in (
+                "    void ResetHistory()",
+                "    void ReadDifferences()",
+                "    Slot* AcquireSlot()",
+                "    ResourcePtr Generate(const ResourcePtr& source, double seconds)",
+            )
+        )
+        self.assertNotIn("context.Finish(", source)
+        self.assertNotIn("context.Wait", methods)
+        dispatch = function(source, "    void Dispatch(")
+        self.assertLess(dispatch.index("commands->Dispatch("), dispatch.index("slot.tick ="))
+        self.assertIn("slot.tick = context.CurrentTick()", dispatch)
+        self.assertIn("context.Retain(slot.readback)", methods)
+        driver = r"""
+#include <array>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <vector>
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+using u64 = std::uint64_t;
+struct Resource {
+    struct Desc { unsigned Width = 8, Height = 8; };
+    struct Handle {
+        Resource* value;
+        Resource* Get() { return value; }
+        Handle* operator->() { return this; }
+        Desc GetDesc() { return {}; }
+    } handle{this};
+    std::array<unsigned char, 256> mapped{};
+};
+using ResourcePtr = std::shared_ptr<Resource>;
+enum State { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE };
+struct Context {
+    u64 tick = 1, completed = 0;
+    std::vector<u64> checked;
+    unsigned sum = 0;
+    bool IsFree(u64 value) { checked.push_back(value); return value <= completed; }
+    u64 CurrentTick() { return tick; }
+    void Retain(const ResourcePtr&) {}
+    void Transition(const ResourcePtr&, State) {}
+    void GlobalUavBarrier() {}
+    Context* Commands() { return this; }
+    void CopyBufferRegion(Resource* dst, unsigned, Resource*, unsigned, unsigned) {
+        std::memcpy(dst->mapped.data(), &sum, sizeof(sum));
+    }
+};
+struct Generator {
+    Context context;
+    D3D12::Present::FrameGenerationPolicy policy;
+    struct Slot {
+        ResourcePtr readback = std::make_shared<Resource>();
+        u64 tick{}, sample_tick{}, sample_id{};
+        unsigned cells{};
+        bool pending{};
+    };
+    std::array<Slot, 3> slots;
+    unsigned next_slot{};
+    u64 sample_id{}, completed_sample{};
+    double latest_difference{};
+    unsigned width = 8, height = 8, bx = 1, by = 1, output_width = 8, output_height = 8;
+    bool history{};
+    ResourcePtr previous = std::make_shared<Resource>(), current = std::make_shared<Resource>(),
+        real, output = std::make_shared<Resource>(), luma = std::make_shared<Resource>(),
+        motion = std::make_shared<Resource>(), stats = std::make_shared<Resource>(),
+        zero = std::make_shared<Resource>();
+    struct Tally { unsigned slow_or_fast{}, no_history{}, too_different{}, generated{}; } tally;
+    double decision = -1;
+    unsigned initialized{}, views{}, passes{};
+    void Initialize() { ++initialized; }
+    void Allocate(unsigned, unsigned) {}
+    void Views(Slot& slot) {
+        assert(!slot.tick || context.IsFree(slot.tick));
+        ++views;
+    }
+    void Copy(const ResourcePtr&, const ResourcePtr&) {}
+    void Dispatch(Slot& slot, unsigned, unsigned, unsigned) {
+        ++passes;
+        slot.tick = context.CurrentTick();
+    }
+    void Count(unsigned Tally::*reason, double difference = -1) {
+        ++(tally.*reason);
+        decision = difference;
+    }
+// METHODS
+};
+int main() {
+    auto source = std::make_shared<Resource>();
+    Generator g;
+    assert(!g.Generate(source, 1.0 / 30)); // Seed history.
+    g.context.tick = 2;
+    g.context.sum = 4095; // Current pair is a cut, but no completed sample yet.
+    assert(g.Generate(source, 1.0 / 30));
+    assert(g.decision == 0 && g.tally.generated == 1);
+    assert(g.slots[1].sample_tick == 2 && g.slots[1].tick == 2);
+    g.context.tick = 3;
+    g.context.completed = 2;
+    g.context.sum = 0;
+    assert(!g.Generate(source, 1.0 / 30)); // Reject using the previous pair.
+    assert(g.decision == 1 && g.tally.too_different == 1);
+    g.context.tick = 4;
+    assert(!g.Generate(source, 1.0 / 30)); // Newer zero is still in flight.
+    assert(g.decision == 1);
+    g.context.tick = 5;
+    g.context.completed = 4;
+    assert(g.Generate(source, 1.0 / 30));
+    assert(g.decision == 0 && g.completed_sample == 3);
+
+    // Rotated storage order must not replace the newest result with an older one.
+    g.completed_sample = 0;
+    g.slots[0].pending = g.slots[2].pending = true;
+    g.slots[0].sample_id = 20;
+    g.slots[2].sample_id = 19;
+    g.slots[0].sample_tick = g.slots[2].sample_tick = 4;
+    g.slots[0].cells = 2;
+    unsigned sum = 4095;
+    std::memcpy(g.slots[0].readback->mapped.data(), &sum, sizeof(sum));
+    g.ReadDifferences();
+    assert(g.completed_sample == 20 && g.latest_difference == 0.5);
+
+    Generator busy;
+    busy.history = true;
+    busy.context.completed = 6;
+    busy.slots[0].tick = 7;
+    busy.slots[1].tick = 9;
+    busy.slots[2].tick = 8;
+    assert(!busy.AcquireSlot());
+    assert((busy.context.checked == std::vector<u64>{7, 9, 8}));
+    assert(!busy.Generate(source, 1.0 / 30));
+    assert(!busy.history && busy.tally.no_history == 1 && busy.views == 0);
+    busy.context.completed = 7;
+    assert(busy.AcquireSlot() == &busy.slots[0]);
+    busy.slots[0].tick = 10;
+    assert(!busy.AcquireSlot());
+    busy.slots[0].pending = true;
+    busy.latest_difference = 1;
+    busy.ResetHistory();
+    assert(busy.slots[0].tick == 10 && !busy.slots[0].pending);
+    assert(busy.latest_difference == 0);
+
+    for (double seconds : {1.0 / 55, 1.0 / 60, 0.2}) {
+        Generator fast;
+        fast.history = true;
+        assert(!fast.Generate(source, seconds));
+        assert(fast.initialized == 0 && fast.views == 0 && fast.passes == 0);
+        assert(!fast.history && fast.tally.slow_or_fast == 1);
+    }
+    Generator downsample;
+    downsample.real = std::make_shared<Resource>();
+    assert(!downsample.Generate(source, 1.0 / 30));
+    assert(downsample.slots[0].tick == 1 && downsample.passes == 1);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(
+                driver.replace("// METHODS", methods),
+                Path(directory),
+                extra_flags=["-Wall", "-Wextra", "-Werror"],
+            )
+
     def test_disabled_command_source_matches_pre_framegen_presenter(self):
         # Remove ONLY the two explicitly guarded enabled branches. The remaining
         # production method must match the pre-feature method, including every
