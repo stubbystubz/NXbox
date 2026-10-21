@@ -6,6 +6,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <span>
 #include <string>
@@ -341,6 +343,13 @@ struct DescriptorKey {
 };
 // Planning uses the same writers and full keys as the CPU descriptor cache.
 struct DescriptorPlan {
+    // Scratch keys survive Reset; exact byte comparison avoids rebuilding the
+    // same 80-byte semantic key on every repeated binding. Resource pins and
+    // source-generation checks still run for every draw.
+    bool patch_keys = [] {
+        const char* value = std::getenv("NXBOX_D3D12_DESCRIPTOR_KEY_PATCH");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
     DescriptorSources<std::uintptr_t> sources;
     std::array<u32, 3> sizes{};
     std::vector<DescriptorKey> keys;

@@ -262,6 +262,8 @@ D3D12DescriptorAllocator::D3D12DescriptorAllocator(Context& context, u32 view_ca
     InitCache(bound_dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
     Diagnostic(fmt::format("D3D12 handle_table_cache={}", handle_table_reuse ? 1 : 0));
     Diagnostic(fmt::format("D3D12 descriptor_fastpath={}", descriptor_fastpath ? 1 : 0));
+    Diagnostic(fmt::format("D3D12 descriptor_key_patch={}",
+                           previous_draw_tables[0].plan.patch_keys ? 1 : 0));
     Diagnostic(fmt::format("D3D12 descriptor_table_cache={}", descriptor_table_cache ? 1 : 0));
     Diagnostic(fmt::format("D3D12 descriptor_ranges={} persistent_null_descriptors={}",
                            descriptor_ranges, persistent_null_descriptors));
@@ -312,8 +314,16 @@ void D3D12DescriptorAllocator::WriteCached(D3D12_DESCRIPTOR_HEAP_TYPE type,
         throw std::out_of_range("D3D12 descriptor write outside table slice");
     if (table.plan) {
         const u32 index = table.first + slot;
-        const DescriptorKey key = MakeDescriptorKey(resource, kind, desc, size);
         auto& plan = *table.plan;
+        if (size > DescriptorKey{}.description.size())
+            throw std::invalid_argument("D3D12 descriptor exceeds cache key size");
+        auto& key = table.plan->keys.at(index);
+        const auto identity =
+            reinterpret_cast<std::uintptr_t>(resource ? resource->handle.Get() : nullptr);
+        if (!plan.patch_keys || key.resource != identity || key.kind != kind || key.size != size ||
+            std::memcmp(key.description.data(), desc, size) != 0) {
+            key = MakeDescriptorKey(resource, kind, desc, size);
+        }
         if (descriptor_fastpath && plan.sources.valid) {
             RefreshCaches();
             auto& cache = type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER ? sampler_cache : view_cache;
@@ -325,7 +335,6 @@ void D3D12DescriptorAllocator::WriteCached(D3D12_DESCRIPTOR_HEAP_TYPE type,
                 [&] { return cache.generation; },
                 [&] { return ResolveDescriptor(type, resource, key, nullptr).ptr; });
         }
-        table.plan->keys.at(index) = key;
         table.plan->resources.at(index) = resource;
         if (!table.plan->initialized.empty())
             table.plan->initialized.at(index) = 1;

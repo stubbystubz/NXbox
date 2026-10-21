@@ -217,7 +217,7 @@ class T8PerfTests(unittest.TestCase):
         self.assertNotIn("std::function", writer)
         self.assertNotIn("[&](auto handle)", descriptors)
         self.assertNotIn("std::string key", writer)
-        self.assertIn("DescriptorKey key", writer)
+        self.assertIn("MakeDescriptorKey(resource, kind, desc, size)", writer)
         run = helpers.split("void ComputePasses::Run(")[1]
         self.assertNotIn("CreateDescriptorHeap", run)
         self.assertIn("descriptors.FindTable(view_key)", run)
