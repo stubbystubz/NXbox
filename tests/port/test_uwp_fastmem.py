@@ -826,6 +826,152 @@ int main() {
         )
         self.compile_and_run(native_test)
 
+    def test_seh_wrapper_preserves_return_address_with_windows_home_space(self):
+        source = (
+            ROOT / "src/dynarmic/src/dynarmic/backend/x64/exception_handler_windows.cpp"
+        ).read_text()
+        wrapper = source[source.index("        code.lea(code.rsp") :]
+        wrapper = wrapper[: wrapper.index("        code.ret();") + len("        code.ret();")]
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+// Execute the production wrapper's emitter operations with Windows x64 register
+// and stack semantics. A callee may spill all four register arguments into its
+// home slots, even if this particular compiler currently chooses not to do so.
+struct Register { size_t index; };
+struct Address { Register base; int offset; };
+Address operator-(Register base, int offset) { return {base, -offset}; }
+struct Operand { Address operator[](Address address) { return address; } };
+struct Code {
+    Register rsp{0}, ABI_PARAM1{1}, ABI_PARAM2{2}, ABI_PARAM3{3}, ABI_PARAM4{4};
+    Operand ptr;
+    std::array<u64, 5> registers{};
+    alignas(16) std::array<u64, 32> stack{};
+    u64 entry;
+    static constexpr u64 sentinel = 0x12345678;
+    Code() {
+        // Windows function entry: RSP == 8 mod 16 (after the caller's CALL).
+        entry = reinterpret_cast<u64>(&stack[17]);
+        registers[0] = entry;
+        stack[17] = sentinel;
+    }
+    void lea(Register destination, Address address) {
+        registers[destination.index] = registers[address.base.index] + address.offset;
+    }
+    void mov(Register destination, Register source) {
+        registers[destination.index] = registers[source.index];
+    }
+    void mov(Register destination, u64 value) { registers[destination.index] = value; }
+    void add(Register destination, int value) { registers[destination.index] += value; }
+    template<class Lambda> void CallLambda(Lambda callback) {
+        assert(registers[0] % 16 == 0);
+        auto* home = reinterpret_cast<u64*>(registers[0]);
+        for (size_t i = 0; i < 4; ++i)
+            home[i] = registers[i + 1];
+        assert(stack[17] == sentinel); // No argument spill may overwrite our return PC.
+        disposition = callback(*reinterpret_cast<std::function<FakeCall(u64)>*>(registers[1]),
+                               reinterpret_cast<PCONTEXT>(registers[2]),
+                               reinterpret_cast<const EXCEPTION_RECORD*>(registers[3]));
+    }
+    void ret() { assert(registers[0] == entry && stack[17] == sentinel); }
+    EXCEPTION_DISPOSITION disposition{};
+};
+int main() {
+    for (bool resolve : {false, true}) {
+        Code code;
+        u64 guest_stack[4]{};
+        CONTEXT context{0x1234, reinterpret_cast<u64>(guest_stack + 4)};
+        EXCEPTION_RECORD record{EXCEPTION_ACCESS_VIOLATION, 2, {0, 0x10000}};
+        std::function<FakeCall(u64)> cb = [&](u64 rip) {
+            assert(rip == 0x1234);
+            return resolve ? FakeCall{0x5678, 0x1238} : FakeCall{};
+        };
+        code.registers[1] = reinterpret_cast<u64>(&record);
+        code.registers[3] = reinterpret_cast<u64>(&context);
+WRAPPER
+        assert(code.disposition == (resolve ? ExceptionContinueExecution : ExceptionContinueSearch));
+        assert(context.Rip == (resolve ? 0x5678u : 0x1234u));
+        assert(context.Rsp == reinterpret_cast<u64>(guest_stack + (resolve ? 3 : 4)));
+        if (resolve) assert(guest_stack[3] == 0x1238);
+    }
+}
+""".replace("WRAPPER", wrapper)
+        self.compile_and_run(native_test)
+
+    def test_unresolvable_arena_access_uses_production_recompile_fallback(self):
+        source = (
+            ROOT / "src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc"
+        ).read_text()
+        callback = re.search(
+            r"FakeCall AxxEmitX64::FastmemCallback\(.*?^}", source, re.DOTALL | re.MULTILINE
+        )[0].replace("AxxEmitX64", "Emitter")
+        should_fastmem = (
+            re.search(
+                r"std::optional<AxxEmitX64::DoNotFastmemMarker>.*?^}",
+                source,
+                re.DOTALL | re.MULTILINE,
+            )[0]
+            .replace("AxxEmitX64", "Emitter")
+            .replace("AxxEmitContext", "Context")
+        )
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+#include <optional>
+#include <tuple>
+namespace fmt { template<class... T> void print(const char*, T...) {} }
+struct Context { int Location() { return 1; } };
+namespace IR { struct Inst { int GetName() { return 2; } }; }
+struct Emitter {
+    using DoNotFastmemMarker = std::tuple<int, int>;
+    struct Config { bool IsFastmemEnabled() const { return true; } } conf;
+    struct Handler { bool SupportsFastmem() const { return true; } } exception_handler;
+    struct Patch { u64 resume_rip, callback; DoNotFastmemMarker marker; bool recompile; };
+    std::map<u64, Patch> fastmem_patch_info;
+    std::set<DoNotFastmemMarker> do_not_fastmem;
+    int invalidations{};
+    void InvalidateBasicBlocks(std::initializer_list<int> locations) {
+        assert(locations.size() == 1 && *locations.begin() == 1);
+        ++invalidations;
+    }
+    FakeCall FastmemCallback(u64);
+    std::optional<DoNotFastmemMarker> ShouldFastmem(Context&, IR::Inst*) const;
+};
+CALLBACK
+SHOULD_FASTMEM
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    {
+        Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+        assert(memory.Init() && memory.virtual_base);
+        // The guest page has no alias record. VEH must decline both access kinds;
+        // a retry at the original instruction would fault forever.
+        for (size_t access : {0u, 1u}) {
+            auto* hole = memory.virtual_base + 17 * 65536;
+            assert(!Fault(hole, access));
+            assert(!Mock::Accessible(hole, access == 1));
+            Emitter emitter;
+            Context ctx;
+            IR::Inst inst;
+            assert(emitter.ShouldFastmem(ctx, &inst));
+            emitter.fastmem_patch_info.emplace(0x1234, Emitter::Patch{0x1238, 0x5678, {1, 2}, true});
+            u64 stack[4]{};
+            CONTEXT context{0x1234, reinterpret_cast<u64>(stack + 4)};
+            EXCEPTION_RECORD record{EXCEPTION_ACCESS_VIOLATION, 2,
+                                    {access, reinterpret_cast<size_t>(hole)}};
+            std::function<FakeCall(u64)> cb = [&](u64 pc) { return emitter.FastmemCallback(pc); };
+            assert(DispatchFastmem(cb, &context, &record) == ExceptionContinueExecution);
+            assert(context.Rip == 0x5678 && context.Rsp == reinterpret_cast<u64>(stack + 3));
+            assert(stack[3] == 0x1238 && emitter.invalidations == 1);
+            assert(!emitter.ShouldFastmem(ctx, &inst)); // Re-emission selects page table/callbacks.
+            assert(!Mock::Accessible(hole, access == 1)); // No invented guest mapping.
+            assert(memory.fastmem_enabled.load()); // A normal hole does not disable the session.
+        }
+    }
+    Mock::Reset();
+}
+""".replace("CALLBACK", callback).replace("SHOULD_FASTMEM", should_fastmem)
+        self.compile_and_run(native_test)
+
     def compile_and_run(self, native_test):
         with tempfile.TemporaryDirectory(prefix="nxbox-fastmem-") as directory:
             cpp = Path(directory) / "fastmem.cpp"

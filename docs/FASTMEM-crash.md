@@ -1,5 +1,111 @@
 # UWP fastmem boot faults
 
+## Round 4: build 0.3.817 / fm5
+
+### Complete capture analysis
+
+Round 3 (`58469dd11`) is present in 0.3.817. Odyssey now reaches frames at
+23.8 game fps (capture summary); MK8D has no new measurement. Wonder fastmem
+still presents no frame. Its last Eden timestamp is 32.615 s. The crash logger
+uses a different clock: its first/last JIT AV ticks span 16.141 s, so dividing
+2,682 by 32 s is not a measured fault rate. There is one earlier intentional
+native probe AV, 33.375 s before the first JIT AV.
+
+`tools/nxbox/analyze_fastmem_faults.py` reads every line, counts PCs and target
+4 KiB pages, and emits JSON (including the complete PC/page histograms):
+
+```sh
+python3 tools/nxbox/analyze_fastmem_faults.py \
+  /Users/miguel/.local/share/nxbox/artifacts/compat-2026-10-18/r-wonder-fm5 \
+  /Users/miguel/.local/share/nxbox/artifacts/compat-2026-10-18/r-ody-fm5 \
+  /Users/miguel/.local/share/nxbox/artifacts/compat-2026-10-18/r-wonder-nf5 \
+  /Users/miguel/.local/share/nxbox/artifacts/compat-2026-10-18/r-wonder-vis
+```
+
+| Capture | Lines read | Recorded AVs | Unique PCs | Unique targets | Target pages |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `r-wonder-fm5` | 26,930 | 2,682 | 2,682 | 1,292 | 108 |
+| `r-ody-fm5` | 119,714 | 11,811 | 11,811 | 4,091 | 214 |
+| `r-wonder-nf5` | 2,397 | 0 | 0 | 0 | 0 |
+| `r-wonder-vis` | 1,736 | 0 | 0 | 0 | 0 |
+
+The fastmem counts each include one protected native startup probe. All targets
+are inside the respective 512 GiB arena. Wonder has 1,219 reads and 1,463 writes;
+roles are worker=1 (probe), cpu0=2,072, cpu1=571, cpu2=38. Its hottest pages are
+`0x1edbf640000` (570 faults), `0x1fe4f729000` (252), `0x1ee1e692000`
+(190), `0x1ee8ee00000` (140), and `0x1fe52620000` (106). Its hottest exact
+target, `0x1edbf640a30`, occurs 17 times at distinct PCs. No PC or PC/target pair
+repeats in either fastmem capture. This is not a recorded same-instruction retry
+loop; it is consistent with Dynarmic invalidating and re-emitting guest blocks.
+It does not prove that every AV reached that fallback: successful lazy alias
+materialization can also resume an instruction.
+
+Wonder's backing is `0x1dc3a000000`, its arena is `0x1dd3a000000`, and the
+actual ready log says **`backing_size=0x100000000`**, four GiB, not `0x100000`.
+The example targets are arena offsets `0x1085629388` and `0x213cb58521`.
+Being in that reservation does not establish whether the guest page is unmapped,
+rasterizer-protected, or backed by a regional alias record. The captures do not
+include those records or the handlers' dispositions. The `+0x3043d7`,
+`+0x306ec6`, `+0x3087d7` frames are the logger's handler stack, not the interrupted
+JIT's caller stack. All four JIT unwind tables report successful registration.
+No runtime allocator fallback warning or unhandled/abort record is present.
+The earlier fm4 `bad allocation` failure is not reproduced in this capture.
+
+Both no-fastmem Wonder captures reach frames: nf5 reports median 27.2 game fps,
+vis 27.9. Odyssey's many AVs coexist with sustained rendering. Neither the AV
+count nor the final first-chance record proves Wonder's terminal exception.
+
+### SEH fallback ABI defect and fix
+
+The regional VEH **must** return `EXCEPTION_CONTINUE_SEARCH` for a hole or an
+unresolvable alias. That hands the data AV to Dynarmic's registered x64 SEH
+handler; it does not itself terminate the process. A known fastmem instruction
+uses `FastmemCallback` to find its native fallback/resume addresses, mark the
+guest location against future fastmem emission, and invalidate its block. SEH
+pushes the resume address onto the saved JIT stack and redirects the saved PC to
+the native callback. It returns `ExceptionContinueExecution` (the SEH disposition,
+not the VEH constant). No guest page is manufactured to satisfy a hole, and an
+unresolved access must never be retried unchanged.
+
+The generated SEH wrapper violated the Windows x64 calling convention: before
+calling its C++ lambda it reserved only an eight-byte alignment slot. Its callee
+owns **32 bytes of home space** in addition to stack alignment. An allowed spill
+of the second register argument overwrites the wrapper's return PC; later home
+slots overwrite its caller's stack. This defect is on the precise path used
+when the VEH declines a guest access. The portable allocator tests previously
+extracted and called only the lambda, bypassing the generated wrapper entirely.
+
+The wrapper now reserves/restores **40 bytes** (32 home + 8 alignment). Its
+argument forwarding, disposition return, saved guest context redirection, and
+allocator behavior are otherwise unchanged. This repairs a concrete fallback
+stack-corruption defect shared by the Windows handler. The console logs do not
+prove that a home-slot spill caused Wonder's terminal exit; a matching console
+retest is still required before claiming that game fixed.
+
+Regression coverage:
+
+- A compiled emitter model runs the production wrapper operations, including
+  argument forwarding and the production lambda, with Windows x64 stack rules.
+  The callee writes all four home slots, as the ABI permits. Both handled and
+  declined AVs preserve the wrapper return PC and stack; handled AVs redirect
+  the saved JIT PC/SP correctly. Restoring only the old eight-byte reservation
+  makes this fail at the return-PC sentinel (negative control).
+- A compiled integration test sends read/write faults on an untracked arena page
+  through the production VEH, SEH lambda, `FastmemCallback`, and `ShouldFastmem`.
+  VEH declines, SEH redirects once to the recorded callback/resume pair, the
+  guest block is invalidated, and re-emission rejects fastmem for that marker.
+  The hole remains inaccessible and the healthy session stays enabled. This
+  covers the same callback/recompile policy used by desktop Eden; it does not
+  execute Windows exception dispatch or simulate the guest memory callback.
+
+Validation on 2026-10-21: all 19 fastmem tests passed. The full command
+`python3 -m unittest discover -s tests/port` ran 991 tests in 539.916 seconds:
+945 passed, 44 skipped, and only the two known `fontTools` import errors
+(`test_button_layout`, `test_xbox_button_icons`). Ruff check/format, modified-line
+clang-format, `git diff --check`, and the old-frame negative control passed.
+No commits, Windows application build, or console rerun were made.
+
+
 ## Round 3: build 0.3.813 / fm4
 
 ### The arena-base AV is the intentional startup probe

@@ -189,7 +189,9 @@ struct ExceptionHandler::Impl final {
         code.cmp(code.rax, static_cast<u32>(code.GetTotalCodeSize()));
         code.ja(exception_handler_without_cb);
 
-        code.lea(code.rsp, code.ptr[code.rsp - 8]);
+        // Windows x64 callees own 32 bytes of home space. With only the
+        // alignment slot, a legal argument spill overwrites our return address.
+        code.lea(code.rsp, code.ptr[code.rsp - 40]);
         // Preserve the exception record before replacing ABI_PARAM1 with &cb.
         code.mov(code.ABI_PARAM4, code.ABI_PARAM1);
         code.mov(code.ABI_PARAM1, std::bit_cast<u64>(&cb));
@@ -213,7 +215,7 @@ struct ExceptionHandler::Impl final {
             ctx->Rip = fc.call_rip;
             return ExceptionContinueExecution;
         });
-        code.add(code.rsp, 8);
+        code.add(code.rsp, 40);
         code.ret();
 
         exception_handler_without_cb_offset = ULONG(exception_handler_without_cb - code.getCode<u8*>());
