@@ -145,6 +145,331 @@ int main() {
 """
         self.compile_and_run(native_test)
 
+    def test_untracked_alias_callback_prepares_untouched_and_reclaimed_backing(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        memory_source = (ROOT / "src/core/memory.cpp").read_text()
+        helper = re.search(
+            r"    u8\* PrepareNativePointer\(.*?^    }", memory_source, re.DOTALL | re.MULTILINE
+        )[0]
+        native_test += r"""
+#define NXBOX_UWP 1
+struct Buffer {
+    Common::HostMemory::Impl& memory;
+    u8* VirtualBasePointer() const { return memory.virtual_base; }
+    bool PrepareBackingPage(const u8* pointer) { return memory.PrepareBackingPage(pointer); }
+};
+struct Callback {
+    Buffer* host_buffer;
+HELPER
+};
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    {
+        Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+        assert(memory.Init() && memory.fastmem_enabled.load());
+        Buffer buffer{memory};
+        Callback callback{&buffer};
+        auto* backing = memory.backing_base + 2 * 65536 + 8;
+        // No regional alias record: a valid canonical page-table callback follows.
+        assert(!Fault(memory.virtual_base + 17 * 65536));
+        assert(!Mock::Accessible(backing, true));
+        for (int pass = 0; pass < 2; ++pass) {
+            assert(callback.PrepareNativePointer(backing) == backing);
+            assert(Mock::Accessible(backing, true));
+            const int maps = Mock::calls["map"];
+            u8 value = 42;
+            assert(Mock::ProbeMemoryAccess(backing, true, value));
+            assert(Mock::calls["map"] == maps && backing[0] == 42);
+            memory.Clear(2 * 65536, 65536, 0);
+            assert(!Mock::Accessible(backing, true));
+        }
+        assert(memory.fastmem_enabled.load()); // Normal protection/hole faults are expected.
+    }
+    Mock::Reset();
+}
+""".replace("HELPER", helper)
+        self.compile_and_run(native_test)
+
+    def test_default_native_pointer_path_performs_no_preparation_call(self):
+        memory_source = (ROOT / "src/core/memory.cpp").read_text()
+        helper = re.search(
+            r"    u8\* PrepareNativePointer\(.*?^    }", memory_source, re.DOTALL | re.MULTILINE
+        )[0]
+        native_test = r"""
+#include <cassert>
+#include <new>
+using u8 = unsigned char;
+#define NXBOX_UWP 1
+struct Buffer {
+    int calls{};
+    u8* arena{};
+    u8* VirtualBasePointer() const { return arena; }
+    bool PrepareBackingPage(const u8*) { ++calls; return true; }
+};
+struct Callback {
+    Buffer* host_buffer;
+HELPER
+};
+int main() {
+    Buffer buffer;
+    Callback callback{&buffer};
+    u8 value{};
+    for (int i = 0; i < 1000; ++i)
+        assert(callback.PrepareNativePointer(&value) == &value);
+    assert(callback.PrepareNativePointer(nullptr) == nullptr);
+    assert(buffer.calls == 0);
+    buffer.arena = &value;
+    assert(callback.PrepareNativePointer(&value) == &value);
+    assert(buffer.calls == 1); // The regional path still prepares backing.
+}
+""".replace("HELPER", helper)
+        self.compile_and_run(native_test)
+
+    def test_backed_region_preparation_avoids_lock_and_rechecks_after_reclaim(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        # Instrument the production mutex without changing its locking semantics.
+        native_test = "#include <atomic>\nstd::atomic<int> lock_calls{};\n" + native_test
+        native_test = native_test.replace(
+            "std::recursive_mutex mutex;",
+            "struct CountingMutex { std::recursive_mutex inner; "
+            "void lock() { ++lock_calls; inner.lock(); } "
+            "void unlock() { inner.unlock(); } } mutex;",
+        )
+        native_test += r"""
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    for (bool private_backing : {false, true}) {
+        {
+            Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+            assert(memory.Init());
+            auto* backing = memory.backing_base + 65536;
+            if (private_backing) {
+                Mock::fail_name = "create";
+                Mock::fail_at = Mock::calls["create"] + 1;
+            }
+            int locks = lock_calls.load();
+            assert(memory.PrepareBackingPage(backing));
+            assert(lock_calls > locks); // First materialization must lock.
+            locks = lock_calls.load();
+            std::vector<std::thread> workers;
+            for (int core = 0; core < 8; ++core)
+                workers.emplace_back([&] {
+                    for (int i = 0; i < 1000; ++i)
+                        assert(memory.PrepareBackingPage(backing + 4096));
+                });
+            for (auto& worker : workers)
+                worker.join();
+            assert(lock_calls == locks);
+            memory.Clear(65536, 65536, 0);
+            assert(!Mock::Accessible(backing, true));
+            locks = lock_calls.load();
+            assert(memory.PrepareBackingPage(backing));
+            assert(lock_calls > locks && Mock::Accessible(backing, true));
+        }
+        Mock::Reset();
+    }
+}
+"""
+        self.compile_and_run(native_test)
+
+    def test_outside_native_pointers_pass_through_without_disabling_fastmem(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        memory_source = (ROOT / "src/core/memory.cpp").read_text()
+        helper = re.search(
+            r"    u8\* PrepareNativePointer\(.*?^    }", memory_source, re.DOTALL | re.MULTILINE
+        )[0]
+        native_test += r"""
+#define NXBOX_UWP 1
+struct Buffer {
+    Common::HostMemory::Impl& memory;
+    u8* VirtualBasePointer() const { return memory.virtual_base; }
+    bool PrepareBackingPage(const u8* pointer) { return memory.PrepareBackingPage(pointer); }
+};
+struct Callback {
+    Buffer* host_buffer;
+HELPER
+};
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    {
+        Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+        assert(memory.Init() && memory.fastmem_enabled.load());
+        Buffer buffer{memory};
+        Callback callback{&buffer};
+        u8 unrelated{};
+        const auto calls = Mock::calls;
+        for (auto* pointer : {&unrelated, memory.virtual_base,
+                              reinterpret_cast<u8*>(reinterpret_cast<size_t>(memory.backing_base) - 1),
+                              memory.backing_base + memory.backing_size}) {
+            assert(callback.PrepareNativePointer(pointer) == pointer);
+            assert(memory.fastmem_enabled.load());
+            assert(fallback_reasons.empty() && Mock::calls == calls);
+        }
+        assert(callback.PrepareNativePointer(nullptr) == nullptr);
+    }
+    Mock::Reset();
+}
+""".replace("HELPER", helper)
+        self.compile_and_run(native_test)
+
+    def test_unexpected_backing_and_alias_state_latch_session_fallback(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    for (int mode : {0, 1, 2}) {
+        const bool backing_fault = mode != 1;
+        Mock::Reset();
+        {
+            Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+            assert(memory.Init());
+            memory.Map(0, 65536, 65536, Common::MemoryPermission::ReadWrite);
+            assert(Fault(memory.virtual_base));
+            auto* backing = memory.backing_base + 65536;
+            auto* target = backing_fault ? backing : memory.virtual_base;
+            backing[0] = 42;
+            DWORD old{};
+            if (mode == 2)
+                assert(Mock::Unmap(GetCurrentProcess(), backing, MEM_PRESERVE_PLACEHOLDER));
+            else
+                assert(Mock::Protect(target, 65536, PAGE_READONLY, &old));
+            assert(!Mock::Accessible(target, true));
+            assert(Fault(target) == backing_fault);
+            assert(backing[0] == 42); // Remapping a retained section preserves guest bytes.
+            assert(!memory.fastmem_enabled.load());
+            assert(Mock::Accessible(backing, true));
+            assert(fallback_reasons.size() == 1);
+            // Existing view data is retained; new views never re-enable fastmem.
+            backing[0] = 99;
+            memory.Map(65536, 65536, 65536, Common::MemoryPermission::ReadWrite);
+            assert(!Fault(memory.virtual_base + 65536));
+            assert(memory.PrepareBackingPage(backing) && backing[0] == 99);
+            assert(!memory.fastmem_enabled.load() && fallback_reasons.size() == 1);
+        }
+    }
+    Mock::Reset();
+}
+"""
+        self.compile_and_run(native_test)
+
+    def test_failed_native_preparation_is_explicit_and_never_claims_retry(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    Mock::Reset();
+    {
+        Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+        assert(memory.Init());
+        Mock::fail_name = "create";
+        Mock::fail_at = Mock::calls["create"] + 1;
+        Mock::reject_private_replacement = true;
+        assert(!memory.PrepareBackingPage(memory.backing_base + 65536));
+        assert(!Mock::Accessible(memory.backing_base + 65536, true));
+        assert(!memory.fastmem_enabled.load() && fallback_reasons.size() == 1);
+        // A later successful backing allocation cannot reset the session latch.
+        assert(memory.PrepareBackingPage(memory.backing_base + 65536));
+        assert(!memory.fastmem_enabled.load() && fallback_reasons.size() == 1);
+    }
+    Mock::Reset();
+}
+"""
+        self.compile_and_run(native_test)
+
+    def test_runtime_section_failure_recovers_private_backing_in_place(self):
+        native_test = self.allocator_source().split("int main() {", 1)[0]
+        native_test += r"""
+int main() {
+    setenv("NXBOX_FASTMEM", "1", 1);
+    for (const char* api : {"create", "map"}) {
+        Mock::Reset();
+        {
+            Common::HostMemory::Impl memory(4 * 65536, 32 * 65536);
+            assert(memory.Init());
+            memory.Map(0, 65536, 65536, Common::MemoryPermission::ReadWrite);
+            auto* backing = memory.backing_base + 65536;
+            Mock::fail_name = api;
+            Mock::fail_at = Mock::calls[api] + 1; // Fail section creation or backing-view map.
+            // Existing compiled alias access declines, with usable native backing.
+            assert(!Fault(memory.virtual_base));
+            assert(!memory.fastmem_enabled.load() && fallback_reasons.size() == 1);
+            assert(Mock::sections == 0 && Mock::Accessible(backing, true));
+            assert(Mock::calls["private_replace"] == 1);
+            assert(memory.PrepareBackingPage(backing));
+            backing[0] = 91;
+            memory.Clear(65536 + 4096, 4096, 0);
+            assert(backing[0] == 91 && backing[4096] == 0);
+            // Reclaim private allocation to its original placeholder, with no relocation.
+            memory.Clear(65536, 65536, 0);
+            assert(!Mock::Accessible(backing, true) && Mock::committed == 0);
+            assert(memory.PrepareBackingPage(backing) && backing[0] == 0);
+            assert(!memory.fastmem_enabled.load() && fallback_reasons.size() == 1);
+        }
+    }
+    Mock::Reset();
+}
+"""
+        self.compile_and_run(native_test)
+
+    def test_session_latch_stops_a32_and_a64_fastmem_emission(self):
+        emit_source = (
+            ROOT / "src/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc"
+        ).read_text()
+        should_fastmem = (
+            re.search(
+                r"std::optional<AxxEmitX64::DoNotFastmemMarker>.*?^}",
+                emit_source,
+                re.DOTALL | re.MULTILINE,
+            )[0]
+            .replace("AxxEmitX64", "Emitter")
+            .replace("AxxEmitContext", "Context")
+        )
+        for arch in ("32", "64"):
+            config = (ROOT / f"src/dynarmic/src/dynarmic/interface/A{arch}/config.h").read_text()
+            query = re.search(
+                r"    bool IsFastmemEnabled\(\) const {.*?^    }",
+                config,
+                re.DOTALL | re.MULTILINE,
+            )[0]
+            native_test = r"""
+#include <atomic>
+#include <cassert>
+#include <optional>
+#include <set>
+#include <tuple>
+struct Config {
+    std::optional<uintptr_t> fastmem_pointer;
+    const std::atomic<bool>* fastmem_enabled = nullptr;
+QUERY
+};
+struct Context { int Location() { return 1; } };
+namespace IR { struct Inst { int GetName() { return 2; } }; }
+struct Emitter {
+    using DoNotFastmemMarker = std::tuple<int, int>;
+    Config conf;
+    struct Handler { bool SupportsFastmem() const { return true; } } exception_handler;
+    std::set<DoNotFastmemMarker> do_not_fastmem;
+    std::optional<DoNotFastmemMarker> ShouldFastmem(Context&, IR::Inst*) const;
+};
+SHOULD_FASTMEM
+int main() {
+    std::atomic<bool> enabled{true};
+    Emitter emitter;
+    emitter.conf = {0x100000, &enabled};
+    Context ctx;
+    IR::Inst inst;
+    assert(emitter.ShouldFastmem(ctx, &inst));
+    enabled.store(false);
+    assert(!emitter.ShouldFastmem(ctx, &inst));
+    emitter.conf.fastmem_enabled = nullptr; // Other platforms retain their selection.
+    assert(emitter.ShouldFastmem(ctx, &inst));
+}
+""".replace("QUERY", query).replace("SHOULD_FASTMEM", should_fastmem)
+            self.compile_and_run(native_test)
+
     def test_seh_declines_non_data_faults_without_changing_context(self):
         native_test = self.allocator_source().split("int main() {", 1)[0]
         native_test += r"""

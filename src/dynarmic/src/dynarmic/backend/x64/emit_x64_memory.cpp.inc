@@ -19,7 +19,7 @@ using Vector = std::array<u64, 2>;
 }
 
 std::optional<AxxEmitX64::DoNotFastmemMarker> AxxEmitX64::ShouldFastmem(AxxEmitContext& ctx, IR::Inst* inst) const {
-    if (!conf.fastmem_pointer || !exception_handler.SupportsFastmem()) {
+    if (!conf.IsFastmemEnabled() || !exception_handler.SupportsFastmem()) {
         return std::nullopt;
     }
 

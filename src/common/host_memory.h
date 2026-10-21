@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -59,6 +60,12 @@ public:
     void EnableDirectMappedAddress();
 
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
+
+#ifdef YUZU_UWP_APPCONTAINER
+    // Materialize a native callback's page before entering its load/store; ignore foreign pointers.
+    bool PrepareBackingPage(const u8* pointer);
+    const std::atomic<bool>* FastmemEnabledFlag() const;
+#endif
 
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;

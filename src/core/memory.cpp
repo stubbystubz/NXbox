@@ -585,6 +585,20 @@ struct Memory::Impl {
         }
     }
 
+    u8* PrepareNativePointer(u8* pointer) const {
+#ifdef NXBOX_UWP
+        // An untracked fastmem alias can reach a callback without preparing backing.
+        // Materialize the physical page before the native load/store, outside VEH/SEH.
+        // The cached buffer's inline arena check keeps page-table mode free of calls.
+        // Keep preparing regional backing even if new fastmem emission was disabled.
+        if (pointer && host_buffer->VirtualBasePointer() &&
+            !host_buffer->PrepareBackingPage(pointer)) {
+            throw std::bad_alloc{};
+        }
+#endif
+        return pointer;
+    }
+
     template<typename F, typename G>
     [[nodiscard]] u8* GetPointerImpl(u64 vaddr, F&& on_unmapped, G&& on_rasterizer) const {
         // AARCH64 masks the upper 16 bit of all memory accesses
@@ -593,18 +607,18 @@ struct Memory::Impl {
             // Avoid adding any extra logic to this fast-path block
             const auto raw = current_page_table->entries[vaddr >> YUZU_PAGEBITS].Raw();
             if (auto pointer = Common::PageTable::PageEntryData::ExtractPointer(raw); pointer) [[likely]] {
-                return reinterpret_cast<u8*>(pointer + vaddr);
+                return PrepareNativePointer(reinterpret_cast<u8*>(pointer + vaddr));
             } else {
                 switch (static_cast<Common::PageType>(raw.type)) {
                 case Common::PageType::Memory:
                     ASSERT_MSG(false, "Mapped memory page without a pointer @ {:#016x}", vaddr);
                     return nullptr;
                 case Common::PageType::DebugMemory:
-                    return GetPointerFromDebugMemory(vaddr);
+                    return PrepareNativePointer(GetPointerFromDebugMemory(vaddr));
                 case Common::PageType::RasterizerCachedMemory: {
                     u8* const host_ptr{GetPointerFromRasterizerCachedMemory(vaddr)};
                     on_rasterizer();
-                    return host_ptr;
+                    return PrepareNativePointer(host_ptr);
                 }
                 case Common::PageType::Unmapped: [[unlikely]] {
                     on_unmapped();
