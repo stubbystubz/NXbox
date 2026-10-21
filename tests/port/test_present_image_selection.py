@@ -78,7 +78,7 @@ class PresentImageSelectionTests(unittest.TestCase):
                         "-Wall",
                         "-Wextra",
                         f"-DEXPECT_FALLBACK_DOWNLOAD={int(value != '0')}",
-                        f"-DEXPECT_GPU_LOOKUP={int(gpu_lookup == '1')}",
+                        f"-DEXPECT_GPU_LOOKUP={int(gpu_lookup != '0')}",
                         f"-DEXPECT_FAST={int(fast == '1')}",
                     ],
                 )
