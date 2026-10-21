@@ -728,15 +728,42 @@ void NativeWideAtomics() {
   Contains(text, "Load<uint64_t>");
   Contains(text, "InterlockedCompareExchange");
   std::ofstream("hlsl_atomic64.hlsl") << text;
+  Bindings fallback_bindings;
+  const auto fallback = f.Emit(fallback_bindings);
+  Contains(fallback, ".InterlockedAdd(");
+  Contains(fallback, ".InterlockedCompareExchange(");
+  Require(fallback.find("InterlockedCompareExchange64") == fallback.npos,
+          "Fallback used native atomics");
+  std::ofstream("hlsl_atomic64_fallback.hlsl") << fallback;
   Bindings failed{.storage_buffer = 7};
+  Profile disabled{};
+  disabled.hlsl_emulate_int64_atomics = false;
   try {
-    f.Emit(failed);
-    throw std::runtime_error(
-        "Native wide atomics accepted without device capability");
+    f.Emit(failed, disabled);
+    throw std::runtime_error("Disabled wide atomics accepted");
   } catch (const NotImplementedException &error) {
     Contains(error.what(), "SM 6.6");
   }
   Require(failed.storage_buffer == 7, "Failure advanced bindings");
+  // Arceus fails in a fragment shader, not a compute shader.
+  Fixture fragment{Stage::Fragment};
+  fragment.program.info.uses_int64 = true;
+  fragment.program.info.storage_buffers_descriptors.push_back(
+      {.count = 1, .is_written = true});
+  for (auto op :
+       {IR::Opcode::StorageAtomicIAdd64, IR::Opcode::StorageAtomicSMin64,
+        IR::Opcode::StorageAtomicUMin64, IR::Opcode::StorageAtomicSMax64,
+        IR::Opcode::StorageAtomicUMax64, IR::Opcode::StorageAtomicAnd64,
+        IR::Opcode::StorageAtomicOr64, IR::Opcode::StorageAtomicXor64,
+        IR::Opcode::StorageAtomicExchange64}) {
+    fragment.Add(op,
+                 {IR::Value{0u}, IR::Value{0u}, IR::Value{u64{0x1ffffffff}}});
+  }
+  Bindings native_fragment, fallback_fragment;
+  std::ofstream("hlsl_fragment_atomic64_native.hlsl")
+      << fragment.Emit(native_fragment, profile);
+  std::ofstream("hlsl_fragment_atomic64_fallback.hlsl")
+      << fragment.Emit(fallback_fragment);
 }
 void MixedSharedMemory() {
   Fixture f{Stage::Compute};

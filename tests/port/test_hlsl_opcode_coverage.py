@@ -139,6 +139,9 @@ class HlslOpcodeCoverageTests(unittest.TestCase):
             "global": "cs_6_6",
             "geometry": "gs_6_0",
             "atomic64": "cs_6_6",
+            "atomic64_fallback": "cs_6_0",
+            "fragment_atomic64_native": "ps_6_6",
+            "fragment_atomic64_fallback": "ps_6_0",
             "shared64": "cs_6_6",
             "helper": "ps_6_6",
         }

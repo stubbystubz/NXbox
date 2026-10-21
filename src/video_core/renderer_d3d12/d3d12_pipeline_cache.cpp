@@ -11,6 +11,7 @@
 #include <exception>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <regex>
 #include <set>
 #include <stdexcept>
@@ -39,6 +40,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_d3d12/d3d12_hlsl_dump.h"
+#include "video_core/renderer_d3d12/d3d12_int64_policy.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
 #include "video_core/renderer_d3d12/d3d12_pso_diagnostics.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
@@ -865,6 +867,36 @@ struct TranslationState {
         host.ApplyDescriptorLimitPolicy();
         profile.support_typeless_image_loads = options.TypedUAVLoadAdditionalFormats != FALSE;
         profile.support_int64 = host.support_int64;
+        // These UAVs live in descriptor tables, not root descriptors. SM 6.6 alone
+        // only guarantees raw-buffer atomics for root descriptors (OPTIONS11 matters).
+        D3D12_FEATURE_DATA_SHADER_MODEL model{D3D_SHADER_MODEL_6_6};
+        const bool sm66 = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &model,
+                                                                sizeof(model))) &&
+                          model.HighestShaderModel >= D3D_SHADER_MODEL_6_6;
+        D3D12_FEATURE_DATA_D3D12_OPTIONS9 options9{};
+        const auto hr9 =
+            device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &options9, sizeof(options9));
+        D3D12_FEATURE_DATA_D3D12_OPTIONS11 options11{};
+        const auto hr11 = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &options11,
+                                                      sizeof(options11));
+        const bool enabled = Int64AtomicsEnabled();
+        profile.hlsl_emulate_int64_atomics = enabled;
+        profile.support_int64_atomics = UseNativeInt64Atomics(
+            enabled, NativeInt64AtomicsEnabled(), sm66, host.support_int64,
+            SUCCEEDED(hr11) && options11.AtomicInt64OnDescriptorHeapResourceSupported);
+        static std::once_flag atomic_caps_logged;
+        std::call_once(atomic_caps_logged, [&] {
+            Diagnostic(fmt::format(
+                "D3D12 int64 atomics: sm66={} int64={} options9_hr={:#x} typed={} shared={} "
+                "options11_hr={:#x} descriptor_heap={} path={}",
+                sm66, host.support_int64, static_cast<u32>(hr9),
+                options9.AtomicInt64OnTypedResourceSupported != FALSE,
+                options9.AtomicInt64OnGroupSharedSupported != FALSE, static_cast<u32>(hr11),
+                options11.AtomicInt64OnDescriptorHeapResourceSupported != FALSE,
+                !enabled                        ? "disabled"
+                : profile.support_int64_atomics ? "native"
+                                                : "split32"));
+        });
         profile.support_vertex_instance_id = true;
         profile.support_vote = true;
         profile.support_quad_shuffles = true;
@@ -2255,12 +2287,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     graphics.clear();
     compute.clear();
     // RescalingPass bakes the scale into shader instructions. Never prewarm another
-    // resolution's serialized HLSL/PSO under the same guest shader hash. 1x keeps the old
-    // identity so existing caches survive this update.
+    // resolution's serialized HLSL/PSO under the same guest shader hash. Version 6
+    // adds storage int64 atomics; switches also isolate serialized prewarm recipes.
     const auto resolution = Settings::values.resolution_setup.GetValue();
-    const u32 emitter_identity =
-        resolution == Settings::ResolutionSetup::Res1X ? 4u
-                                                       : 5u + (static_cast<u32>(resolution) << 16);
+    const u32 emitter_identity = (resolution == Settings::ResolutionSetup::Res1X
+                                      ? 6u
+                                      : 7u + (static_cast<u32>(resolution) << 16)) |
+                                 (!Int64AtomicsEnabled() ? 1u << 8 : 0u) |
+                                 (!NativeInt64AtomicsEnabled() ? 1u << 9 : 0u);
     const auto identity = DiskPipelineCache::QueryIdentity(
         context.Device(), {emitter_identity, 2, PsoNormalizeEnabled() ? 7u : 6u});
     if (!identity) {

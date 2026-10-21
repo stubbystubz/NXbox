@@ -218,7 +218,10 @@ int main() {
 
     def test_cached_shaders_are_partitioned_by_resolution(self):
         source = (ROOT / "src/video_core/renderer_d3d12/d3d12_pipeline_cache.cpp").read_text()
-        self.assertTrue("static_cast<u32>(resolution) << 16" in source and "Res1X ? 4u" in source)
+        self.assertIn("static_cast<u32>(resolution) << 16", source)
+        self.assertRegex(source, r"Res1X\s*\? 6u")
+        self.assertIn("!Int64AtomicsEnabled()", source)
+        self.assertIn("!NativeInt64AtomicsEnabled()", source)
         self.assertTrue("{emitter_identity, 2," in source)
 
     def test_menu_and_present_are_not_fixed_to_native_scale(self):

@@ -10,7 +10,7 @@ namespace {
 constexpr std::string_view GLOBAL_INDEX = "NonUniformResourceIndex(nx_global_index)";
 void Atomic64(EmitContext& ctx, IR::Inst& inst, std::string_view resource, std::string_view offset,
               std::string_view value) {
-    if (!ctx.profile.support_int64_atomics)
+    if (!ctx.profile.support_int64_atomics && !ctx.profile.hlsl_emulate_int64_atomics)
         throw NotImplementedException(
             "HLSL {} requires SM 6.6 and D3D12 native buffer int64 atomics", inst.GetOpcode());
     const auto result = ctx.var_alloc.Define(inst, HlslVarType::U64);
@@ -54,6 +54,38 @@ void Atomic64(EmitContext& ctx, IR::Inst& inst, std::string_view resource, std::
         break;
     default:
         throw LogicError("Invalid HLSL int64 atomic {}", inst.GetOpcode());
+    }
+    if (!ctx.profile.support_int64_atomics) {
+        // Each word is atomic, but the pair is not a linearizable 64-bit transaction.
+        // In particular, readers can observe the low word before the carry reaches high.
+        if (inst.GetOpcode() == IR::Opcode::StorageAtomicIAdd64 ||
+            inst.GetOpcode() == IR::Opcode::GlobalAtomicIAdd64) {
+            ctx.Add("{{ uint64_t value = {2}; uint lo, hi; "
+                    "{0}.InterlockedAdd({1}, uint(value), lo); "
+                    "uint carry = uint(lo + uint(value) < lo); "
+                    "{0}.InterlockedAdd(({1}) + 4u, uint(value >> 32) + carry, hi); "
+                    "{3} = (uint64_t(hi) << 32) | uint64_t(lo); }}",
+                    resource, offset, value, result);
+        } else {
+            // Retry each word separately, evaluating min/max in 64 bits. Keep the
+            // original low word for the high comparison; concurrent updates can still tear.
+            ctx.Add("{{ uint64_t value = {2}; uint2 original = uint2(0u, 0u); "
+                    "for (uint word = 0u; word < 2u; ++word) {{ "
+                    "uint address = ({1}) + word * 4u; uint expected; uint previous; "
+                    "{0}.InterlockedAdd(address, 0u, expected); "
+                    "do {{ uint other; {0}.InterlockedAdd(({1}) + (1u - word) * 4u, 0u, other); "
+                    "uint64_t old_value = word == 0u ? "
+                    "((uint64_t(other) << 32) | expected) : "
+                    "((uint64_t(expected) << 32) | original.x); "
+                    "uint64_t new_value = {3}; "
+                    "uint replacement = uint(new_value >> (word * 32u)); "
+                    "{0}.InterlockedCompareExchange(address, expected, replacement, previous); "
+                    "if (previous == expected) break; expected = previous; }} while (true); "
+                    "original[word] = expected; }} "
+                    "{4} = (uint64_t(original.y) << 32) | original.x; }}",
+                    resource, offset, value, operation, result);
+        }
+        return;
     }
     ctx.Add("{{ uint64_t old_value = {0}.Load<uint64_t>({1}); uint64_t previous; "
             "uint64_t value = {2}; do {{ uint64_t new_value = {3}; "

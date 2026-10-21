@@ -11,6 +11,9 @@
 #include <stdexcept>
 #include <dxgi1_4.h>
 #include <windows.h>
+#ifdef NXBOX_UWP
+#include <winrt/Windows.System.Profile.h>
+#endif
 #include "common/fps_overlay.h"
 #include "common/logging.h"
 #include "common/maxwell_method_profile.h"
@@ -19,6 +22,7 @@
 #include "eden_uwp/renderer_boundary.h"
 #include "eden_uwp/thread_profile.h"
 #include "video_core/capture.h"
+#include "video_core/renderer_d3d12/d3d12_output_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
@@ -88,6 +92,18 @@ struct RendererD3D12::Impl {
     u64 present_sequence{};
     UINT rtv_stride{};
     UINT srv_stride{};
+    bool series_s{};
+    std::string output_environment;
+    OutputExtent OutputSize(u32 requested_width, u32 requested_height) const {
+        const auto size =
+            ChooseOutputExtent({requested_width, requested_height}, series_s, output_environment);
+        if (size.width != width || size.height != height)
+            Diagnostic("D3D12 output requested=" + std::to_string(requested_width) + "x" +
+                       std::to_string(requested_height) + " chosen=" + std::to_string(size.width) +
+                       "x" + std::to_string(size.height) + " series_s=" + std::to_string(series_s) +
+                       " NXBOX_SERIES_S_1080P=" + (output_environment == "0" ? "0" : "1"));
+        return size;
+    }
     u32 width{};
     u32 height{};
     std::atomic<bool> failed{};
@@ -223,8 +239,24 @@ struct RendererD3D12::Impl {
         ComPtr<IDXGIFactory2> factory;
         Check(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)), "CreateDXGIFactory2",
               context.Device());
-        width = std::max(1u, window.GetFramebufferLayout().width);
-        height = std::max(1u, window.GetFramebufferLayout().height);
+#ifdef NXBOX_UWP
+        try {
+            const auto form =
+                winrt::to_string(winrt::Windows::System::Profile::AnalyticsInfo::DeviceForm());
+            series_s = IsSeriesS(form);
+            Diagnostic("D3D12 output device_form=" + form);
+        } catch (const winrt::hresult_error&) {
+            Diagnostic("D3D12 output device_form unavailable; output cap not applied");
+        }
+#endif
+        char output_cap[16]{};
+        if (GetEnvironmentVariableA("NXBOX_SERIES_S_1080P", output_cap, sizeof(output_cap)) != 1)
+            output_cap[0] = 0;
+        output_environment = output_cap;
+        const auto size =
+            OutputSize(window.GetFramebufferLayout().width, window.GetFramebufferLayout().height);
+        width = size.width;
+        height = size.height;
         DXGI_SWAP_CHAIN_DESC1 desc{};
         desc.Width = width;
         desc.Height = height;
@@ -464,8 +496,9 @@ struct RendererD3D12::Impl {
         }
         // Each swapchain buffer owns a descriptor slice; wait only when reusing it.
         context.Collect();
-        const auto new_width = std::max(1u, layout.width);
-        const auto new_height = std::max(1u, layout.height);
+        const auto size = OutputSize(layout.width, layout.height);
+        const auto new_width = size.width;
+        const auto new_height = size.height;
         if (width != new_width || height != new_height) {
             context.Finish(FrameCount::ForcedSubmitLifecycle);
             present_ticks.fill(0);
@@ -479,7 +512,19 @@ struct RendererD3D12::Impl {
             AcquireBuffers();
         }
         UINT index = swapchain->GetCurrentBackBufferIndex();
-        Draw(layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
+        auto output_layout = layout;
+        const auto scale_x = [&](auto x) {
+            return static_cast<decltype(x)>(std::uint64_t{x} * width / std::max(1u, layout.width));
+        };
+        const auto scale_y = [&](auto y) {
+            return static_cast<decltype(y)>(std::uint64_t{y} * height /
+                                            std::max(1u, layout.height));
+        };
+        output_layout.screen = {scale_x(layout.screen.left), scale_y(layout.screen.top),
+                                scale_x(layout.screen.right), scale_y(layout.screen.bottom)};
+        output_layout.width = width;
+        output_layout.height = height;
+        Draw(output_layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
         if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {
             const auto now = std::chrono::steady_clock::now();
             const double seconds =
