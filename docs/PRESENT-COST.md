@@ -208,3 +208,18 @@ Final host result (Mac arm64): 993 tests in 538.841 seconds, OK, 44 skipped;
 package through PYTHONPATH, removing the two known failed-import placeholders
 without changing installed packages. The new NamedScope regression adds one
 test. Formatting checks and `git diff --check` pass. No commits were made.
+
+## GPU lookup (p46), on by default
+
+`NXBOX_D3D12_PRESENT_GPU_LOOKUP` now defaults to on; set it to `0` to return to
+the guest-memory download/upload path. Console results on 0.3.823 (chain76,
+Series X): every title resolved `result=gpu_view`, the image was intact, and
+`present_upload`/`present_download` left the method profile.
+
+| Title | Before (fps) | GPU lookup (fps) | Luma |
+| --- | ---: | ---: | ---: |
+| Mario Kart 8 Deluxe | 30.4 | 30.3 | 106 |
+| Super Mario Odyssey | 24.8 | 23.0 | 74 |
+| Super Mario Bros. Wonder | 27.2 | 30.0 | 176 |
+| Mario Party Superstars | 54.5 | 59.9 | 139 |
+| MK8D, Series S simulation | 22.1 | 23.2 | 102 |

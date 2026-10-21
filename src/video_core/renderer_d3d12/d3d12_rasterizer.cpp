@@ -4276,7 +4276,8 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
     std::scoped_lock lock{texture_cache.mutex};
     static const bool gpu_lookup = [] {
         const char* value = std::getenv("NXBOX_D3D12_PRESENT_GPU_LOOKUP");
-        return value && value[0] == '1' && value[1] == '\0';
+        // On by default since chain76 (MK8D, Odyssey, Wonder, Mario Party); "0" opts out.
+        return !(value && value[0] == '0' && value[1] == '\0');
     }();
     const bool diagnose_lookup = !std::exchange(presentation_lookup_logged, true);
     auto [view, scaled] = texture_cache.TryFindFramebufferImageView(
