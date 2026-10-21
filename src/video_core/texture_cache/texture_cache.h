@@ -1456,7 +1456,7 @@ std::string TextureCache<P>::RecordPassDumpPresentation(DAddr cpu_addr, const Im
 
 template <class P>
 std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImageView(
-    const Tegra::FramebufferConfig& config, DAddr cpu_addr) {
+    const Tegra::FramebufferConfig& config, DAddr cpu_addr, bool gpu_lookup, bool diagnose) {
     const auto view_format = [&]() {
         switch (config.pixel_format) {
         case Service::android::PixelFormat::Rgb565:
@@ -1468,26 +1468,101 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         }
     }();
 
+    // D3D12 requests this once per presenter, independently of PASS_DUMP.
+    const auto report = [&](std::string_view message) {
+        if (diagnose)
+            ReportPassDump(std::string{message});
+    };
+    if (diagnose)
+        report(fmt::format("D3D12_DISPLAY_MISS config address={} offset={} query={} extent={}x{} "
+                           "stride={} format={} layout=block_linear block=0,4,0 gpu_lookup={}",
+                           config.address, config.offset, cpu_addr, config.width, config.height,
+                           config.stride, PassDump::FormatName(view_format), gpu_lookup));
     const auto it = page_table.find(cpu_addr >> YUZU_PAGEBITS);
     if (it == page_table.end()) {
+        report("D3D12_DISPLAY_MISS reason=no_address_page");
         return {};
     }
     const auto& image_map_ids = it->second;
-    boost::container::small_vector<ImageId, 4> valid_image_ids;
+    struct Candidate {
+        ImageId id;
+        SubresourceBase base;
+    };
+    boost::container::small_vector<Candidate, 4> valid_image_ids;
+    u64 newest_gpu_tick = 0;
+    bool legacy_hit = false;
     for (const ImageMapId map_id : image_map_ids) {
         const ImageMapView& map = slot_map_views[map_id];
         const ImageBase& image = slot_images[map.image_id];
-        if (image.cpu_addr != cpu_addr) {
+        if (!map.Overlaps(cpu_addr, 1))
             continue;
-        }
-        // An address can have several format/size aliases. Never create a display view
-        // on an incompatible resource just because it was modified more recently.
-        const bool eligible =
-            image.info.type == ImageType::e2D && image.info.size.width == config.stride &&
-            image.info.size.height == config.height &&
+        if (True(image.flags & ImageFlagBits::GpuModified))
+            newest_gpu_tick = (std::max)(newest_gpu_tick, image.modification_tick);
+        const bool same_base = image.cpu_addr == cpu_addr;
+        const bool same_size =
+            image.info.size.width == config.stride && image.info.size.height == config.height;
+        const bool same_format =
             IsViewCompatible(image.info.format, view_format, runtime.HasBrokenTextureViewFormats(),
                              runtime.HasNativeBgr());
-        if (PassDump::GetConfig().enabled && CaptureFrame() == PassDump::GetConfig().frame) {
+        const bool legacy_eligible =
+            same_base && image.info.type == ImageType::e2D && same_size && same_format;
+        legacy_hit |= legacy_eligible;
+        bool eligible = legacy_eligible;
+        SubresourceBase base{};
+        const char* reason = !same_base                          ? "base_address"
+                             : image.info.type != ImageType::e2D ? "image_type"
+                             : !same_size                        ? "geometry"
+                             : !same_format                      ? "format"
+                                                                 : "accepted";
+        const char* gpu_reason = "disabled";
+        if (gpu_lookup || diagnose) {
+            // Map-relative addressing also handles sparse/aliased CPU mappings. Only
+            // exact subresource starts are safe; an arbitrary byte offset is not a crop.
+            const auto subresource = image.TryFindBase(map.gpu_addr + cpu_addr - map.cpu_addr);
+            bool castable = false;
+            if constexpr (requires {
+                              runtime.CanPresentImage(slot_images[map.image_id], view_format);
+                          })
+                castable = runtime.CanPresentImage(slot_images[map.image_id], view_format);
+            // NVFlinger fallback is block-linear with log2 block height 4. Pitch,
+            // MSAA and a different GOB layout cannot be fixed by a format view.
+            const bool layout = image.info.type == ImageType::e2D && image.info.block.width == 0 &&
+                                image.info.block.height == 4 && image.info.block.depth == 0 &&
+                                image.info.tile_width_spacing == 0 && image.info.num_samples == 1;
+            const bool geometry =
+                subresource && subresource->level == 0 && subresource->layer >= 0 &&
+                subresource->layer < image.info.resources.layers &&
+                image.info.size.width == config.stride && image.info.size.height >= config.height &&
+                image.info.size.height <= ((config.height + 127u) / 128u) * 128u;
+            if (gpu_lookup)
+                eligible = layout && geometry && castable;
+            if (subresource)
+                base = *subresource;
+            gpu_reason = !subresource ? "not_subresource_start"
+                         : !layout    ? "guest_layout"
+                         : !geometry  ? "subresource_geometry"
+                         : !castable  ? "host_format_cast"
+                                      : "accepted";
+        }
+        if (diagnose)
+            report(fmt::format(
+                "D3D12_DISPLAY_MISS candidate cpu={} end={} gpu={:x} delta={} format={} "
+                "type={} extent={}x{} levels={} layers={} pitch_or_block_x={} block_y={} "
+                "block_z={} "
+                "tile_spacing={} samples={} layer_stride={} mip={} layer={} tick={} cpu_dirty={} "
+                "gpu_dirty={} aliases={} base_match={} geometry_match={} format_match={} "
+                "legacy_reason={} gpu_reason={}",
+                image.cpu_addr, image.cpu_addr_end, image.gpu_addr, cpu_addr - map.cpu_addr,
+                PassDump::FormatName(image.info.format), static_cast<unsigned>(image.info.type),
+                image.info.size.width, image.info.size.height, image.info.resources.levels,
+                image.info.resources.layers, image.info.block.width, image.info.block.height,
+                image.info.block.depth, image.info.tile_width_spacing, image.info.num_samples,
+                image.info.layer_stride, base.level, base.layer, image.modification_tick,
+                True(image.flags & ImageFlagBits::CpuModified),
+                True(image.flags & ImageFlagBits::GpuModified), image.aliased_images.size(),
+                same_base, same_size, same_format, reason, gpu_reason));
+        if (same_base && PassDump::GetConfig().enabled &&
+            CaptureFrame() == PassDump::GetConfig().frame) {
             const auto writer =
                 std::ranges::find(pass_dump_writers, map.image_id, &PassDumpWriter::id);
             ReportPassDump(fmt::format(
@@ -1505,12 +1580,24 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
                 writer == pass_dump_writers.end() ? 0 : writer->source));
         }
         if (eligible) {
-            valid_image_ids.push_back(map.image_id);
+            valid_image_ids.push_back({map.image_id, gpu_lookup ? base : SubresourceBase{}});
         }
     }
 
-    const auto GetImageViewForFramebuffer = [&](ImageId image_id) {
-        ImageViewInfo info{ImageViewType::e2D, view_format};
+    const auto GetImageViewForFramebuffer = [&](const Candidate& candidate) {
+        const auto image_id = candidate.id;
+        if (gpu_lookup && slot_images[image_id].modification_tick < newest_gpu_tick) {
+            // A newer incompatible overlapping GPU writer may own these bytes. Do
+            // not present a stale compatible alias or invoke a CPU alias conversion.
+            report("D3D12_DISPLAY_MISS reason=newer_gpu_overlap");
+            return std::pair<ImageView*, bool>{};
+        }
+        if (diagnose)
+            report(fmt::format(
+                "D3D12_DISPLAY_MISS result={} legacy_hit={} gpu={:x} mip={} layer={}",
+                gpu_lookup ? "gpu_view" : "legacy_view", legacy_hit, slot_images[image_id].gpu_addr,
+                candidate.base.level, candidate.base.layer));
+        ImageViewInfo info{ImageViewType::e2D, view_format, {candidate.base, {1, 1}}};
         if (config.blending == Tegra::BlendMode::Opaque) {
             info.x_source = static_cast<u8>(SwizzleSource::R);
             info.y_source = static_cast<u8>(SwizzleSource::G);
@@ -1527,11 +1614,12 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
 
     if (valid_image_ids.size() > 0) [[unlikely]] {
         auto most_recent = std::ranges::max_element(valid_image_ids, [&](auto a, auto b) {
-            return slot_images[a].modification_tick < slot_images[b].modification_tick;
+            return slot_images[a.id].modification_tick < slot_images[b.id].modification_tick;
         });
         return GetImageViewForFramebuffer(*most_recent);
     }
 
+    report("D3D12_DISPLAY_MISS reason=no_compatible_candidate");
     return {};
 }
 

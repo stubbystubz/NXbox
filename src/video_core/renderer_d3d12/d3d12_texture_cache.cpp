@@ -1035,6 +1035,24 @@ void ImageView::LogUnsupported(std::string_view condition) const {
     info.type = image_type;
     UnsupportedImage(info, HostFormat(), condition);
 }
+bool TextureCacheRuntime::CanPresentImage(const Image& image,
+                                          VideoCore::Surface::PixelFormat format) const {
+    using VideoCore::Surface::PixelFormat;
+    // These pairs have identical guest bytes and component order. Sampling the
+    // UNORM view preserves the fallback's transfer function (no sRGB decoding).
+    // Do not use Maxwell's broad 32-bit class: BGRA/RGBA and float need repacking.
+    const bool family =
+        image.info.format == format ||
+        (format == PixelFormat::A8B8G8R8_UNORM &&
+         image.info.format == PixelFormat::A8B8G8R8_SRGB) ||
+        (format == PixelFormat::B8G8R8A8_UNORM && image.info.format == PixelFormat::B8G8R8A8_SRGB);
+    const auto resource = image.Handle();
+    const auto host = image.HostFormat();
+    const auto view = MaxwellFormat(format);
+    return family && resource && host.conversion == FormatConversion::None && !host.depth &&
+           view.Supported() &&
+           resource->SupportsViewFormat(static_cast<DXGI_FORMAT>(view.view_format));
+}
 bool TextureCacheRuntime::CanViewFormat(const ImageView& view,
                                         VideoCore::Surface::PixelFormat format) const {
     if (view.IsBuffer())

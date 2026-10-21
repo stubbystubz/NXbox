@@ -16,6 +16,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include "common/alignment.h"
@@ -4273,8 +4274,15 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
     const Common::MaxwellMethodProfile::NamedScope lookup_profile{
         Common::MaxwellMethodProfile::PresentLookup};
     std::scoped_lock lock{texture_cache.mutex};
-    auto [view, scaled] =
-        texture_cache.TryFindFramebufferImageView(config, config.address + config.offset);
+    static const bool gpu_lookup = [] {
+        const char* value = std::getenv("NXBOX_D3D12_PRESENT_GPU_LOOKUP");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    const bool diagnose_lookup = !std::exchange(presentation_lookup_logged, true);
+    auto [view, scaled] = texture_cache.TryFindFramebufferImageView(
+        config, config.address + config.offset, gpu_lookup, diagnose_lookup);
+    if (diagnose_lookup && view && !view->ImageHandle())
+        Diagnostic("D3D12_DISPLAY_MISS reason=view_resource_unavailable");
     const auto log_source = [&](const ResourcePtr& resource, DXGI_FORMAT format, bool cached) {
         if (cached)
             texture_cache.SnapshotPassDumpPresentation(*view);
