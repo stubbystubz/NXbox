@@ -10,6 +10,9 @@
 #include <cstring>
 #include "common/logging.h"
 #endif
+#ifdef NXBOX_UWP
+#include "core/hle/kernel/nxbox_thread_profile.h"
+#endif
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_event.h"
@@ -102,6 +105,12 @@ Kernel::KEvent* ServiceContext::CreateEvent(std::string&& name) {
 
     // Initialize the event.
     event->Initialize(kernel, process);
+#ifdef NXBOX_UWP
+    if (Kernel::NxboxThreadProfile::Enabled()) {
+        LOG_INFO(Service, "THREAD_PROFILE event_object={:#x} name={}",
+                 reinterpret_cast<std::uintptr_t>(&event->GetReadableEvent()), name);
+    }
+#endif
 
     // Commit the thread reservation.
     event_reservation.Commit();
