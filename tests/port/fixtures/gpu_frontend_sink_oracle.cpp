@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 #include "common/gpu_thread_profile.h"
+#include "common/maxwell_method_profile.h"
 #include "video_core/gpu_frontend.h"
 using u32 = std::uint32_t;
 using u8 = std::uint8_t;

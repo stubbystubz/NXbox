@@ -3962,7 +3962,10 @@ void RasterizerD3D12::ProfileGpuThread(bool active) {
         context.Profile().BindRecordingThread(true);
         Common::GpuProfile::sink = &context.Profile();
         Common::GpuProfile::recording_enabled = true;
+        Common::MaxwellMethodProfile::collector =
+            Common::MaxwellMethodProfile::Enabled() ? &context.Profile() : nullptr;
     } else {
+        Common::MaxwellMethodProfile::collector = nullptr;
         Common::GpuProfile::recording_enabled = false;
         Common::GpuProfile::sink = nullptr;
         Common::GpuProfile::enabled.store(false);

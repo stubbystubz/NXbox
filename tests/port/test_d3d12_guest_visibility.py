@@ -223,7 +223,11 @@ struct Timing {
     void Reset(u64 v) { last=v; }
 };
 struct FrameProfile {
-    bool enabled=true;
+    bool enabled=true, method_enabled=false;
+    u64 method_clock_base{};
+    std::array<Common::MaxwellMethodProfile::Sample,
+               Common::MaxwellMethodProfile::ClassCount +
+               Common::MaxwellMethodProfile::RegisterCount> samples{};
     std::atomic<DWORD> owner{1};
     Timing timing;
     std::array<u64,static_cast<size_t>(FrameCount::Count)> counts{};

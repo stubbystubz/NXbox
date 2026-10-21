@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/gpu_thread_profile.h"
+#include "common/maxwell_method_profile.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
@@ -304,45 +305,49 @@ void Maxwell3D::ConsumeSinkImpl(Core::System&) {
         Common::GpuProfile::Phase::Maxwell3DMethods};
     const Common::GpuProfile::MethodScope state_profile{Common::GpuProfile::MethodClass::DrawState,
                                                         method_sink.size()};
-    // Select instrumentation once for the whole sink, rather than once per write.
-    const auto consume = [&](auto process) {
-        const auto control = shadow_state.shadow_ram_control;
-        if (control == Regs::ShadowRamControl::Track ||
-            control == Regs::ShadowRamControl::TrackWithFilter) {
-            for (auto [method, value] : method_sink) {
-                shadow_state.reg_array[method] = value;
-                process(method, value);
+    Common::MaxwellMethodProfile::Dispatch(
+        [] { return Common::MaxwellMethodProfile::ShadowDirty; }, method_sink.size(),
+        [&](auto) {
+            // Select instrumentation once for the whole sink, rather than once per write.
+            const auto consume = [&](auto process) {
+                const auto control = shadow_state.shadow_ram_control;
+                if (control == Regs::ShadowRamControl::Track ||
+                    control == Regs::ShadowRamControl::TrackWithFilter) {
+                    for (auto [method, value] : method_sink) {
+                        shadow_state.reg_array[method] = value;
+                        process(method, value);
+                    }
+                } else if (control == Regs::ShadowRamControl::Replay) {
+                    for (auto [method, value] : method_sink)
+                        process(method, shadow_state.reg_array[method]);
+                } else {
+                    for (auto [method, value] : method_sink)
+                        process(method, value);
+                }
+            };
+            if (!frontend_fastpath || (Common::GpuProfile::recording_enabled &&
+                                       Common::GpuProfile::MethodProfilingEnabled())) {
+                consume([&](u32 method, u32 value) { ProcessDirtyRegisters(method, value); });
+            } else {
+                // No side effects or draws can observe flags until the sink is drained.
+                // Accumulate locally and merge once, preserving changed-then-restored writes.
+                decltype(dirty.flags) pending_flags{};
+                consume([&](u32 method, u32 value) {
+                    if (method == MAXWELL3D_REG_INDEX(program_region.address_high) ||
+                        method == MAXWELL3D_REG_INDEX(program_region.address_low)) {
+                        ProcessDirtyRegistersImpl(method, value);
+                        return;
+                    }
+                    if (regs.reg_array[method] == value)
+                        return;
+                    regs.reg_array[method] = value;
+                    pending_flags[dirty.tables[0][method]] = true;
+                    pending_flags[dirty.tables[1][method]] = true;
+                });
+                dirty.flags |= pending_flags;
             }
-        } else if (control == Regs::ShadowRamControl::Replay) {
-            for (auto [method, value] : method_sink)
-                process(method, shadow_state.reg_array[method]);
-        } else {
-            for (auto [method, value] : method_sink)
-                process(method, value);
-        }
-    };
-    if (!frontend_fastpath ||
-        (Common::GpuProfile::recording_enabled && Common::GpuProfile::MethodProfilingEnabled())) {
-        consume([&](u32 method, u32 value) { ProcessDirtyRegisters(method, value); });
-    } else {
-        // No side effects or draws can observe flags until the sink is drained.
-        // Accumulate locally and merge once, preserving changed-then-restored writes.
-        decltype(dirty.flags) pending_flags{};
-        consume([&](u32 method, u32 value) {
-            if (method == MAXWELL3D_REG_INDEX(program_region.address_high) ||
-                method == MAXWELL3D_REG_INDEX(program_region.address_low)) {
-                ProcessDirtyRegistersImpl(method, value);
-                return;
-            }
-            if (regs.reg_array[method] == value)
-                return;
-            regs.reg_array[method] = value;
-            pending_flags[dirty.tables[0][method]] = true;
-            pending_flags[dirty.tables[1][method]] = true;
+            method_sink.clear();
         });
-        dirty.flags |= pending_flags;
-    }
-    method_sink.clear();
 }
 
 void Maxwell3D::ProcessDirtyRegisters(u32 method, u32 argument) {
@@ -485,12 +490,64 @@ void Maxwell3D::CallMacroMethod(Core::System& system, u32 method, const std::vec
     draw_manager.DrawDeferred(*this);
 }
 
+u32 Maxwell3D::MethodProfileKey(u32 method) const {
+    using namespace Common::MaxwellMethodProfile;
+    if (method >= MacroRegistersStart)
+        return Macro;
+    if (method >= MAXWELL3D_REG_INDEX(const_buffer.buffer) &&
+        method < MAXWELL3D_REG_INDEX(const_buffer.buffer) + 16)
+        return ConstantBuffer;
+    switch (method) {
+    case MAXWELL3D_REG_INDEX(inline_data):
+    case MAXWELL3D_REG_INDEX(launch_dma):
+        return InlineUpload;
+    case MAXWELL3D_REG_INDEX(draw.begin):
+        return DrawBegin;
+    case MAXWELL3D_REG_INDEX(draw.end):
+        return DrawEnd;
+    case MAXWELL3D_REG_INDEX(draw_inline_index):
+    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+        return DrawInline;
+    case MAXWELL3D_REG_INDEX(index_buffer.count):
+    case MAXWELL3D_REG_INDEX(index_buffer32_first):
+    case MAXWELL3D_REG_INDEX(index_buffer16_first):
+    case MAXWELL3D_REG_INDEX(index_buffer8_first):
+    case MAXWELL3D_REG_INDEX(index_buffer32_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer16_subsequent):
+    case MAXWELL3D_REG_INDEX(index_buffer8_subsequent):
+        return DrawIndexed;
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_first):
+    case MAXWELL3D_REG_INDEX(vertex_array_instance_subsequent):
+    case MAXWELL3D_REG_INDEX(draw_texture.src_y0):
+        return Draw;
+    case MAXWELL3D_REG_INDEX(clear_surface):
+        return Clear;
+    case MAXWELL3D_REG_INDEX(report_semaphore.query):
+    case MAXWELL3D_REG_INDEX(render_enable.mode):
+    case MAXWELL3D_REG_INDEX(clear_report_value):
+    case MAXWELL3D_REG_INDEX(sync_info):
+    case MAXWELL3D_REG_INDEX(wait_for_idle):
+    case MAXWELL3D_REG_INDEX(fragment_barrier):
+    case MAXWELL3D_REG_INDEX(invalidate_texture_data_cache):
+    case MAXWELL3D_REG_INDEX(tiled_cache_barrier):
+        return QuerySync;
+    default:
+        return execution_mask[method] ? ClassCount + method : PlainRegisters;
+    }
+}
+
 void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
     const Common::GpuProfile::RecordingScope gpu_profile_scope{
         Common::GpuProfile::Phase::Maxwell3DMethods};
-    CallMethodImpl(system, method, method_argument, is_last_call);
+    Common::MaxwellMethodProfile::Dispatch([&] { return MethodProfileKey(method); }, 1,
+                                           [&](auto profile) {
+                                               CallMethodImpl<decltype(profile)::value>(
+                                                   system, method, method_argument, is_last_call);
+                                           });
 }
 
+template <bool Profile>
 void Maxwell3D::CallMethodImpl(Core::System& system, u32 method, u32 method_argument,
                                bool is_last_call) {
     // It is an error to write to a register other than the current macro's ARG register before
@@ -510,8 +567,11 @@ void Maxwell3D::CallMethodImpl(Core::System& system, u32 method, u32 method_argu
         ASSERT(method < Regs::NUM_REGS &&
                "Invalid Maxwell3D register, increase the size of the Regs structure");
     }
-    const u32 argument = ProcessShadowRam(method, method_argument);
-    ProcessDirtyRegisters(method, argument);
+    const u32 argument = Common::MaxwellMethodProfile::Shadow<Profile>(1, [&] {
+        const u32 value = ProcessShadowRam(method, method_argument);
+        ProcessDirtyRegisters(method, value);
+        return value;
+    });
     // Macro sends also write ordinary state registers. The DMA sink already uses
     // this mask to bypass side-effect dispatch; do the same for scalar sends,
     // after preserving shadow tracking and dirty bits even when the value repeats.
@@ -524,99 +584,119 @@ void Maxwell3D::CallMethodImpl(Core::System& system, u32 method, u32 method_argu
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     const Common::GpuProfile::RecordingScope gpu_profile_scope{
         Common::GpuProfile::Phase::Maxwell3DMethods};
-    // Methods after 0xE00 are special, they're actually triggers for some microcode that was
-    // uploaded to the GPU during initialization.
-    if (method >= MacroRegistersStart) {
-        ProcessMacro(system, method, base_start, amount, amount == methods_pending);
-        return;
-    }
-    // Ordinary repeated writes still dirty the register when an intermediate value
-    // changes and the final value restores it. There is no observer between these
-    // writes, but dirty flags must match scalar dispatch (also in Track/Replay).
-    if (amount != 0 && executing_macro == 0 && !execution_mask[method]) {
-        for (u32 i = 0; i < amount; ++i) {
-            ProcessDirtyRegisters(method, ProcessShadowRam(method, base_start[i]));
-        }
-        return;
-    }
-    switch (method) {
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer):
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 1:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 2:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 3:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 4:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 5:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 6:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 7:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 8:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 9:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 10:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 11:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 12:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 13:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 14:
-    case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 15:
-        ProcessCBMultiData(base_start, amount);
-        break;
-    case MAXWELL3D_REG_INDEX(inline_data): {
-        ASSERT(methods_pending == amount);
-        upload_state.ProcessData(base_start, amount);
-        return;
-    }
-    case MAXWELL3D_REG_INDEX(draw_inline_index):
-    case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
-    case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
-        if (shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay) {
-            ProcessInlineIndexMultiData(method, base_start, amount);
-            break;
-        }
-        [[fallthrough]];
-    default:
-        if (!method_batching) {
-            for (u32 i = 0; i < amount; ++i) {
-                CallMethod(system, method, base_start[i], methods_pending - i <= 1);
+    Common::MaxwellMethodProfile::Dispatch(
+        [&] { return MethodProfileKey(method); }, amount,
+        [&](auto profile) {
+            // Methods after 0xE00 are special, they're actually triggers for some microcode that
+            // was uploaded to the GPU during initialization.
+            if (method >= MacroRegistersStart) {
+                ProcessMacro(system, method, base_start, amount, amount == methods_pending);
+                return;
             }
-            break;
-        }
-        for (u32 i = 0; i < amount; i++) {
-            // The outer bulk call owns the profiling boundary, including exceptions.
-            CallMethodImpl(system, method, base_start[i], methods_pending - i <= 1);
-        }
-        break;
-    }
+            // Ordinary repeated writes still dirty the register when an intermediate value
+            // changes and the final value restores it. There is no observer between these
+            // writes, but dirty flags must match scalar dispatch (also in Track/Replay).
+            if (amount != 0 && executing_macro == 0 && !execution_mask[method]) {
+                Common::MaxwellMethodProfile::Shadow<decltype(profile)::value>(amount, [&] {
+                    for (u32 i = 0; i < amount; ++i) {
+                        ProcessDirtyRegisters(method, ProcessShadowRam(method, base_start[i]));
+                    }
+                });
+                return;
+            }
+            switch (method) {
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer):
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 1:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 2:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 3:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 4:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 5:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 6:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 7:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 8:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 9:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 10:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 11:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 12:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 13:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 14:
+            case MAXWELL3D_REG_INDEX(const_buffer.buffer) + 15:
+                ProcessCBMultiData(base_start, amount);
+                break;
+            case MAXWELL3D_REG_INDEX(inline_data): {
+                ASSERT(methods_pending == amount);
+                upload_state.ProcessData(base_start, amount);
+                return;
+            }
+            case MAXWELL3D_REG_INDEX(draw_inline_index):
+            case MAXWELL3D_REG_INDEX(inline_index_2x16.even):
+            case MAXWELL3D_REG_INDEX(inline_index_4x8.index0):
+                if (shadow_state.shadow_ram_control != Regs::ShadowRamControl::Replay) {
+                    ProcessInlineIndexMultiData(method, base_start, amount);
+                    break;
+                }
+                [[fallthrough]];
+            default:
+                if (!method_batching) {
+                    for (u32 i = 0; i < amount; ++i) {
+                        const Common::GpuProfile::RecordingScope nested_scope{
+                            Common::GpuProfile::Phase::Maxwell3DMethods};
+                        CallMethodImpl<decltype(profile)::value>(system, method, base_start[i],
+                                                                 methods_pending - i <= 1);
+                    }
+                    break;
+                }
+                for (u32 i = 0; i < amount; i++) {
+                    // The outer bulk call owns the profiling boundary, including exceptions.
+                    CallMethodImpl<decltype(profile)::value>(system, method, base_start[i],
+                                                             methods_pending - i <= 1);
+                }
+                break;
+            }
+        });
 }
 
 void Maxwell3D::CallMultiMethod(Core::System&, u32 method, const u32* values, u32 amount) {
-    // The DMA parser checks the complete range against execution_mask. Preserve
-    // every intermediate write: dirty bits and shadow RAM are consumed in order.
-    if (!frontend_fastpath) {
-        for (u32 i = 0; i < amount; ++i)
-            method_sink.emplace_back(method + i, values[i]);
-        return;
-    }
-    if (amount == 0)
-        return;
-    const auto first = method_sink.size();
-    method_sink.resize(first + amount);
-    auto* output = method_sink.data() + first;
-    for (u32 i = 0; i < amount; ++i)
-        output[i] = {method + i, values[i]};
+    Common::MaxwellMethodProfile::Dispatch(
+        [&] { return Common::MaxwellMethodProfile::PlainRegisters; }, amount,
+        [&](auto) {
+            // The DMA parser checks the complete range against execution_mask. Preserve
+            // every intermediate write: dirty bits and shadow RAM are consumed in order.
+            if (!frontend_fastpath) {
+                for (u32 i = 0; i < amount; ++i)
+                    method_sink.emplace_back(method + i, values[i]);
+                return;
+            }
+            if (amount == 0)
+                return;
+            const auto first = method_sink.size();
+            method_sink.resize(first + amount);
+            auto* output = method_sink.data() + first;
+            for (u32 i = 0; i < amount; ++i)
+                output[i] = {method + i, values[i]};
+        });
 }
 
 void Maxwell3D::CallCBDataIncrementing(u32 method, const u32* values, u32 amount) {
     const Common::GpuProfile::RecordingScope gpu_profile_scope{
         Common::GpuProfile::Phase::Maxwell3DMethods};
-    ASSERT(executing_macro == 0);
-    ASSERT(method >= MAXWELL3D_REG_INDEX(const_buffer.buffer));
-    ASSERT(method + amount <= MAXWELL3D_REG_INDEX(const_buffer.buffer) + 16);
-    std::array<u32, 16> arguments;
-    for (u32 i = 0; i < amount; ++i) {
-        arguments[i] = ProcessShadowRam(method + i, values[i]);
-        ProcessDirtyRegisters(method + i, arguments[i]);
-    }
-    // All sixteen CB_DATA registers have the same sequential memory side effect.
-    // Keep each register/shadow write, but translate and accumulate the range once.
-    ProcessCBMultiData(arguments.data(), amount);
+    Common::MaxwellMethodProfile::Dispatch(
+        [&] { return Common::MaxwellMethodProfile::ConstantBuffer; }, amount,
+        [&](auto profile) {
+            ASSERT(executing_macro == 0);
+            ASSERT(method >= MAXWELL3D_REG_INDEX(const_buffer.buffer));
+            ASSERT(method + amount <= MAXWELL3D_REG_INDEX(const_buffer.buffer) + 16);
+            std::array<u32, 16> arguments;
+            Common::MaxwellMethodProfile::Shadow<decltype(profile)::value>(amount, [&] {
+                for (u32 i = 0; i < amount; ++i) {
+                    arguments[i] = ProcessShadowRam(method + i, values[i]);
+                    ProcessDirtyRegisters(method + i, arguments[i]);
+                }
+            });
+            // All sixteen CB_DATA registers have the same sequential memory side effect.
+            // Keep each register/shadow write, but translate and accumulate the range once.
+            ProcessCBMultiData(arguments.data(), amount);
+        });
 }
 
 void Maxwell3D::ProcessMacroUpload(u32 data) {

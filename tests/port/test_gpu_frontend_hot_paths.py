@@ -27,7 +27,12 @@ def method(source, name, occurrence=0):
     match = matches[occurrence] if len(matches) > occurrence else None
     if match is None:
         raise AssertionError(f"Missing production method: {name}")
-    return match.group()
+    prefix = (
+        "template <bool Profile>\n"
+        if source[: match.start()].endswith("template <bool Profile>\n")
+        else ""
+    )
+    return prefix + match.group()
 
 
 class GpuFrontendHotPathTests(unittest.TestCase):
@@ -69,6 +74,7 @@ class GpuFrontendHotPathTests(unittest.TestCase):
                 "ConsumeSinkImpl",
                 "CallMethod",
                 "CallMethodImpl",
+                "MethodProfileKey",
                 "CallMultiMethod",
                 "CallCBDataIncrementing",
                 "ProcessCBMultiData",
@@ -87,7 +93,18 @@ class GpuFrontendHotPathTests(unittest.TestCase):
         )
         fixture = (FIXTURES / "gpu_frontend.cpp").read_text()
         self.compile_and_run(
-            fixture.replace("// REGISTER_INDICES", registers).replace("// METHODS", methods)
+            fixture.replace("// REGISTER_INDICES", registers).replace("// METHODS", methods),
+            [
+                dict(
+                    os.environ,
+                    NXBOX_GPU_METHOD_PROFILE=old,
+                    NXBOX_D3D12_METHOD_PROFILE=new,
+                    NXBOX_MAXWELL_METHODS=batching,
+                )
+                for old in ("0", "1")
+                for new in ("0", "1")
+                for batching in ("0", "1")
+            ],
         )
 
     def test_incrementing_cb_parser_boundaries(self):

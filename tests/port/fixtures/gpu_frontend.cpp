@@ -14,6 +14,7 @@
 #include "video_core/gpu_frontend.h"
 
 #include "common/gpu_thread_profile.h"
+#include "common/maxwell_method_profile.h"
 
 using u32 = std::uint32_t;
 using GPUVAddr = std::uint64_t;
@@ -117,6 +118,8 @@ struct Maxwell3D {
     void ProcessDirtyRegisters(u32, u32);
     void ProcessDirtyRegistersImpl(u32, u32);
     void CallMethod(Core::System&, u32, u32, bool);
+    u32 MethodProfileKey(u32) const;
+    template <bool Profile = false>
     void CallMethodImpl(Core::System&, u32, u32, bool);
     void CallMultiMethod(Core::System&, u32, const u32*, u32, u32);
     void CallMultiMethod(Core::System&, u32, const u32*, u32);
@@ -169,7 +172,17 @@ struct TestSink : Common::GpuProfile::Sink {
     }
 };
 
+struct TestMethodCollector : Common::MaxwellMethodProfile::Collector {
+    Common::GpuProfile::Tick clock{};
+    Common::GpuProfile::Tick ReadTicks() override {
+        return clock++;
+    }
+};
+
 int main() {
+    TestMethodCollector methods;
+    if (Common::MaxwellMethodProfile::Enabled())
+        Common::MaxwellMethodProfile::collector = &methods;
     Core::System system;
     std::mt19937 random{0x12345678};
     TestSink owner;

@@ -450,6 +450,11 @@ Resource::~Resource() {
     if (budget)
         budget->used -= allocation_size;
 }
+Common::GpuProfile::Tick FrameProfile::ReadTicks() {
+    const auto index = static_cast<size_t>(FramePhase::Maxwell3DMethods);
+    return method_clock_base + timing.cpu[index] +
+           (timing.active == FramePhase::Maxwell3DMethods ? ProfileWallTime() - timing.last : 0);
+}
 bool FrameProfile::OnOwner() {
     return enabled && owner.load() == GetCurrentThreadId();
 }
@@ -457,6 +462,10 @@ void FrameProfile::BindRecordingThread(bool rebind) {
     if (enabled && rebind && owner.load() != GetCurrentThreadId()) {
         owner = 0;
         timing.active = FramePhase::BetweenDraws;
+        if (method_enabled) {
+            method_clock_base += timing.cpu[static_cast<size_t>(FramePhase::Maxwell3DMethods)];
+            samples.fill({});
+        }
         timing.cpu.fill(0);
         counts.fill(0);
         transitions.clear();
@@ -579,6 +588,10 @@ void FrameProfile::EndFrame(bool presented) {
     // belongs to the GPU thread. Fencing-thread scopes never claim this ownership.
     if (owner != GetCurrentThreadId()) {
         owner = 0;
+        if (method_enabled) {
+            method_clock_base += timing.cpu[static_cast<size_t>(FramePhase::Maxwell3DMethods)];
+            samples.fill({});
+        }
         timing.cpu.fill(0);
         counts.fill(0);
         frames = fence_wall = 0;
@@ -822,6 +835,44 @@ void FrameProfile::EndFrame(bool presented) {
                             frames ? static_cast<double>(entry.second) / (10000.0 * frames) : 0.0);
         if (guest_visibility)
             line += guest_visibility();
+        if (method_enabled) {
+            using namespace Common::MaxwellMethodProfile;
+            std::string method_line = "NXBOX METHOD_PROFILE";
+            const double divisor = frames ? static_cast<double>(frames) : 1.0;
+            const auto append = [&](std::string_view name, const Sample& sample) {
+                method_line +=
+                    fmt::format(" {}={:.6f},{:.3f}", name, sample.ticks / (10000.0 * divisor),
+                                sample.count / divisor);
+            };
+            for (unsigned i = 0; i < Other; ++i)
+                append(Names[i], samples[i]);
+            Sample other{};
+            std::array<unsigned, RegisterCount> indices{};
+            for (unsigned i = 0; i < RegisterCount; ++i) {
+                indices[i] = i;
+                other.ticks += samples[ClassCount + i].ticks;
+                other.count += samples[ClassCount + i].count;
+            }
+            append("other", other);
+            std::partial_sort(indices.begin(), indices.begin() + 16, indices.end(),
+                              [&](unsigned a, unsigned b) {
+                                  const auto& x = samples[ClassCount + a];
+                                  const auto& y = samples[ClassCount + b];
+                                  if (x.ticks != y.ticks)
+                                      return x.ticks > y.ticks;
+                                  if (x.count != y.count)
+                                      return x.count > y.count;
+                                  return a < b;
+                              });
+            for (unsigned i = 0; i < 16; ++i) {
+                const auto index = indices[i];
+                const auto& sample = samples[ClassCount + index];
+                if (sample.count)
+                    append(fmt::format("other_0x{:03x}", index), sample);
+            }
+            method_line += fmt::format(" frames={}", frames);
+            Diagnostic(method_line);
+        }
         Diagnostic(line);
         const auto guest = Common::GpuProfile::TakeWindow();
         std::string guest_line = "D3D12_GUEST_WAITS";
@@ -873,6 +924,10 @@ void FrameProfile::EndFrame(bool presented) {
         Diagnostic(method_line);
     } catch (...) {
         Diagnostic("D3D12 frame profile formatting failed");
+    }
+    if (method_enabled) {
+        method_clock_base += timing.cpu[static_cast<size_t>(FramePhase::Maxwell3DMethods)];
+        samples.fill({});
     }
     timing.cpu.fill(0);
     counts.fill(0);

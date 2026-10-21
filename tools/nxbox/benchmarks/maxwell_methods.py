@@ -142,6 +142,10 @@ f = f.replace(
 )
 # all real draw fields get their real offsets; other frontend-only side effects get unused offsets.
 s = production("src/video_core/engines/maxwell_3d.cpp")
+if "template <bool Profile>" not in s:
+    f = f.replace(
+        "    template <bool Profile = false>\n    void CallMethodImpl", "    void CallMethodImpl"
+    )
 methods = (
     "\n".join(
         method(s, "Maxwell3D::" + name)
@@ -166,6 +170,8 @@ methods = (
 )
 if "void Maxwell3D::CallMethodImpl" in s:
     methods += "\n" + method(s, "Maxwell3D::CallMethodImpl")
+    if "MethodProfileKey" in s:
+        methods += "\n" + method(s, "Maxwell3D::MethodProfileKey")
 bodies = (
     production("src/video_core/engines/draw_manager.cpp")
     .split("void Maxwell3D::DrawManager::ProcessMethodCall", 1)[1]

@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 #include "common/gpu_thread_profile.h"
+#include "common/maxwell_method_profile.h"
 #include "video_core/renderer_d3d12/d3d12_flush_policy.h"
 #include "video_core/renderer_d3d12/d3d12_format_cast.h"
 #include "video_core/renderer_d3d12/d3d12_memory_budget.h"
@@ -435,7 +436,8 @@ struct StagingBufferRef {
 };
 // Phase intervals are exclusive wall estimates (nested scopes suspend the parent).
 // Queue idle and fence waits are reported separately from the CPU-work estimates.
-class FrameProfile : public Common::GpuProfile::Sink {
+class FrameProfile : public Common::GpuProfile::Sink,
+                     public Common::MaxwellMethodProfile::Collector {
 public:
     class Scope {
     public:
@@ -468,6 +470,7 @@ public:
         recorder_thread = handle;
     }
     u64 TakeRecorderCpu();
+    Common::GpuProfile::Tick ReadTicks() override;
     u64 recorder_waits{}, recorder_wait_ns{};
 
 private:
@@ -475,7 +478,9 @@ private:
     u64 recorder_initial_cpu{};
     bool OnOwner();
     void Switch(FramePhase phase);
-    bool enabled{BisectEnabled("NXBOX_D3D12_FRAME_PROFILE")};
+    bool method_enabled{Common::MaxwellMethodProfile::Enabled()};
+    bool enabled{method_enabled || BisectEnabled("NXBOX_D3D12_FRAME_PROFILE")};
+    u64 method_clock_base{};
     std::atomic<DWORD> owner{};
     FrameTiming timing;
     std::array<u64, static_cast<size_t>(FrameCount::Count)> counts{};
