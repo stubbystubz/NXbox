@@ -6,6 +6,8 @@
 #include <memory>
 #include <type_traits>
 #include <utility>
+#include <vector>
+#include "common/nxbox_memory.h"
 
 namespace Shader {
 
@@ -57,19 +59,24 @@ private:
     struct Chunk {
         explicit Chunk() = default;
         explicit Chunk(size_t size)
-            : num_objects{size}, storage{std::make_unique<Storage[]>(size)} {}
+            : num_objects{size}, storage{std::make_unique<Storage[]>(size)} {
+            memory.Set(size * sizeof(Storage));
+        }
 
         Chunk& operator=(Chunk&& rhs) noexcept {
             Release();
             used_objects = std::exchange(rhs.used_objects, 0);
             num_objects = std::exchange(rhs.num_objects, 0);
             storage = std::move(rhs.storage);
+            memory = std::move(rhs.memory);
             return *this;
         }
 
         Chunk(Chunk&& rhs) noexcept
             : used_objects{std::exchange(rhs.used_objects, 0)},
-              num_objects{std::exchange(rhs.num_objects, 0)}, storage{std::move(rhs.storage)} {}
+              num_objects{std::exchange(rhs.num_objects, 0)}, storage{std::move(rhs.storage)} {
+            memory = std::move(rhs.memory);
+        }
 
         ~Chunk() {
             Release();
@@ -83,6 +90,7 @@ private:
         size_t used_objects{};
         size_t num_objects{};
         std::unique_ptr<Storage[]> storage;
+        NxboxMemory::Gauge memory{NxboxMemory::Kind::ShaderIr};
     };
 
     [[nodiscard]] T* Memory() {

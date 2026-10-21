@@ -15,9 +15,15 @@
 
 namespace Common {
 
+struct HostBackingUsage {
+    std::uint64_t reserved{};
+    std::uint64_t committed{};
+};
 #ifdef YUZU_UWP_APPCONTAINER
 // Guest DRAM section commit currently held (private fallback reports cumulative demand commit).
 std::uint64_t HostMemoryCommittedBytes();
+// Query canonical DRAM backing once per diagnostic period; aliases are not counted twice.
+HostBackingUsage QueryHostBackingUsage();
 #endif
 
 enum class MemoryPermission : u32 {

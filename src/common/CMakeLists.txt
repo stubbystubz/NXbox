@@ -69,6 +69,7 @@ add_library(
     hex_util.h
     host_memory.cpp
     host_memory.h
+    nxbox_memory.h
     input.h
     intrusive_red_black_tree.h
     literals.h

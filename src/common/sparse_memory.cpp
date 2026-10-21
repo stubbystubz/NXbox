@@ -126,6 +126,16 @@ std::uint64_t CommittedBytes(const void* base, std::size_t size) noexcept {
     return committed;
 }
 
+std::uint64_t LiveCommittedBytes() noexcept {
+    std::lock_guard lock(allocation_mutex);
+    std::uint64_t result = 0;
+    for (auto& range : ranges) {
+        result += CommittedBytes(range.base.load(std::memory_order_acquire),
+                                 range.size.load(std::memory_order_relaxed));
+    }
+    return result;
+}
+
 void* Allocate(std::size_t size) noexcept {
     if (size == 0) {
         return nullptr;

@@ -24,6 +24,8 @@ def method(source, signature):
 
 
 RESOURCE_DRIVER = r"""
+#include "common/nxbox_memory.h"
+#include <optional>
 #include <cassert>
 #include <memory>
 #include <limits>
@@ -38,7 +40,7 @@ using HRESULT = int; using D3D12_HEAP_TYPE = unsigned; using D3D12_RESOURCE_STAT
 inline constexpr int E_INVALIDARG = -1, DXGI_ERROR_UNSUPPORTED = -2, E_OUTOFMEMORY = -3;
 constexpr bool FAILED(int r) { return r < 0; }
 constexpr bool SUCCEEDED(int r) { return r >= 0; }
-inline constexpr unsigned D3D12_HEAP_TYPE_DEFAULT=0, D3D12_HEAP_TYPE_READBACK=2;
+inline constexpr unsigned D3D12_HEAP_TYPE_DEFAULT=0, D3D12_HEAP_TYPE_UPLOAD=1, D3D12_HEAP_TYPE_READBACK=2;
 inline constexpr unsigned D3D12_RESOURCE_DIMENSION_BUFFER=1, D3D12_RESOURCE_DIMENSION_TEXTURE1D=2;
 inline constexpr unsigned D3D12_RESOURCE_DIMENSION_TEXTURE3D=4;
 inline constexpr unsigned D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET=1;
@@ -74,6 +76,7 @@ template <class T> struct Ptr {
 #define IID_PPV_ARGS(p) p
 struct Budget { u64 used{}; };
 struct Resource {
+    std::optional<NxboxMemory::Gauge> memory_gauge, format_gauge;
     Ptr<NativeResource> handle;
     std::vector<u32> castable_formats;
     unsigned heap{}, state{}; u64 allocation_size{};
@@ -269,7 +272,10 @@ class ViewCastTests(unittest.TestCase):
     def test_creation_with_and_without_device10(self):
         source = (BACKEND / "d3d12_context.cpp").read_text()
         driver = '#include "common/maxwell_method_profile.h"\n' + RESOURCE_DRIVER.replace(
-            "// CREATE_RESOURCE", method(source, "ResourcePtr Context::CreateResource(")
+            "// CREATE_RESOURCE",
+            method(source, "NxboxMemory::Kind HeapMemoryKind(")
+            + "\n"
+            + method(source, "ResourcePtr Context::CreateResource("),
         )
         for definitions in ((), ("-D__ID3D12Device10_INTERFACE_DEFINED__",)):
             with self.subTest(definitions=definitions):

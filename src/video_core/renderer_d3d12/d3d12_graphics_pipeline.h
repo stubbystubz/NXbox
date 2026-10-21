@@ -106,6 +106,7 @@ public:
     }
 
 private:
+    NxboxMemory::Gauge object_count{NxboxMemory::Kind::PipelineObjects, 1};
     std::string draw_trace_pso;
     u64 vertex_guest_hash{};
     u64 pixel_guest_hash{};

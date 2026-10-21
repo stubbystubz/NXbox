@@ -21,6 +21,7 @@
 #include <vector>
 #include "common/gpu_thread_profile.h"
 #include "common/maxwell_method_profile.h"
+#include "common/nxbox_memory.h"
 #include "video_core/renderer_d3d12/d3d12_flush_policy.h"
 #include "video_core/renderer_d3d12/d3d12_format_cast.h"
 #include "video_core/renderer_d3d12/d3d12_memory_budget.h"
@@ -422,6 +423,8 @@ struct Resource {
     std::span<u8> mapped;
     std::shared_ptr<MemoryBudget> budget;
     u64 allocation_size{};
+    std::optional<NxboxMemory::Gauge> memory_gauge;
+    std::optional<NxboxMemory::Gauge> format_gauge;
     u64 content_version{};
     // Only the recording thread reads/writes this stamp; batches own the actual lease.
     u64 retained_generation{};

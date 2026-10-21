@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BACKEND = ROOT / "src/video_core/renderer_d3d12"
 
 DRIVER = r"""
+#include "common/nxbox_memory.h"
 #include <cassert>
 #include <atomic>
 #include <memory>
@@ -384,7 +385,13 @@ class T7BuffersTests(unittest.TestCase):
         pool = context.split("struct BufferHeapPage {", 1)[1].split(
             "} // namespace\nResourcePtr Context::CreateResource", 1
         )[0]
-        source_text = DRIVER.replace("__POOL__", "struct BufferHeapPage {" + pool)
+        heap_kind = context.split("NxboxMemory::Kind HeapMemoryKind(", 1)[1].split(
+            "// Each placed resource", 1
+        )[0]
+        source_text = DRIVER.replace(
+            "__POOL__",
+            "NxboxMemory::Kind HeapMemoryKind(" + heap_kind + "struct BufferHeapPage {" + pool,
+        )
         with tempfile.TemporaryDirectory(prefix="nxbox-t7-") as folder:
             source = Path(folder) / "buffers.cpp"
             binary = Path(folder) / "buffers"

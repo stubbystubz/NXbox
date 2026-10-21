@@ -203,6 +203,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
     }
 
     tmp_buffer.resize_destructive(size);
+    scratch_memory.Set(immediate_buffer_alloc.capacity() + tmp_buffer.capacity());
     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
 
     InlineMemoryImplementation(device_addr, size, tmp_buffer);
@@ -2317,6 +2318,7 @@ std::span<const u8> BufferCache<P>::ImmediateBufferWithData(DAddr device_addr, s
 template <class P>
 std::span<u8> BufferCache<P>::ImmediateBuffer(size_t wanted_capacity) {
     immediate_buffer_alloc.resize_destructive(wanted_capacity);
+    scratch_memory.Set(immediate_buffer_alloc.capacity() + tmp_buffer.capacity());
     return std::span<u8>(immediate_buffer_alloc.data(), wanted_capacity);
 }
 

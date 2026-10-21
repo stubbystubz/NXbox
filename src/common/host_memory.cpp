@@ -250,6 +250,27 @@ LONG NTAPI BackingDemandCommitHandler(EXCEPTION_POINTERS* ep) {
 }
 } // namespace
 
+HostBackingUsage QueryHostBackingUsage() {
+    const auto base =
+        reinterpret_cast<std::uintptr_t>(g_backing_base.load(std::memory_order_acquire));
+    const auto size = g_backing_size.load(std::memory_order_acquire);
+    HostBackingUsage result{size, 0};
+    for (auto address = base; base && address < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) !=
+            sizeof(info))
+            break;
+        const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (end <= address)
+            break;
+        const auto next = (std::min)(end, base + size);
+        if (info.State == MEM_COMMIT)
+            result.committed += next - address;
+        address = next;
+    }
+    return result;
+}
+
 std::uint64_t HostMemoryCommittedBytes() {
     return g_backing_committed.load(std::memory_order_relaxed);
 }
@@ -603,6 +624,8 @@ public:
                     faults_ready = false;
                 }
                 if (faults_ready) {
+                    g_backing_base.store(backing_base, std::memory_order_release);
+                    g_backing_size.store(backing_size, std::memory_order_release);
                     probing_faults = false;
                     fastmem_enabled.store(true, std::memory_order_release);
                     LOG_INFO(HW_Memory,

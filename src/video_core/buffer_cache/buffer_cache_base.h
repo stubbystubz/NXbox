@@ -24,6 +24,7 @@
 #include "common/div_ceil.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
+#include "common/nxbox_memory.h"
 #include "common/range_sets.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
@@ -528,6 +529,7 @@ private:
 
     std::deque<Async_Buffer> async_buffers_death_ring;
 
+    NxboxMemory::Gauge scratch_memory{NxboxMemory::Kind::BufferScratch};
     size_t immediate_buffer_capacity = 0;
     Common::ScratchBuffer<u8> immediate_buffer_alloc;
 

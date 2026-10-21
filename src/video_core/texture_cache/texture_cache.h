@@ -24,6 +24,7 @@
 #include "common/alignment.h"
 #include "common/nxbox_stall.h"
 #include "common/nxbox_upload_diag.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "video_core/control/channel_state.h"
@@ -105,6 +106,8 @@ TextureCache<P>::TextureCache(Runtime& runtime_, Tegra::MaxwellDeviceMemoryManag
     constexpr size_t UNSWIZZLE_DATA_BUFFER_INITIAL_CAPACITY = 1_MiB;
     swizzle_data_buffer.resize_destructive(SWIZZLE_DATA_BUFFER_INITIAL_CAPACITY);
     unswizzle_data_buffer.resize_destructive(UNSWIZZLE_DATA_BUFFER_INITIAL_CAPACITY);
+
+    scratch_memory.Set(swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
 
     // Make sure the first index is reserved for the null resources
     // This way the null resource becomes a compile time constant
@@ -210,6 +213,9 @@ void TextureCache<P>::RunGarbageCollector() {
         }
         UnregisterImage(image_id);
         DeleteImage(image_id, image.scale_tick > frame_tick + 5);
+        if constexpr (requires { runtime.RecordMemoryEviction(); }) {
+            runtime.RecordMemoryEviction();
+        }
         if (aggressive_mode && total_used_memory < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
@@ -1894,6 +1900,10 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
 
 template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+    SCOPE_EXIT {
+        scratch_memory.Set(swizzle_data_buffer.capacity() + unswizzle_data_buffer.capacity());
+    };
+
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
         return;
@@ -1913,8 +1923,22 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     if (True(image.flags & ImageFlagBits::AsynchronousDecode)) {
-        QueueAsyncDecode(image, image_id);
-        return;
+        bool allow_async = true;
+        if constexpr (requires { runtime.AllowAsyncDecode(u64{}, u64{}, u64{}); }) {
+            allow_async = runtime.AllowAsyncDecode(async_decode_bytes, image.unswizzled_size_bytes,
+                                                   MapSizeBytes(image));
+        }
+        if (allow_async) {
+            QueueAsyncDecode(image, image_id);
+            return;
+        }
+        // A previous decode may still hold an older guest snapshot. Its late
+        // upload must not overwrite the synchronous refresh selected by pressure.
+        for (const auto& decode : async_decodes) {
+            if (decode->image_id == image_id)
+                decode->cancelled = true;
+        }
+        image.flags &= ~ImageFlagBits::IsDecoding;
     }
 
     const bool gpu_unswizzle_enabled = Settings::values.gpu_unswizzle_enabled.GetValue();
@@ -2186,21 +2210,36 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
     auto decode = std::make_unique<AsyncDecodeContext>();
     auto* decode_ptr = decode.get();
     decode->image_id = image_id;
+    decode->reserved_bytes = image.unswizzled_size_bytes + MapSizeBytes(image);
+    decode->reservation.Set(decode->reserved_bytes);
+    async_decode_bytes += decode->reserved_bytes;
     async_decodes.push_back(std::move(decode));
 
     std::vector<u8> local_unswizzle_data_buffer(image.unswizzled_size_bytes, 0);
+    decode_ptr->input_memory.Set(local_unswizzle_data_buffer.capacity());
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzle_data(*gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
     auto copies = UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzle_data, local_unswizzle_data_buffer);
     const size_t out_size = MapSizeBytes(image);
 
-    auto func = [out_size, copies, info = image.info,
+    bool release_input = false;
+    if constexpr (requires { runtime.ReleaseDecodeInput(); }) {
+        release_input = runtime.ReleaseDecodeInput();
+    }
+    auto func = [out_size, copies, release_input, info = image.info,
                  input = std::move(local_unswizzle_data_buffer),
                  async_decode = decode_ptr]() mutable {
         NxboxWait::Add(NxboxWait::Counter::DecodeStarted);
         async_decode->decoded_data.resize_destructive(out_size);
+        async_decode->output_memory.Set(async_decode->decoded_data.capacity());
         std::span copies_span{copies.data(), copies.size()};
         ConvertImage(input, info, async_decode->decoded_data, copies_span);
 
+        // Release compressed input before publishing completion so the GPU thread
+        // can allocate upload staging without overlapping this input allocation.
+        if (release_input) {
+            std::vector<u8>{}.swap(input);
+            async_decode->input_memory.Set(0);
+        }
         // TODO: Do we need this lock?
         std::unique_lock lock{async_decode->mutex};
         async_decode->copies = std::move(copies);
@@ -2239,6 +2278,7 @@ void TextureCache<P>::TickAsyncDecode() {
         }
         if (async_decode->cancelled) {
             NxboxWait::Add(NxboxWait::Counter::DecodeCancelled);
+            async_decode_bytes -= async_decode->reserved_bytes;
             lock.unlock();
             i = async_decodes.erase(i);
             continue;
@@ -2253,6 +2293,7 @@ void TextureCache<P>::TickAsyncDecode() {
         image.flags &= ~ImageFlagBits::IsDecoding;
         has_uploads = true;
         // Erasing destroys the mutex, so it must not still be held.
+        async_decode_bytes -= async_decode->reserved_bytes;
         lock.unlock();
         i = async_decodes.erase(i);
     }

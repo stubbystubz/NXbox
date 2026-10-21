@@ -78,6 +78,7 @@ using u64 = std::uint64_t;
 namespace winrt::Windows::System {
 struct MemoryManager {
     static inline bool fail = false;
+    static unsigned AppMemoryUsageLevel() { return 0; }
     static u64 AppMemoryUsageLimit() {
         if (fail) throw std::runtime_error("telemetry unavailable");
         return 5120ULL << 20;

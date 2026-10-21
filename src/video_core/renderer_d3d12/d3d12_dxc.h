@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/nxbox_memory.h"
 #include "shader_recompiler/stage.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
@@ -41,6 +42,7 @@ private:
         DxilBlob dxil;
         std::exception_ptr failure;
     };
+    NxboxMemory::Gauge source_memory{NxboxMemory::Kind::ShaderSource};
     FrameProfile* profile{};
     ShaderCompiler compiler;
     std::unordered_multimap<u64, Entry> entries;

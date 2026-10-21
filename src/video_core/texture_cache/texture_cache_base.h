@@ -29,6 +29,7 @@
 #include "common/hash.h"
 #include "common/literals.h"
 #include "common/lru_cache.h"
+#include "common/nxbox_memory.h"
 #include <ranges>
 #include "common/scratch_buffer.h"
 #include "common/slot_vector.h"
@@ -73,6 +74,10 @@ struct AsyncDecodeContext {
     std::mutex mutex;
     std::atomic_bool complete;
     bool cancelled{}; ///< The image was deleted before the upload; GPU thread only.
+    u64 reserved_bytes{};
+    NxboxMemory::Gauge reservation{NxboxMemory::Kind::DecodeReserved};
+    NxboxMemory::Gauge input_memory{NxboxMemory::Kind::DecodeInput};
+    NxboxMemory::Gauge output_memory{NxboxMemory::Kind::DecodeOutput};
 };
 
 using TextureCacheGPUMap = ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>;
@@ -612,6 +617,8 @@ private:
 
     ::Common::unordered_map<GPUVAddr, ImageAllocId> image_allocs_table;
 
+    NxboxMemory::Gauge scratch_memory{NxboxMemory::Kind::TextureScratch};
+    u64 async_decode_bytes{};
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
 

@@ -70,6 +70,17 @@ public:
     u64 GetDeviceMemoryUsage() const {
         return context.MemoryUsage();
     }
+    bool ReleaseDecodeInput() const {
+        return AstcMemoryBudgetEnabled();
+    }
+    bool AllowAsyncDecode(u64 queued, u64 input, u64 output) const {
+        const auto budget = NativeDecodeMemoryBudget();
+        decode_budget.Set(budget);
+        return AdmitDecode(budget, queued, input, output);
+    }
+    void RecordMemoryEviction() {
+        memory_evictions.Add(1);
+    }
     bool CanReportMemoryUsage() const {
         return true;
     }
@@ -78,6 +89,8 @@ public:
         const auto thresholds = NativeTextureMemoryBudget(context.MemoryUsage());
         expected = thresholds.expected;
         critical = thresholds.critical;
+        memory_expected.Set(expected);
+        memory_critical.Set(critical);
     }
 #endif
     bool CanDownloadImage(const Image& image) const;
@@ -155,6 +168,10 @@ private:
     RepeatedTextureUploads repeated_uploads;
     std::chrono::steady_clock::time_point upload_log_time{std::chrono::steady_clock::now()};
     std::unique_ptr<BlitImageHelper> blit_helper;
+    mutable NxboxMemory::Gauge decode_budget{NxboxMemory::Kind::DecodeBudget};
+    NxboxMemory::Gauge memory_expected{NxboxMemory::Kind::TextureExpected};
+    NxboxMemory::Gauge memory_critical{NxboxMemory::Kind::TextureCritical};
+    NxboxMemory::Gauge memory_evictions{NxboxMemory::Kind::TextureEvictions};
     StagingRing upload;
     StagingRing readback;
     struct FramebufferEntry {

@@ -11,6 +11,21 @@
 #include "video_core/renderer_d3d12/d3d12_pso_tables.h"
 
 namespace D3D12 {
+namespace {
+DxilBlob TrackedDxil(std::vector<u8> bytes) {
+    if (!NxboxMemory::Enabled())
+        return std::make_shared<const std::vector<u8>>(std::move(bytes));
+    struct Storage {
+        std::vector<u8> data;
+        NxboxMemory::Gauge memory{NxboxMemory::Kind::ShaderDxil};
+        explicit Storage(std::vector<u8> value) : data{std::move(value)} {
+            memory.Set(data.capacity());
+        }
+    };
+    auto storage = std::make_shared<Storage>(std::move(bytes));
+    return DxilBlob{storage, &storage->data};
+}
+} // namespace
 
 const wchar_t* StageTarget(Shader::Stage stage) {
     switch (stage) {
@@ -67,8 +82,9 @@ DxilBlob DxcCache::Compile(std::string_view hlsl, Shader::Stage stage, u64 pipel
         if (auto cached = disk->FindDxil(hash)) {
             if (stats)
                 ++stats->disk_hits;
-            auto dxil = std::make_shared<const std::vector<u8>>(std::move(*cached));
-            entries.emplace(hash, Entry{std::string{hlsl}, target, dxil, {}});
+            auto dxil = TrackedDxil(std::move(*cached));
+            source_memory.Add(entries.emplace(hash, Entry{std::string{hlsl}, target, dxil, {}})
+                                  ->second.source.capacity());
             return dxil;
         }
     }
@@ -83,15 +99,17 @@ DxilBlob DxcCache::Compile(std::string_view hlsl, Shader::Stage stage, u64 pipel
     try {
         auto dxil = [&] {
             const PsoBuildTimer timer{&PsoBuildStats::dxc_us};
-            return std::make_shared<const std::vector<u8>>(
-                compiler.Compile(hlsl, L"main", target, pipeline_hash));
+            return TrackedDxil(compiler.Compile(hlsl, L"main", target, pipeline_hash));
         }();
         if (disk)
             disk->StoreDxil(hash, *dxil);
-        entries.emplace(hash, Entry{std::string{hlsl}, target, dxil, {}});
+        source_memory.Add(entries.emplace(hash, Entry{std::string{hlsl}, target, dxil, {}})
+                              ->second.source.capacity());
         return dxil;
     } catch (...) {
-        entries.emplace(hash, Entry{std::string{hlsl}, target, {}, std::current_exception()});
+        source_memory.Add(
+            entries.emplace(hash, Entry{std::string{hlsl}, target, {}, std::current_exception()})
+                ->second.source.capacity());
         throw;
     }
 }

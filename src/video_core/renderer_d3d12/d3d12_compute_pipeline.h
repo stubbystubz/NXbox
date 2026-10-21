@@ -35,6 +35,7 @@ public:
     Shader::Info info;
 
 private:
+    NxboxMemory::Gauge object_count{NxboxMemory::Kind::PipelineObjects, 1};
     bool root_cbvs{};
     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;

@@ -18,10 +18,14 @@ class BufferPressureReuseTests(unittest.TestCase):
         pool = source.split("struct BufferHeapPage {", 1)[1].split(
             "std::shared_ptr<BufferHeapPool> BufferPool(", 1
         )[0]
+        heap_kind = source.split("NxboxMemory::Kind HeapMemoryKind(", 1)[1].split(
+            "// Each placed resource", 1
+        )[0]
         create = source.split("ResourcePtr Context::CreateBuffer(", 1)[1].split(
             "void StagingRing::Collect(", 1
         )[0]
         driver = r"""
+#include "common/nxbox_memory.h"
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -113,6 +117,7 @@ struct Resource {
     std::span<u8> mapped;
 };
 using ResourcePtr=std::shared_ptr<Resource>;
+__HEAP_KIND__
 struct BufferHeapPage {__POOL__
 std::shared_ptr<BufferHeapPool> active_pool;
 std::shared_ptr<BufferHeapPool> BufferPool(const std::shared_ptr<MemoryBudget>&) {
@@ -207,6 +212,9 @@ int main() {
         with tempfile.TemporaryDirectory(prefix="nxbox-pressure-reuse-") as folder:
             cpp = Path(folder) / "pressure.cpp"
             binary = Path(folder) / "pressure"
+            driver = driver.replace(
+                "__HEAP_KIND__", "NxboxMemory::Kind HeapMemoryKind(" + heap_kind
+            )
             cpp.write_text('#include "common/maxwell_method_profile.h"\n' + driver)
             subprocess.run(
                 [

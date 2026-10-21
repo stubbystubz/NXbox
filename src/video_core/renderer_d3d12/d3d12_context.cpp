@@ -2025,8 +2025,11 @@ TextureMemoryBudget NativeTextureMemoryBudget(u64 cache) noexcept {
 #ifdef NXBOX_UWP
     try {
         using winrt::Windows::System::MemoryManager;
-        return TextureMemoryThresholds(MemoryManager::AppMemoryUsageLimit(),
-                                       MemoryManager::AppMemoryUsage(), cache);
+        return TextureMemoryThresholds(
+            MemoryManager::AppMemoryUsageLimit(), MemoryManager::AppMemoryUsage(), cache,
+            TextureMemoryPressureEnabled()
+                ? static_cast<unsigned>(MemoryManager::AppMemoryUsageLevel())
+                : 0);
     } catch (...) {
         // Retain the ordinary watermarks if platform telemetry is unavailable.
     }
@@ -2052,7 +2055,29 @@ u64 NativeBufferMemoryTarget(u64 cache) noexcept {
                                   cache);
     return 1ULL << 30;
 }
+u64 NativeDecodeMemoryBudget() noexcept {
+#ifdef NXBOX_UWP
+    if (AstcMemoryBudgetEnabled()) {
+        try {
+            using winrt::Windows::System::MemoryManager;
+            return DecodeMemoryBudget(MemoryManager::AppMemoryUsageLimit(),
+                                      MemoryManager::AppMemoryUsage(),
+                                      static_cast<unsigned>(MemoryManager::AppMemoryUsageLevel()));
+        } catch (...) {
+            return 32ULL << 20; // Conservative queue when OS telemetry is unavailable.
+        }
+    }
+#endif
+    return UINT64_MAX;
+}
 namespace {
+NxboxMemory::Kind HeapMemoryKind(D3D12_HEAP_TYPE heap, bool texture = false) {
+    if (heap == D3D12_HEAP_TYPE_UPLOAD)
+        return NxboxMemory::Kind::GpuUpload;
+    if (heap == D3D12_HEAP_TYPE_READBACK)
+        return NxboxMemory::Kind::GpuReadback;
+    return texture ? NxboxMemory::Kind::GpuTexture : NxboxMemory::Kind::GpuBuffer;
+}
 // Each placed resource owns its page lease until every fence/binding reference is gone.
 // Empty pages are evicted oldest-first under pressure; populated pages never move.
 struct BufferHeapPage {
@@ -2062,6 +2087,7 @@ struct BufferHeapPage {
     BufferHeapSlots slots{static_cast<u32>(Size / BufferHeapSlots::Alignment)};
     std::shared_ptr<MemoryBudget> budget;
     std::mutex mutex;
+    std::optional<NxboxMemory::Gauge> memory_gauge;
     ~BufferHeapPage() {
         if (handle)
             budget->used -= Size;
@@ -2115,6 +2141,7 @@ struct BufferHeapPool {
             Check(device->CreateHeap(&heap, IID_PPV_ARGS(&page->handle)), "Create buffer heap",
                   device);
             budget->used += BufferHeapPage::Size;
+            page->memory_gauge.emplace(HeapMemoryKind(type), BufferHeapPage::Size);
             pages.push_back(page);
             start = page->slots.Allocate(count);
             if (!start)
@@ -2282,6 +2309,21 @@ ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_
     resource->allocation_size = allocation.SizeInBytes;
     resource->budget = budget;
     budget->used += allocation.SizeInBytes;
+    resource->memory_gauge.emplace(
+        HeapMemoryKind(heap, desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER),
+        allocation.SizeInBytes);
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const auto format = static_cast<u32>(desc.Format);
+        const auto kind = (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+                              ? NxboxMemory::Kind::TextureDepth
+                          : (format >= 70 && format <= 84) || (format >= 94 && format <= 99)
+                              ? NxboxMemory::Kind::TextureBc
+                          : (format >= 27 && format <= 32) || format == 87 || format == 88 ||
+                                  (format >= 90 && format <= 93)
+                              ? NxboxMemory::Kind::TextureRgba8
+                              : NxboxMemory::Kind::TextureOther;
+        resource->format_gauge.emplace(kind, allocation.SizeInBytes);
+    }
     if (heap != D3D12_HEAP_TYPE_DEFAULT) {
         void* mapped{};
         D3D12_RANGE read_range{0, heap == D3D12_HEAP_TYPE_READBACK ? static_cast<SIZE_T>(desc.Width)

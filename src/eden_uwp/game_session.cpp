@@ -40,6 +40,7 @@
 #include "common/host_memory.h"
 #include "common/logging.h"
 #include "common/nxbox_jit_cache.h"
+#include "common/nxbox_memory.h"
 #include "common/nxbox_stall.h"
 #include "common/nxbox_upload_diag.h"
 #include "common/scope_exit.h"
@@ -1376,6 +1377,47 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
         }
         const auto elapsed = std::chrono::duration<double>(now - measured_at).count();
         if (elapsed >= 5.0) {
+            if (NxboxMemory::Enabled()) {
+                const auto query_begin = std::chrono::steady_clock::now();
+                const auto backing = Common::QueryHostBackingUsage();
+                const auto sparse = Common::SparseMemory::LiveCommittedBytes();
+                using NxboxMemory::Kind;
+                using NxboxMemory::Read;
+                const auto usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
+                const auto known = backing.committed + sparse + Read(Kind::GpuBuffer) +
+                                   Read(Kind::GpuTexture) + Read(Kind::GpuUpload) +
+                                   Read(Kind::GpuReadback) + Read(Kind::DecodeInput) +
+                                   Read(Kind::DecodeOutput) + Read(Kind::TextureScratch) +
+                                   Read(Kind::BufferScratch) + Read(Kind::ShaderIr) +
+                                   Read(Kind::ShaderSource) + Read(Kind::ShaderDxil);
+                Diagnostic(fmt::format(
+                    "MEMORY_BREAKDOWN process={} limit={} level={} guest_reserved={} "
+                    "guest_committed={} "
+                    "sparse_committed={} gpu_buffers={} gpu_textures={} gpu_upload={} "
+                    "gpu_readback={} "
+                    "decode_input={} decode_output={} decode_reserved={} texture_scratch={} "
+                    "buffer_scratch={} "
+                    "shader_ir={} shader_source={} shader_dxil={} pipeline_objects={} "
+                    "texture_rgba8={} texture_bc={} texture_depth={} texture_other={} "
+                    "texture_expected={} texture_critical={} decode_budget_last={} "
+                    "texture_evictions={} "
+                    "driver_bytes=unknown unattributed={} query_us={}",
+                    usage, winrt::Windows::System::MemoryManager::AppMemoryUsageLimit(),
+                    static_cast<unsigned>(
+                        winrt::Windows::System::MemoryManager::AppMemoryUsageLevel()),
+                    backing.reserved, backing.committed, sparse, Read(Kind::GpuBuffer),
+                    Read(Kind::GpuTexture), Read(Kind::GpuUpload), Read(Kind::GpuReadback),
+                    Read(Kind::DecodeInput), Read(Kind::DecodeOutput), Read(Kind::DecodeReserved),
+                    Read(Kind::TextureScratch), Read(Kind::BufferScratch), Read(Kind::ShaderIr),
+                    Read(Kind::ShaderSource), Read(Kind::ShaderDxil), Read(Kind::PipelineObjects),
+                    Read(Kind::TextureRgba8), Read(Kind::TextureBc), Read(Kind::TextureDepth),
+                    Read(Kind::TextureOther), Read(Kind::TextureExpected),
+                    Read(Kind::TextureCritical), Read(Kind::DecodeBudget),
+                    Read(Kind::TextureEvictions), usage - (std::min)(usage, known),
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - query_begin)
+                        .count()));
+            }
             const auto timing_sample =
                 timing_probe.Read(timing_now(), Common::g_wall_clock.GetCNTPCT(),
                                   system.CoreTiming().GetClockTicks());
