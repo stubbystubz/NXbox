@@ -322,7 +322,8 @@ struct Recorder::Impl {
             texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
             texture.Width = options.Width();
             texture.Height = options.Height();
-            texture.DepthOrArraySize = texture.MipLevels = texture.SampleDesc.Count = 1;
+            texture.DepthOrArraySize = texture.MipLevels = 1;
+            texture.SampleDesc.Count = 1;
             texture.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             slot.target = context.CreateResourceNoWait(texture, D3D12_HEAP_TYPE_DEFAULT,
@@ -333,8 +334,8 @@ struct Recorder::Impl {
             D3D12_RESOURCE_DESC readback{};
             readback.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
             readback.Width = bytes;
-            readback.Height = readback.DepthOrArraySize = readback.MipLevels =
-                readback.SampleDesc.Count = 1;
+            readback.Height = readback.SampleDesc.Count = 1;
+            readback.DepthOrArraySize = readback.MipLevels = 1;
             readback.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
             slot.readback = context.CreateResourceNoWait(readback, D3D12_HEAP_TYPE_READBACK,
                                                          D3D12_RESOURCE_STATE_COPY_DEST);
