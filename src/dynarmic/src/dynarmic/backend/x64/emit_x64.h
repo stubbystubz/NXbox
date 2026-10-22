@@ -16,18 +16,19 @@
 #include <type_traits>
 #include <vector>
 
+#include <boost/container/small_vector.hpp>
+#include <boost/container/stable_vector.hpp>
+
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
-#include <boost/container/stable_vector.hpp>
-#include <boost/container/small_vector.hpp>
-
-#include "dynarmic/backend/x64/xbyak.h"
-#include "dynarmic/mcl/bit.hpp"
+#include "common/nxbox_memory.h"
 #include "dynarmic/backend/exception_handler.h"
 #include "dynarmic/backend/x64/reg_alloc.h"
+#include "dynarmic/backend/x64/xbyak.h"
 #include "dynarmic/common/fp/fpcr.h"
 #include "dynarmic/ir/location_descriptor.h"
 #include "dynarmic/ir/terminal.h"
+#include "dynarmic/mcl/bit.hpp"
 
 namespace Dynarmic::IR {
 class Block;
@@ -128,7 +129,7 @@ public:
         };
         // One 24-byte vector per target replaces four inline small-vectors (224 bytes).
         // Sites remain alive across target invalidation so incoming blocks can be relinked.
-        std::vector<Site> sites;
+        std::vector<Site, NxboxMemory::JitAllocator<Site>> sites;
 
         void Add(Kind kind, CodePtr location) {
             sites.push_back({location, kind});
@@ -167,8 +168,8 @@ public:
     // State
     BlockOfCode& code;
     ExceptionHandler exception_handler;
-    ::Common::unordered_map<IR::LocationDescriptor, BlockDescriptor> block_descriptors;
-    ::Common::unordered_map<IR::LocationDescriptor, PatchInformation> patch_information;
+    ::Common::unordered_map<IR::LocationDescriptor, BlockDescriptor, std::hash<IR::LocationDescriptor>, std::equal_to<IR::LocationDescriptor>, NxboxMemory::JitAllocator<std::pair<const IR::LocationDescriptor, BlockDescriptor>>> block_descriptors;
+    ::Common::unordered_map<IR::LocationDescriptor, PatchInformation, std::hash<IR::LocationDescriptor>, std::equal_to<IR::LocationDescriptor>, NxboxMemory::JitAllocator<std::pair<const IR::LocationDescriptor, PatchInformation>>> patch_information;
 
     // We need materialized protected members
     friend class A64EmitX64;

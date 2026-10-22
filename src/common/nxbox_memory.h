@@ -6,13 +6,21 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 // Cross-thread allocation gauges. No allocation, locks or formatting on the hot path.
 // Counters describe owned capacity, not resident pages or opaque driver allocations.
 namespace NxboxMemory {
 enum class Kind {
+    JitMetadata,
+    JitCode,
+    JitReserved,
+    JitDispatch,
+    FiberStacks,
+    DescriptorPayload,
     GpuBuffer,
     GpuTexture,
     TextureRgba8,
@@ -45,9 +53,59 @@ inline bool Enabled() {
     }();
     return enabled;
 }
+inline bool NativeAstcToBc(bool native_d3d12, const char* value) {
+    return native_d3d12 && value && std::string_view{value} == "1";
+}
+
+// Latched independently from diagnostic enablement. Exact 1 restores eager JIT sections.
+inline bool JitEagerCommit() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_JIT_EAGER_COMMIT");
+        return value && std::string_view{value} == "1";
+    }();
+    return enabled;
+}
+
 inline std::uint64_t Read(Kind kind) {
     return bytes[static_cast<size_t>(kind)].load(std::memory_order_relaxed);
 }
+// Charge allocator requests after successful allocation, including container bucket
+// capacity and nested patch-site vectors. Allocator/driver metadata stays unknown.
+template <typename T>
+class TrackedAllocator {
+public:
+    using value_type = T;
+    using is_always_equal = std::true_type;
+    TrackedAllocator() = default;
+    template <typename U>
+    TrackedAllocator(const TrackedAllocator<U>&) noexcept {}
+    T* allocate(std::size_t count) {
+        T* allocation = std::allocator<T>{}.allocate(count);
+        if (Enabled())
+            bytes[static_cast<size_t>(Kind::JitMetadata)].fetch_add(count * sizeof(T),
+                                                                    std::memory_order_relaxed);
+        return allocation;
+    }
+    void deallocate(T* allocation, std::size_t count) noexcept {
+        if (Enabled())
+            bytes[static_cast<size_t>(Kind::JitMetadata)].fetch_sub(count * sizeof(T),
+                                                                    std::memory_order_relaxed);
+        std::allocator<T>{}.deallocate(allocation, count);
+    }
+    template <typename U>
+    bool operator==(const TrackedAllocator<U>&) const noexcept {
+        return true;
+    }
+};
+
+#ifdef DYNARMIC_UWP_APPCONTAINER
+template <typename T>
+using JitAllocator = TrackedAllocator<T>;
+#else
+template <typename T>
+using JitAllocator = std::allocator<T>;
+#endif
+
 class Gauge {
 public:
     explicit Gauge(Kind kind_) : kind{kind_} {}

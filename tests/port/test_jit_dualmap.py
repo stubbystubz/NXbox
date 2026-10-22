@@ -69,14 +69,24 @@ class FlagTests(unittest.TestCase):
 class FallbackTests(unittest.TestCase):
     def test_every_failure_has_a_reason_and_falls_back(self):
         fn = body(BLOCK, "uint8_t* TryAllocDualMap(size_t size)")
-        for reason in ("flag_off", "xbyak_unpatched", "create_section_failed", "map_rw_failed", "map_rx_failed"):
+        for reason in (
+            "flag_off",
+            "xbyak_unpatched",
+            "create_section_failed",
+            "map_rw_failed",
+            "commit_rw_failed",
+            "map_rx_failed",
+        ):
             self.assertIn(reason, fn)
         alloc = body(BLOCK, "uint8_t* alloc(size_t size) override")
-        self.assertLess(alloc.index("TryAllocDualMap(size)"), alloc.index("DYNARMIC_VIRTUAL_ALLOC(nullptr, size, MEM_RESERVE"))
+        self.assertLess(
+            alloc.index("TryAllocDualMap(size)"),
+            alloc.index("DYNARMIC_VIRTUAL_ALLOC(nullptr, size, MEM_RESERVE"),
+        )
 
     def test_views_are_released_on_partial_failure_and_on_free(self):
         fn = body(BLOCK, "uint8_t* TryAllocDualMap(size_t size)")
-        self.assertEqual(fn.count("CloseHandle(section)"), 2)
+        self.assertEqual(fn.count("CloseHandle(section)"), 3)
         self.assertIn("UnmapViewOfFile(rw)", fn)
         free = body(BLOCK, "bool FreeDualMap(uint8_t* rw)")
         for call in ("UnmapViewOfFile(views.rx)", "UnmapViewOfFile(rw)", "CloseHandle(views.section)"):
@@ -102,7 +112,6 @@ class NoProtectTests(unittest.TestCase):
             "void BlockOfCode::DisableWriting()",
             "void BlockOfCode::PrepareWriteRange(",
             "void BlockOfCode::ClearCache()",
-            "void BlockOfCode::EnsureMemoryCommitted(",
         ):
             with self.subTest(function=signature):
                 branch = dual_branch(body(BLOCK, signature))

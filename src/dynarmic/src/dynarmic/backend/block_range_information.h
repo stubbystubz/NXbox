@@ -12,9 +12,10 @@
 
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
+
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
-
+#include "common/nxbox_memory.h"
 #include "dynarmic/ir/location_descriptor.h"
 
 namespace Dynarmic::Backend {
@@ -25,7 +26,12 @@ public:
     void AddRange(boost::icl::discrete_interval<P> range, IR::LocationDescriptor location);
     void ClearCache();
     ::Common::unordered_set<IR::LocationDescriptor> InvalidateRanges(const boost::icl::interval_set<P>& ranges);
-    boost::icl::interval_map<P, ::Common::unordered_set<IR::LocationDescriptor>> block_ranges;
+    using LocationSet = ::Common::unordered_set<
+        IR::LocationDescriptor,
+        std::hash<IR::LocationDescriptor>,
+        std::equal_to<IR::LocationDescriptor>,
+        NxboxMemory::JitAllocator<IR::LocationDescriptor>>;
+    boost::icl::interval_map<P, LocationSet, boost::icl::partial_absorber, std::less, boost::icl::inplace_plus, boost::icl::inter_section, boost::icl::discrete_interval<P>, NxboxMemory::JitAllocator> block_ranges;
 };
 
 }  // namespace Dynarmic::Backend

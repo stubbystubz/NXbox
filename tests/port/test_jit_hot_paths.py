@@ -68,6 +68,7 @@ class JitHotPathTests(unittest.TestCase):
         ).group()
         program = r"""
 #include <cassert>
+#include "common/nxbox_memory.h"
 #include <cstddef>
 #include <map>
 #include <string>
@@ -175,7 +176,11 @@ int main() {
 #endif
 }
 """.replace("METHODS", "\n".join(methods)).replace("PATCH_STRUCT", patch_struct)
-        for defines in ((), ("NXBOX_UWP=1",), ("NXBOX_UWP=1", "YUZU_UWP_APPCONTAINER=1")):
+        for defines in (
+            (),
+            ("NXBOX_UWP=1",),
+            ("NXBOX_UWP=1", "YUZU_UWP_APPCONTAINER=1", "DYNARMIC_UWP_APPCONTAINER=1"),
+        ):
             with self.subTest(defines=defines):
                 self.compile_and_run(program, defines)
 

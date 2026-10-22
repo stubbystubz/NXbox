@@ -277,6 +277,7 @@ void D3D12DescriptorAllocator::InitCache(DescriptorCache& cache, D3D12_DESCRIPTO
     Check(context.Device()->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&cache.heap)),
           "create CPU descriptor cache", context.Device());
     cache.stride = context.Device()->GetDescriptorHandleIncrementSize(type);
+    cache.payload_memory.Set(static_cast<u64>(capacity) * cache.stride);
     cache.capacity = capacity;
     cache.cpu = cache.heap->GetCPUDescriptorHandleForHeapStart();
 }
@@ -689,6 +690,7 @@ void D3D12DescriptorAllocator::Init(Ring& ring, D3D12_DESCRIPTOR_HEAP_TYPE type,
     Check(context.Device()->CreateDescriptorHeap(&desc, IID_PPV_ARGS(&ring.heap)),
           "CreateDescriptorHeap", context.Device());
     ring.stride = context.Device()->GetDescriptorHandleIncrementSize(type);
+    ring.payload_memory.Set(static_cast<u64>(capacity) * ring.stride);
     ring.cpu = ring.heap->GetCPUDescriptorHandleForHeapStart();
     ring.shader_visible = visible;
     if (visible)

@@ -102,9 +102,8 @@ size_t JitPageSize() {
 //
 // By default (NXBOX_JIT_DUALMAP=0 turns it off; read once) the cache is instead a pagefile-backed section mapped twice: the RW view is
 // what Xbyak stores to (top_), the RX view is what the CPU executes and what every code address refers
-// to. The section is committed in full up front (no SEC_RESERVE), so no VirtualProtectFromApp and no
-// per-block commit are needed. Any failure is remembered in DualMapReason() and the plain W^X
-// reservation below is used instead.
+// to. Reserve the section and commit its RW view as emission grows. RX aliases share that
+// commitment; do not charge it twice. Any failure uses the demand-committed W^X fallback.
 bool DualMapRequested() {
     static const bool requested = [] {
         const char* value = std::getenv("NXBOX_JIT_DUALMAP");
@@ -117,6 +116,7 @@ bool DualMapRequested() {
 struct DualMapViews {
     HANDLE section;
     void* rx;
+    size_t committed;
 };
 std::mutex dualmap_mutex;
 std::unordered_map<const uint8_t*, DualMapViews> dualmap_views;  // keyed by the RW view base
@@ -141,7 +141,7 @@ uint8_t* TryAllocDualMap(size_t size) {
     dualmap_reason = "xbyak_unpatched";
     return nullptr;
 #else
-    HANDLE section = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE,
+    HANDLE section = CreateFileMappingFromApp(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | (NxboxMemory::JitEagerCommit() ? 0 : SEC_RESERVE),
                                               static_cast<ULONG64>(size), nullptr);
     if (section == nullptr) {
         dualmap_reason = DualMapError("create_section_failed");
@@ -150,6 +150,13 @@ uint8_t* TryAllocDualMap(size_t size) {
     void* rw = MapViewOfFileFromApp(section, FILE_MAP_WRITE, 0, size);
     if (rw == nullptr) {
         dualmap_reason = DualMapError("map_rw_failed");
+        CloseHandle(section);
+        return nullptr;
+    }
+    const size_t initial_commit = NxboxMemory::JitEagerCommit() ? size : std::min(size, PRELUDE_COMMIT_SIZE);
+    if (!NxboxMemory::JitEagerCommit() && !DYNARMIC_VIRTUAL_ALLOC(rw, initial_commit, MEM_COMMIT, PAGE_READWRITE)) {
+        dualmap_reason = DualMapError("commit_rw_failed");
+        UnmapViewOfFile(rw);
         CloseHandle(section);
         return nullptr;
     }
@@ -170,16 +177,19 @@ uint8_t* TryAllocDualMap(size_t size) {
         return nullptr;
     }
     const std::lock_guard lock{dualmap_mutex};
-    dualmap_views[static_cast<uint8_t*>(rw)] = DualMapViews{section, rx};
+    dualmap_views[static_cast<uint8_t*>(rw)] = DualMapViews{section, rx, initial_commit};
     return static_cast<uint8_t*>(rw);
 #endif
 }
 
 // The executable view for an RW base returned by TryAllocDualMap, or nullptr.
-[[maybe_unused]] void* DualMapExecView(const uint8_t* rw) {
+[[maybe_unused]] void* DualMapExecView(const uint8_t* rw, size_t& committed) {
     const std::lock_guard lock{dualmap_mutex};
     const auto it = dualmap_views.find(rw);
-    return it == dualmap_views.end() ? nullptr : it->second.rx;
+    if (it == dualmap_views.end())
+        return nullptr;
+    committed = it->second.committed;
+    return it->second.rx;
 }
 
 bool FreeDualMap(uint8_t* rw) {
@@ -329,15 +339,15 @@ bool IsUnderRosetta() {
 // constant_pool is constructed. Installs the RW->RX delta so that, from the very first emitted byte,
 // getCode()/getCurr() are executable addresses while stores keep going to the RW view.
 bool BlockOfCode::ConfigureWx() {
+    reserved_memory.Set(maxSize_);
     bool mapped = false;
     std::string reason;
 #ifdef XBYAK_NXBOX_EXEC_DELTA
-    if (const void* rx = DualMapExecView(top_)) {
+    if (const void* rx = DualMapExecView(top_, committed_size)) {
         setExecDelta(static_cast<const u8*>(rx) - top_);
-        // The section is committed whole; EnsureMemoryCommitted() has nothing left to do.
-        committed_size = maxSize_;
+        code_memory.Set(committed_size);
         mapped = true;
-        reason = "default";
+        reason = NxboxMemory::JitEagerCommit() ? "eager_commit" : "demand_commit";
     }
 #endif
     if (!mapped) {
@@ -540,8 +550,6 @@ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
 #    ifdef DYNARMIC_UWP_APPCONTAINER
     if (size_ > maxSize_ || codesize > maxSize_ - size_)
         UNREACHABLE_MSG("NXBOX JIT code cache exhausted");
-    if (dual_map)
-        return;  // The whole section is committed (ConfigureWx).
     if (committed_size < size_ + codesize) {
         const size_t mask = JitPageSize() - 1;
         const size_t next_size = std::min(maxSize_, (std::max(size_ + codesize, committed_size + PRELUDE_COMMIT_SIZE) + mask) & ~mask);
@@ -552,6 +560,7 @@ void BlockOfCode::EnsureMemoryCommitted([[maybe_unused]] size_t codesize) {
         if (!DYNARMIC_VIRTUAL_ALLOC(top_ + committed_size, next_size - committed_size, MEM_COMMIT, PAGE_READWRITE))
             UNREACHABLE_MSG("NXBOX JIT commit failed: error={}", GetLastError());
         committed_size = next_size;
+        code_memory.Set(committed_size);
     }
 #    else
     if (committed_size < size_ + codesize) {

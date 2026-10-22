@@ -882,6 +882,7 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
     Settings::values.accelerate_astc.SetValue(window.UsesNativeD3D12()
                                                   ? Settings::AstcDecodeMode::CpuAsynchronous
                                                   : Settings::AstcDecodeMode::Cpu);
+    Settings::values.astc_recompression.SetValue(Settings::AstcRecompression::Uncompressed);
     Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);
     Settings::values.resolution_setup.SetValue(Settings::ResolutionSetup::Res1X);
     // The firmware error applet never draws on the Xbox: P5R opens it from the network prompt,
@@ -1035,6 +1036,20 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                                  "renderer_backend or NXBOX_RENDERER and restart");
     }
     // Apply after global and per-title settings, before renderer/cache construction.
+    // Keep image sizing, CPU conversion and native format selection in agreement.
+    // Lossy BC3 is explicit; an absent variable preserves per-title configuration.
+    if (const char* astc_to_bc = std::getenv("NXBOX_ASTC_TO_BC");
+        astc_to_bc != nullptr && window.UsesNativeD3D12()) {
+        Settings::values.astc_recompression.SetValue(
+            NxboxMemory::NativeAstcToBc(window.UsesNativeD3D12(), astc_to_bc)
+                ? Settings::AstcRecompression::Bc3
+                : Settings::AstcRecompression::Uncompressed);
+    }
+    Diagnostic(fmt::format(
+        "ASTC_STORAGE recompression={} env_bc={} native={}",
+        static_cast<int>(Settings::values.astc_recompression.GetValue()),
+        NxboxMemory::NativeAstcToBc(window.UsesNativeD3D12(), std::getenv("NXBOX_ASTC_TO_BC")),
+        window.UsesNativeD3D12()));
     if (const char* reactive = std::getenv("NXBOX_REACTIVE_FLUSH"); reactive != nullptr) {
         Settings::values.use_reactive_flushing.SetValue(reactive[0] == '1');
     }
@@ -1433,12 +1448,13 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                 using NxboxMemory::Kind;
                 using NxboxMemory::Read;
                 const auto usage = winrt::Windows::System::MemoryManager::AppMemoryUsage();
-                const auto known = backing.committed + sparse + Read(Kind::GpuBuffer) +
-                                   Read(Kind::GpuTexture) + Read(Kind::GpuUpload) +
-                                   Read(Kind::GpuReadback) + Read(Kind::DecodeInput) +
-                                   Read(Kind::DecodeOutput) + Read(Kind::TextureScratch) +
-                                   Read(Kind::BufferScratch) + Read(Kind::ShaderIr) +
-                                   Read(Kind::ShaderSource) + Read(Kind::ShaderDxil);
+                const auto known =
+                    backing.committed + sparse + Read(Kind::GpuBuffer) + Read(Kind::GpuTexture) +
+                    Read(Kind::GpuUpload) + Read(Kind::GpuReadback) + Read(Kind::DecodeInput) +
+                    Read(Kind::DecodeOutput) + Read(Kind::TextureScratch) +
+                    Read(Kind::BufferScratch) + Read(Kind::ShaderIr) + Read(Kind::ShaderSource) +
+                    Read(Kind::ShaderDxil) + Read(Kind::JitCode) + Read(Kind::JitMetadata) +
+                    Read(Kind::JitDispatch) + Read(Kind::FiberStacks);
                 Diagnostic(fmt::format(
                     "MEMORY_BREAKDOWN process={} limit={} level={} guest_reserved={} "
                     "guest_committed={} "
@@ -1449,7 +1465,8 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                     "shader_ir={} shader_source={} shader_dxil={} pipeline_objects={} "
                     "texture_rgba8={} texture_bc={} texture_depth={} texture_other={} "
                     "texture_expected={} texture_critical={} decode_budget_last={} "
-                    "texture_evictions={} "
+                    "texture_evictions={} jit_code_committed={} jit_code_reserved={} "
+                    "jit_metadata={} jit_dispatch={} fiber_stacks={} descriptor_payload={} "
                     "driver_bytes=unknown unattributed={} query_us={}",
                     usage, winrt::Windows::System::MemoryManager::AppMemoryUsageLimit(),
                     static_cast<unsigned>(
@@ -1462,7 +1479,9 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                     Read(Kind::TextureRgba8), Read(Kind::TextureBc), Read(Kind::TextureDepth),
                     Read(Kind::TextureOther), Read(Kind::TextureExpected),
                     Read(Kind::TextureCritical), Read(Kind::DecodeBudget),
-                    Read(Kind::TextureEvictions), usage - (std::min)(usage, known),
+                    Read(Kind::TextureEvictions), Read(Kind::JitCode), Read(Kind::JitReserved),
+                    Read(Kind::JitMetadata), Read(Kind::JitDispatch), Read(Kind::FiberStacks),
+                    Read(Kind::DescriptorPayload), usage - (std::min)(usage, known),
                     std::chrono::duration_cast<std::chrono::microseconds>(
                         std::chrono::steady_clock::now() - query_begin)
                         .count()));

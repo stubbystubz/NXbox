@@ -9,6 +9,9 @@
 #pragma once
 
 #include <array>
+#ifdef DYNARMIC_UWP_APPCONTAINER
+#    include "../../../../../common/nxbox_memory.h"
+#endif
 #include <functional>
 #include <memory>
 #include <type_traits>
@@ -221,6 +224,8 @@ private:
     void RecordWriteRange(size_t begin, size_t end);
     // Must be declared before constant_pool: it installs the executable-view delta that the
     // constant pool's constructor (which emits and allocates from the code buffer) already needs.
+    NxboxMemory::Gauge code_memory{NxboxMemory::Kind::JitCode};
+    NxboxMemory::Gauge reserved_memory{NxboxMemory::Kind::JitReserved};
     bool ConfigureWx();
     bool dual_map = ConfigureWx();
 #endif
