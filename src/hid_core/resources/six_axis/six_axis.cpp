@@ -223,7 +223,7 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
                             for (std::size_t column = 0; column < 3; ++column)
                                 attitude[row * 3 + column] = sent_state.orientation[row][column];
                         if (!diagnostic.Update(
-                                {sent_state.gyro.x, sent_state.gyro.y, sent_state.gyro.z}, attitude,
+                                {sent_state.gyro[0], sent_state.gyro[1], sent_state.gyro[2]}, attitude,
                                 delivered, diagnostic_now))
                             continue;
                         LOG_WARNING(Service_HID,
