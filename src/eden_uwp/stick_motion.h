@@ -27,6 +27,11 @@ public:
     static constexpr float kReleaseSeconds = 0.15f;
     static constexpr float kDeadzone = 0.15f;
 
+    // Frontend chords consume View without interrupting the current tilt gesture.
+    void CancelTap() {
+        cancelled = true;
+    }
+
     StickMotionSample Update(bool view, float x, float y, Clock::time_point now,
                              bool blocked = false) {
         const float elapsed = initialized ? std::max(0.0f, Seconds(now - last)) : 1.0f / 60.0f;

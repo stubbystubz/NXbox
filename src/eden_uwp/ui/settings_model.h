@@ -30,6 +30,7 @@ enum class Setting {
     FrameGeneration,
     FramePacing,
     ShowFps,
+    RecordVideo,
     Version,
     FtpServer,
     Count
@@ -51,8 +52,8 @@ inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
      {Setting::ProfilePicture, Setting::Accounts, Setting::Moru, Setting::SaveSync},
      4},
     {Text::SettingsSystem,
-     {Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox},
-     3},
+     {Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox, Setting::RecordVideo},
+     4},
     {Text::SettingsAbout, {Setting::Version, Setting::Credits}, 2},
 }};
 inline constexpr std::array<unsigned, 3> kFrameGenerationModes{0, 2, 4};

@@ -28,6 +28,7 @@
 #include "common/scope_exit.h"
 #include "common/fps_overlay.h"
 #include "eden_uwp/fps_settings.h"
+#include "eden_uwp/recorder_policy.h"
 #include "common/scm_rev.h"
 #include "eden_uwp/renderer_settings.h"
 #include "eden_uwp/ui/settings_model.h"
@@ -232,6 +233,7 @@ public:
         input_.SetCancelFlag(return_home_);
         official_interface_ = UseOfficialSwitchInterface(local_state_);
         show_fps_ = ReadShowFps(local_state_);
+        recording_ = Recording::ReadOptions(local_state_);
         renderer_backend_ = RendererSettings::Read(local_state_);
         shader_preload_ = RendererSettings::ReadShaderPreload(local_state_);
         async_shaders_ = RendererSettings::ReadAsyncShaders(local_state_);
@@ -1050,6 +1052,15 @@ private:
                 ftp_.Stop();
             else if (!ftp_.Start(local_state_))
                 Toast(Tr(Text::FtpStartFailed), now);
+            return;
+        }
+        if (SelectedSetting() == Setting::RecordVideo) {
+            auto next = recording_;
+            next.mode = (next.mode + 1) % 5;
+            if (Recording::SaveOptions(local_state_, next))
+                recording_ = next;
+            else
+                Toast(Tr(Text::ResolutionSaveFailed), now);
             return;
         }
         if (SelectedSetting() == Setting::ShowFps) {
@@ -1910,6 +1921,10 @@ private:
               Theme::kTextSecondary, Tr(Text::FramePacingHint)},
              {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::ShowFpsHint)},
+             {Tr(Text::RecordVideo),
+              Tr(std::array{Text::RecordManual, Text::Record72030, Text::Record72060,
+                            Text::Record108030, Text::Record108060}[recording_.mode]),
+              Theme::kTextSecondary, Tr(Text::RecordVideoHint)},
              {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
               Tr(Text::SettingsBuildHint)},
              {Tr(Text::FtpServer), ftp_address.c_str(), Theme::kTextSecondary,
@@ -2214,6 +2229,7 @@ private:
     std::wstring toast_;
     Clock::time_point toast_until_{};
 
+    Recording::Options recording_;
     bool show_fps_ = false;
     bool closed_ = false;
     bool leaving_ = false;

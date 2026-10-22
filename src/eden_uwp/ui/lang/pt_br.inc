@@ -461,3 +461,11 @@
 
     {Text::MaxPlayersTitle, L"Jogadores locais"},
     {Text::MaxPlayersHint, L"Cada controle conectado vira um jogador, até 4."},
+
+    {Text::RecordVideo, L"Gravar vídeo"},
+    {Text::RecordVideoHint, L"Próximo jogo · View + clique no analógico direito: iniciar/parar · Sem áudio · 120 s · Apaga vídeos antigos."},
+    {Text::RecordManual, L"Manual · 720p / 30 fps"},
+    {Text::Record72030, L"720p / 30 fps"},
+    {Text::Record72060, L"720p / 60 fps"},
+    {Text::Record108030, L"1080p / 30 fps"},
+    {Text::Record108060, L"1080p / 60 fps"},

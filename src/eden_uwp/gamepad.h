@@ -21,6 +21,7 @@
 #include "eden_uwp/home_combo.h"
 #include "eden_uwp/input_script.h"
 #include "eden_uwp/pad_style.h"
+#include "eden_uwp/recorder_policy.h"
 #include "eden_uwp/stick_motion.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
@@ -169,9 +170,18 @@ public:
             home_pressed = home_edge.Update(view, menu);
             home_combo_action = UpdateHomeCombo(home_combo, view, menu, now);
         }
+        const bool right_click =
+            (reading.Buttons & GamepadButtons::RightThumbstick) != GamepadButtons::None ||
+            (keys & (1u << Settings::NativeButton::RStick)) != 0;
+        if (primary && record_shortcut.Update(view, right_click, menu || combo_blocked) &&
+            !suppress_guest) {
+            Recording::toggles.fetch_add(1);
+        }
         const auto motion = stick_motions[slot].Update(
             view, static_cast<float>(reading.RightThumbstickX),
             static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
+        if (primary && view && right_click)
+            stick_motions[slot].CancelTap();
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -209,7 +219,8 @@ public:
                       (scripted_keys & (1u << i)) != 0;
             if (i == Settings::NativeButton::Minus)
                 pressed = motion.minus_pressed;
-            if (i == Settings::NativeButton::RStick && motion.suppress_right_stick)
+            if (i == Settings::NativeButton::RStick &&
+                (motion.suppress_right_stick || (primary && record_shortcut.consume_stick)))
                 pressed = false;
             if (combo_blocked &&
                 (i == Settings::NativeButton::Minus || i == Settings::NativeButton::Plus)) {
@@ -285,6 +296,7 @@ public:
     }
 
 private:
+    Recording::Shortcut record_shortcut;
     bool shader_skip_armed = false;
     ButtonLayout button_layout = ButtonLayout::Name;
     GamepadSlots<winrt::Windows::Gaming::Input::Gamepad> previous_devices;

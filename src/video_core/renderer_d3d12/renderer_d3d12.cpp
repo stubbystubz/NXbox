@@ -28,6 +28,7 @@
 #include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/recorder.h"
 #include "video_core/renderer_d3d12/d3d12_resolution.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
 
@@ -71,6 +72,7 @@ struct RendererD3D12::Impl {
     ComPtr<IDXGISwapChain3> swapchain;
     std::unique_ptr<Present::Presenter> upscaler;
     std::unique_ptr<Present::FpsCounter> fps_counter;
+    std::unique_ptr<Present::Recorder> recorder;
     std::unique_ptr<Present::FrameGenerator> frame_generator;
     bool frame_pacing_enabled{};
     Present::FramePacingPolicy frame_pacing;
@@ -118,6 +120,7 @@ struct RendererD3D12::Impl {
         } catch (...) {
             Diagnostic("D3D12 renderer teardown: non-standard exception");
         }
+        recorder.reset();
     }
     D3D12_CPU_DESCRIPTOR_HANDLE Rtv(UINT index) const {
         auto handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -264,7 +267,7 @@ struct RendererD3D12::Impl {
         desc.Height = height;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         desc.SampleDesc.Count = 1;
-        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
         desc.BufferCount = active_buffers;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.Scaling = DXGI_SCALING_STRETCH;
@@ -581,6 +584,9 @@ struct RendererD3D12::Impl {
                 fps_counter->Draw(Rtv(index), width, height);
             });
         }
+        if (!recorder)
+            recorder = std::make_unique<Present::Recorder>(context);
+        recorder->Capture(buffers[index], Rtv(index), !layers.empty());
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
         context.SimulateSeriesSFrame();
         context.GpuPassFrame();
@@ -671,6 +677,8 @@ struct RendererD3D12::Impl {
             context.Commands()->CopyResource(destination->handle.Get(), source->handle.Get());
         };
         copy(buffers[index], generated);
+        if (recorder)
+            recorder->Capture(buffers[index], Rtv(index), true);
         context.Transition(buffers[index], D3D12_RESOURCE_STATE_PRESENT);
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();

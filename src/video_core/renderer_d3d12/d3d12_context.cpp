@@ -2201,6 +2201,36 @@ std::shared_ptr<BufferHeapPool> BufferPool(const std::shared_ptr<MemoryBudget>& 
     return pool;
 }
 } // namespace
+ResourcePtr Context::CreateResourceNoWait(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE heap,
+                                          D3D12_RESOURCE_STATES state) {
+    const auto allocation = device->GetResourceAllocationInfo(0, 1, &desc);
+    const u64 used = budget->used.load();
+    const auto target = NativeBufferMemoryTarget(used);
+    if (allocation.SizeInBytes == UINT64_MAX || used >= target ||
+        allocation.SizeInBytes > target - used)
+        throw std::runtime_error("D3D12 optional capture resource exceeds memory budget");
+    auto resource = std::make_shared<Resource>();
+    D3D12_HEAP_PROPERTIES properties{};
+    properties.Type = heap;
+    properties.CreationNodeMask = properties.VisibleNodeMask = 1;
+    // No pool growth, eviction, submission, fence wait or out-of-memory retry here.
+    Check(device->CreateCommittedResource(&properties, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                          IID_PPV_ARGS(&resource->handle)),
+          "Create optional capture resource", device.Get());
+    resource->heap = heap;
+    resource->state = state;
+    resource->allocation_size = allocation.SizeInBytes;
+    resource->budget = budget;
+    budget->used += allocation.SizeInBytes;
+    if (heap == D3D12_HEAP_TYPE_READBACK) {
+        void* mapped{};
+        const D3D12_RANGE range{0, static_cast<SIZE_T>(desc.Width)};
+        Check(resource->handle->Map(0, &range, &mapped), "Map optional capture readback",
+              device.Get());
+        resource->mapped = {static_cast<u8*>(mapped), static_cast<size_t>(desc.Width)};
+    }
+    return resource;
+}
 ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE heap,
                                     D3D12_RESOURCE_STATES state) {
     Collect();
