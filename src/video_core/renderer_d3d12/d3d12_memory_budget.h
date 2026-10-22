@@ -8,6 +8,18 @@
 #include <string_view>
 
 namespace D3D12 {
+// Cache GC targets may be exceeded by live resources. Only process exhaustion
+// justifies waiting before asking the device for a new allocation.
+constexpr bool AllocationNeedsRetirement(std::uint64_t limit, std::uint64_t usage,
+                                         std::uint64_t bytes) noexcept {
+    constexpr std::uint64_t reserve = 256ULL << 20;
+    if (!limit)
+        return true;
+    const auto available = limit - (std::min)(limit, usage);
+    return available <= reserve || bytes >= available - reserve;
+}
+bool NativeAllocationPressureWait(std::uint64_t bytes) noexcept;
+
 struct TextureMemoryBudget {
     std::uint64_t expected = 320ULL << 20;
     std::uint64_t critical = 448ULL << 20;
