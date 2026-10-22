@@ -2232,9 +2232,16 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
 
     const std::array<u64, 4> target_key{num_rts, num_rts ? rtv_base.ptr : 0,
                                         has_depth ? dsv_handle.ptr : 0, has_depth ? 1u : 0u};
-    if (context.RecordState(recorded.targets.Update(target_key)))
+    if (context.RecordState(recorded.targets.Update(target_key))) {
+        for (u32 target_slot = 0; target_slot < num_rts; ++target_slot) {
+            if (color_views[target_slot])
+                color_views[target_slot]->NoteAstcBcUse(true);
+        }
+        if (has_depth)
+            depth_view->NoteAstcBcUse(true);
         commands->OMSetRenderTargets(num_rts, num_rts ? &rtv_base : nullptr, TRUE,
                                      has_depth ? &dsv_handle : nullptr);
+    }
     context.GraphicsStateTracker().SetRenderArea(render_area.width, render_area.height);
     const GraphicsStateInputs dynamic_graphics{
         context.GraphicsStateTracker().Update(*maxwell3d),

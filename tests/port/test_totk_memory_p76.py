@@ -315,15 +315,15 @@ u32 NumBlocksPerLayer(const ImageInfo&, Extent2D) { return 64+16+4+1; }
 int main() {
  ImageInfo image;
  using Settings::AstcRecompression;
- assert(CalculateConvertedSizeBytes(image)==680); // RGBA mips, two layers.
+ assert(CalculateConvertedSizeBytes(image, false)==680); // RGBA mips, two layers.
  Settings::values.astc_recompression.current=AstcRecompression::Bc3;
- assert(CalculateConvertedSizeBytes(image)==224); // (64+16+16+16)*2, padded BC blocks.
+ assert(CalculateConvertedSizeBytes(image, false)==224); // (64+16+16+16)*2, padded BC blocks.
  image.resources.levels=1;
- assert(CalculateConvertedSizeBytes(image)==128); // 4:1 for full 4x4 blocks.
+ assert(CalculateConvertedSizeBytes(image, false)==128); // 4:1 for full 4x4 blocks.
  image.size={5,3,1};
- assert(CalculateConvertedSizeBytes(image)==64); // Two 16-byte blocks per layer.
+ assert(CalculateConvertedSizeBytes(image, false)==64); // Two 16-byte blocks per layer.
  Settings::values.astc_recompression.current=AstcRecompression::Bc1;
- assert(CalculateConvertedSizeBytes(image)==32); // Preserve the existing BC1 option.
+ assert(CalculateConvertedSizeBytes(image, false)==32); // Preserve the existing BC1 option.
 }
 """
         )

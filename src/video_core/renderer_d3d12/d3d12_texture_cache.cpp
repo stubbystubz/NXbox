@@ -20,6 +20,7 @@
 #include "common/settings.h"
 #include "video_core/framebuffer_config.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_astc_bc.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor.h"
 #include "video_core/renderer_d3d12/d3d12_footprint.h"
 #include "video_core/renderer_d3d12/d3d12_resolution.h"
@@ -220,7 +221,27 @@ Image::Image(TextureCacheRuntime& runtime, const VideoCommon::ImageInfo& info, G
     if (host_format.converted_astc) {
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
-        switch (Settings::values.astc_recompression.GetValue()) {
+        astc_bc_candidate = Settings::values.astc_recompression.GetValue() !=
+                            Settings::AstcRecompression::Uncompressed;
+        static const std::string skip_rule = [] {
+            const char* value = std::getenv("NXBOX_ASTC_BC_SKIP");
+            return value ? std::string{value} : std::string{};
+        }();
+        astc_uncompressed =
+            astc_bc_candidate &&
+            (!AstcBcEligible(info.type == VideoCommon::ImageType::e2D, info.size.width,
+                             info.size.height, info.size.depth, info.resources.layers,
+                             info.num_samples) ||
+             (!skip_rule.empty() &&
+              AstcBcSkip(skip_rule,
+                         AstcBcClasses(info.size.width, info.size.height, info.resources.levels,
+                                       info.resources.layers, host_format.name, gpu_addr))));
+        if (astc_uncompressed)
+            converted_size_bytes = VideoCommon::CalculateConvertedSizeBytes(info, true);
+        const auto recompression = astc_uncompressed
+                                       ? Settings::AstcRecompression::Uncompressed
+                                       : Settings::values.astc_recompression.GetValue();
+        switch (recompression) {
         case Settings::AstcRecompression::Bc1:
             host_format = LookupFormat("BC1_RGBA_UNORM");
             break;
@@ -288,6 +309,7 @@ Image::Image(TextureCacheRuntime& runtime, const VideoCommon::ImageInfo& info, G
                               info.num_samples == 1 && info.resources.levels == 1 &&
                               host_format.block_width == 1 && host_format.block_height == 1;
     original_resource = resource;
+    TraceAstcBc("create");
     // CPU ASTC decoding runs inline on the GPU thread: Wonder spent up to 1.3 s of every 5 s
     // there while streaming a new area. accelerate_astc=2 moves it to the texture decode worker;
     // the texture samples empty until its upload lands at a later frame tick.
@@ -349,8 +371,60 @@ bool Image::ScaleDown(bool ignore) {
     return true;
 }
 
+bool Image::AstcBcDiagnosticEnabled() const {
+    static const bool enabled = BisectEnabled("NXBOX_ASTC_BC_DIAG");
+    return enabled && astc_bc_candidate;
+}
+void Image::TraceAstcBc(std::string_view event, std::string_view detail) const {
+    if (!AstcBcDiagnosticEnabled())
+        return;
+    Diagnostic(fmt::format(
+        "ASTC_BC event={} gpu={:x} size={}x{}x{} mips={} layers={} type={} "
+        "block={}x{} format={} srgb={} host={} host_block={}x{} rgba={} rt_view={} copy_dst={} {}",
+        event, gpu_addr, info.size.width, info.size.height, info.size.depth, info.resources.levels,
+        info.resources.layers, static_cast<u32>(info.type),
+        VideoCore::Surface::DefaultBlockWidth(info.format),
+        VideoCore::Surface::DefaultBlockHeight(info.format), MaxwellFormat(info.format).name,
+        VideoCore::Surface::IsPixelFormatSRGB(info.format), host_format.name,
+        host_format.block_width, host_format.block_height, astc_uncompressed, astc_bc_rt,
+        astc_bc_copy_dst, detail));
+}
+void Image::NoteAstcBcUse(bool render_target) {
+    bool& seen = render_target ? astc_bc_rt : astc_bc_copy_dst;
+    if (seen)
+        return;
+    seen = true;
+    TraceAstcBc(render_target ? "rt_view" : "copy_dst");
+}
 void Image::UploadMemory(const StagingBufferRef& map,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    if (AstcBcDiagnosticEnabled()) {
+        for (const auto& upload_copy : copies) {
+            const auto upload_level = upload_copy.image_subresource.base_level;
+            const auto& upload_extent = upload_copy.image_extent;
+            const auto& upload_offset = upload_copy.image_offset;
+            const bool partial =
+                upload_level < 0 || upload_level >= info.resources.levels || upload_level >= 32 ||
+                upload_offset.x || upload_offset.y || upload_offset.z ||
+                upload_extent.width != std::max(1u, info.size.width >> upload_level) ||
+                upload_extent.height != std::max(1u, info.size.height >> upload_level) ||
+                upload_extent.depth != (info.type == VideoCommon::ImageType::e3D
+                                            ? std::max(1u, info.size.depth >> upload_level)
+                                            : 1u) ||
+                upload_copy.image_subresource.base_layer != 0 ||
+                upload_copy.image_subresource.num_layers != info.resources.layers;
+            TraceAstcBc(partial ? "partial_upload" : "full_upload",
+                        fmt::format("level={} layer={} count={} origin={},{},{} extent={}x{}x{} "
+                                    "buffer_offset={} buffer_size={} row_length={} image_height={}",
+                                    upload_level, upload_copy.image_subresource.base_layer,
+                                    upload_copy.image_subresource.num_layers, upload_offset.x,
+                                    upload_offset.y, upload_offset.z, upload_extent.width,
+                                    upload_extent.height, upload_extent.depth,
+                                    upload_copy.buffer_offset, upload_copy.buffer_size,
+                                    upload_copy.buffer_row_length,
+                                    upload_copy.buffer_image_height));
+        }
+    }
     Transfer(map, copies, false);
 }
 void Image::DownloadMemory(const StagingBufferRef& map,
@@ -885,6 +959,16 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::ImageViewInfo& inf
     : ImageViewBase{info, image.info, id, image.gpu_addr}, is_rescaled{image.IsRescaled()},
       sample_count{image.info.num_samples}, image_type{image.info.type},
       host_format{image.HostFormat()}, resource{image.Handle()} {
+    astc_bc_diag = image.AstcBcDiagnosticEnabled();
+    if (image.AstcBcDiagnosticEnabled())
+        image.TraceAstcBc(
+            "view",
+            fmt::format("view_format={} view_type={} level={} levels={} layer={} layers={} rt={}",
+                        MaxwellFormat(info.format).name, static_cast<u32>(type), range.base.level,
+                        range.extent.levels, range.base.layer, range.extent.layers,
+                        info.IsRenderTarget()));
+    if (info.IsRenderTarget())
+        image.NoteAstcBcUse(true);
     if (!resource)
         return;
     resource->Description();
@@ -1028,6 +1112,19 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::ImageInfo& info,
     : ImageViewBase{info, view, addr}, buffer_size{VideoCommon::CalculateGuestSizeInBytes(info)},
       sample_count{info.num_samples}, image_type{info.type},
       host_format{MaxwellFormat(info.format)} {}
+void ImageView::NoteAstcBcUse(bool render_target) const {
+    if (!astc_bc_diag)
+        return;
+    bool& seen = render_target ? astc_bc_rt_bound : astc_bc_copy_dst;
+    if (seen)
+        return;
+    seen = true;
+    Diagnostic(fmt::format("ASTC_BC event={} gpu={:x} view_format={} host={} level={} layers={} "
+                           "rt_bound={} copy_dst={}",
+                           render_target ? "rt_bind" : "view_copy_dst", gpu_addr,
+                           MaxwellFormat(format).name, host_format.name, range.base.level,
+                           range.extent.layers, astc_bc_rt_bound, astc_bc_copy_dst));
+}
 void ImageView::LogUnsupported(std::string_view condition) const {
     VideoCommon::ImageInfo info;
     info.format = format;
@@ -1236,6 +1333,7 @@ bool TextureCacheRuntime::CanBlitImages(const Image& dst, const Image& src,
                                         const Tegra::Engines::Fermi2D::Surface& dst_surface,
                                         const Tegra::Engines::Fermi2D::Surface& src_surface,
                                         const Tegra::Engines::Fermi2D::Config& copy) const {
+    dst.TraceAstcBc("copy_dst_candidate");
     const auto reject = [this](const char* reason) {
         blit_reject = reason;
         return false;
@@ -1303,6 +1401,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst, ImageView& src
                                     const VideoCommon::Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
+    dst.NoteAstcBcUse(false);
     if (!dst.ImageHandle() || !src.ImageHandle())
         return;
     const BlitSurface source{src.ImageHandle(), src.HostFormat(),
@@ -1359,6 +1458,7 @@ BlitImageHelper& TextureCacheRuntime::BlitHelpers() {
 }
 void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
                                         std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteAstcBcUse(false);
     if (!dst.Handle() || !src.Handle())
         return;
     try {
@@ -1369,6 +1469,7 @@ void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
     }
 }
 void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst, ImageView& src) {
+    dst.NoteAstcBcUse(false);
     if (!dst.ImageHandle() || !src.ImageHandle())
         return;
     VideoCommon::ImageCopy copy{};
@@ -1576,6 +1677,7 @@ bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
 }
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteAstcBcUse(false);
     if (!dst.Handle() || !src.Handle())
         return;
     if (!ShouldReinterpret(dst, src)) {
@@ -1714,6 +1816,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
 }
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const VideoCommon::ImageCopy> copies) {
+    dst.NoteAstcBcUse(false);
     if (!dst.Handle() || !src.Handle())
         return;
     if (dst.Handle()->handle->GetDesc().SampleDesc.Count !=
