@@ -153,7 +153,7 @@ public:
                               hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)
                                   ->IsSixAxisSensorRequested());
             PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot),
-                       sensor_requested && allowed && present &&
+                       sensor_requested && allowed && (present || slot == 0) &&
                            Settings::values.motion_enabled.GetValue());
             controller.SetSyntheticMotionGesture(stick_motions[slot].IsModifierActive(),
                                                  stick_motions[slot].TapCount());
@@ -200,11 +200,21 @@ public:
         const bool modifier =
             (reading.Buttons & GamepadButtons::LeftThumbstick) != GamepadButtons::None ||
             (keys & (1u << Settings::NativeButton::LStick)) != 0;
+        const auto key_axis = [keys](int positive, int negative, double value) {
+            if (keys & (1u << positive))
+                return 1.0f;
+            if (keys & (1u << negative))
+                return -1.0f;
+            return static_cast<float>(value);
+        };
+        // Remote/keyboard stick keys drive motion like a pad's sticks (player 1 without a pad).
         const auto motion = stick_motions[slot].Update(
-            sensor_requested, modifier, static_cast<float>(reading.LeftThumbstickX),
-            static_cast<float>(reading.LeftThumbstickY),
-            static_cast<float>(reading.RightThumbstickX),
-            static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
+            sensor_requested, modifier,
+            key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX),
+            key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY),
+            key_axis(KeyRightStickRight, KeyRightStickLeft, reading.RightThumbstickX),
+            key_axis(KeyRightStickUp, KeyRightStickDown, reading.RightThumbstickY), now,
+            suppress_guest || combo_blocked);
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -257,13 +267,6 @@ public:
                 SetAxis(pad, i, 0.0f);
             return;
         }
-        const auto key_axis = [keys](int positive, int negative, double value) {
-            if (keys & (1u << positive))
-                return 1.0f;
-            if (keys & (1u << negative))
-                return -1.0f;
-            return static_cast<float>(value);
-        };
         SetAxis(pad, 0,
                 motion.suppress_sticks
                     ? 0.0f
