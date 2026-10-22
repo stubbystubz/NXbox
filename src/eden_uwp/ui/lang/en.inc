@@ -448,3 +448,7 @@
     {Text::Record72060, L"720p / 60 fps"},
     {Text::Record108030, L"1080p / 30 fps"},
     {Text::Record108060, L"1080p / 60 fps"},
+    {Text::FrameGenerationAuto, L"Auto (locked)"}, {Text::FrameGenerationDefault, L"Default"},
+    {Text::FrameGenerationTargetHint,
+     L"Default inherits the global choice, then the game preset. Auto locks an even display rate. "
+     L"40 FG requires 120 Hz output."},

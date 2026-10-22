@@ -41,7 +41,7 @@ endwhile()
 configure_file(shader_source.h.in d3d12_present_shader_source.h @ONLY)
 target_include_directories(video_core PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 target_sources(video_core PRIVATE present.cpp present.h present_math.h
-               frame_generation.cpp frame_generation.h frame_generation_policy.h
+               frame_generation.cpp frame_generation.h frame_generation_policy.h frame_generation_target.h
                frame_pacing_policy.h temporal_upscaler.cpp temporal_upscaler.h)
 
 target_sources(video_core PRIVATE recorder.cpp recorder.h)

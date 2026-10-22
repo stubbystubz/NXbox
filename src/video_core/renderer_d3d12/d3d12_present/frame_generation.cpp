@@ -23,6 +23,7 @@ struct FrameGenerator::Impl {
         // Heap ownership lasts through the final dispatch, not just the statistic copy.
         u64 tick{}, sample_tick{}, sample_id{};
         unsigned cells{}, query_pairs{}, generation_mode{2};
+        double game_seconds{1.0 / 30};
         bool pending{};
     };
     std::array<Slot, 3> slots;
@@ -286,10 +287,10 @@ struct FrameGenerator::Impl {
                 ticks += timestamps[1] - timestamps[0];
         }
         latest_gpu_ms = double(ticks) * 1000 / timing_frequency;
-        // Conservative 30 fps budget; no idle time between interpolated presents
+        // Budget of the sampled real frame; no idle time between interpolated presents
         // is counted. A miss latches generation off for this renderer session.
         if (!gpu_budget_missed &&
-            FrameGenerationBudgetMissed(latest_gpu_ms, 1.0 / 30, slot.generation_mode)) {
+            FrameGenerationBudgetMissed(latest_gpu_ms, slot.game_seconds, slot.generation_mode)) {
             gpu_budget_missed = true;
             Diagnostic(fmt::format("D3D12_FRAME_GEN mode=off rejected_timing=gpu_budget "
                                    "gpu_ms={:.3f} requested={}x",
@@ -349,6 +350,7 @@ struct FrameGenerator::Impl {
         }
         auto& slot = *available;
         slot.generation_mode = mode;
+        slot.game_seconds = seconds > 0 ? seconds : 1.0 / 30;
         if (history)
             std::swap(previous, current);
         Views(slot);
@@ -455,7 +457,10 @@ ResourcePtr FrameGenerator::Motion() const {
 ResourcePtr FrameGenerator::Previous() const {
     return impl->previous;
 }
-unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requested) {
+double FrameGenerator::RefreshHz() const {
+    return impl->refresh_hz;
+}
+unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked) {
     DXGI_SWAP_CHAIN_DESC desc{};
     const bool specified_refresh = SUCCEEDED(swapchain->GetDesc(&desc)) &&
                                    desc.BufferDesc.RefreshRate.Denominator &&
@@ -485,7 +490,8 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
         if (!specified_refresh)
             impl->refresh_hz = 0;
     }
-    const unsigned mode = DisplayFrameGenerationMode(requested, impl->refresh_hz);
+    const unsigned mode =
+        locked ? requested : DisplayFrameGenerationMode(requested, impl->refresh_hz);
     if (!impl->logged_refresh || mode != impl->mode) {
         ComPtr<IDXGIOutput> output;
         DXGI_OUTPUT_DESC output_desc{};
@@ -496,6 +502,7 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
                                requested, mode, impl->refresh_hz, found, impl->refresh_hz == 0));
         impl->logged_refresh = true;
     }
+    impl->policy.locked = locked;
     impl->mode = mode;
     impl->fraction = mode > 1 ? 1.f / mode : .5f;
     return mode;

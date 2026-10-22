@@ -25,6 +25,7 @@
 #include "video_core/renderer_d3d12/d3d12_output_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_target.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
@@ -84,6 +85,10 @@ struct RendererD3D12::Impl {
     unsigned frame_generation_mode{}, effective_frame_generation_mode{2};
     bool frame_generation_failed{};
     Present::FrameGenerationCadence frame_generation_cadence;
+    Present::FrameGenerationTargetPolicy target_policy;
+    unsigned target_interval{1};
+    double previous_generation_wait{};
+    bool logged_40hz{};
     std::chrono::steady_clock::time_point previous_game_frame{};
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
@@ -216,15 +221,19 @@ struct RendererD3D12::Impl {
         if (Common::FpsOverlay::EnvironmentForces(show_fps))
             Common::FpsOverlay::Initialize(true, show_fps);
         char frame_gen[16]{}, frame_gen_setting[16]{};
-        if (GetEnvironmentVariableA("NXBOX_FRAME_GEN", frame_gen, sizeof(frame_gen)) != 1)
+        const auto mode_length =
+            GetEnvironmentVariableA("NXBOX_FRAME_GEN", frame_gen, sizeof(frame_gen));
+        if (!mode_length || mode_length >= sizeof(frame_gen))
             frame_gen[0] = 0;
-        if (GetEnvironmentVariableA("NXBOX_FRAME_GEN_SETTING", frame_gen_setting,
-                                    sizeof(frame_gen_setting)) != 1)
+        const auto setting_length = GetEnvironmentVariableA(
+            "NXBOX_FRAME_GEN_SETTING", frame_gen_setting, sizeof(frame_gen_setting));
+        if (!setting_length || setting_length >= sizeof(frame_gen_setting))
             frame_gen_setting[0] = 0;
         frame_generation_mode = Present::FrameGenerationMode(
             Present::FrameGenerationMode(0, frame_gen_setting), frame_gen);
         frame_generation_enabled = frame_generation_mode != 0;
         Common::FpsOverlay::frame_generation.store(frame_generation_enabled);
+        Common::FpsOverlay::frame_generation_target.store(0);
         char pacing[16]{}, pacing_setting[16]{};
         if (GetEnvironmentVariableA("NXBOX_FRAME_PACING", pacing, sizeof(pacing)) != 1)
             pacing[0] = 0;
@@ -548,13 +557,46 @@ struct RendererD3D12::Impl {
                     source_width = std::max(source_width, rotated ? layer.height : layer.width);
                     source_height = std::max(source_height, rotated ? layer.width : layer.height);
                 }
-                effective_frame_generation_mode =
-                    frame_generator->Configure(swapchain.Get(), frame_generation_mode);
+                const bool automatic = frame_generation_mode == 3;
+                effective_frame_generation_mode = frame_generator->Configure(
+                    swapchain.Get(),
+                    automatic ? target_policy.current.multiplier : frame_generation_mode,
+                    automatic);
+                target_interval = 1;
+                if (automatic) {
+                    const double producer = seconds - previous_generation_wait;
+                    const double refresh = frame_generator->RefreshHz();
+                    if (!logged_40hz && refresh >= 59 && refresh <= 61 && producer > 1.0 / 28 &&
+                        producer < 1.0 / 20) {
+                        Diagnostic("D3D12_FRAME_GEN 40 FG requires 120 Hz output; choose 30 FG 2x "
+                                   "over 60 FG 4x: same 15 real fps, fewer synthetic frames");
+                        logged_40hz = true;
+                    }
+                    if (target_policy.Observe(producer, refresh, seconds)) {
+                        frame_generator->Reset();
+                        frame_generator->Configure(swapchain.Get(),
+                                                   target_policy.current.multiplier, true);
+                        Diagnostic(
+                            fmt::format("D3D12_FRAME_GEN lock={} multiplier={} refresh_hz={:.2f}",
+                                        target_policy.current.output,
+                                        target_policy.current.multiplier, refresh));
+                    }
+                    const auto target = target_policy.current;
+                    Common::FpsOverlay::frame_generation_target.store(target.output);
+                    effective_frame_generation_mode = target.multiplier;
+                    target_interval = target.interval ? target.interval : 1;
+                }
                 frame_generator->UseMotion(layers.size() == 1 && upscaler ? upscaler->Motion()
                                                                           : ResourcePtr{});
                 frame_generator->SetSourceExtent(source_width, source_height);
-                generated = frame_generator->Generate(buffers[index],
-                                                      frame_generation_cadence.Observe(seconds));
+                if (automatic && (!std::isfinite(seconds) || seconds >= 0.2)) {
+                    frame_generator->Reset();
+                } else if (!automatic || target_policy.current.output) {
+                    generated = frame_generator->Generate(
+                        buffers[index], automatic ? double(target_policy.current.multiplier) /
+                                                        target_policy.current.output
+                                                  : frame_generation_cadence.Observe(seconds));
+                }
             } catch (const std::exception&) {
                 frame_generation_failed = true;
                 Diagnostic("D3D12 frame generation disabled for session: initialization failed");
@@ -606,6 +648,9 @@ struct RendererD3D12::Impl {
                 EdenXbox::ThreadProfile::Wait::Present};
             status = Common::MaxwellMethodProfile::Measure(
                 Common::MaxwellMethodProfile::PresentSwapchain, [&] {
+                    if (frame_generation_mode == 3 && !frame_generation_failed &&
+                        target_policy.current.output)
+                        return swapchain->Present(target_interval, 0);
                     if (frame_pacing_enabled)
                         return PresentPaced(pacing_interval);
                     return swapchain->Present(1, 0);
@@ -616,6 +661,15 @@ struct RendererD3D12::Impl {
         RecordPresentation();
         if (frame_generation_enabled)
             Common::FpsOverlay::Presented();
+        if (frame_generation_enabled) {
+            if (frame_generation_failed)
+                Common::FpsOverlay::frame_generation_target.store(0);
+            if (frame_generation_mode == 3 && previous_game_frame.time_since_epoch().count())
+                previous_generation_wait =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                  previous_game_frame)
+                        .count();
+        }
         Check(context.Device()->GetDeviceRemovedReason(), "after Present", context.Device());
         if (log_present)
             Diagnostic("D3D12 Present complete");
@@ -683,7 +737,7 @@ struct RendererD3D12::Impl {
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
-        Check(swapchain->Present(1, 0), "Present generated frame", context.Device());
+        Check(swapchain->Present(target_interval, 0), "Present generated frame", context.Device());
         Common::FpsOverlay::Presented();
         RecordPresentation();
         index = swapchain->GetCurrentBackBufferIndex();

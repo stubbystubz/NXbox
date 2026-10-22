@@ -469,3 +469,7 @@
     {Text::Record72060, L"720p / 60 fps"},
     {Text::Record108030, L"1080p / 30 fps"},
     {Text::Record108060, L"1080p / 60 fps"},
+    {Text::FrameGenerationAuto, L"Auto (fixo)"}, {Text::FrameGenerationDefault, L"Padrão"},
+    {Text::FrameGenerationTargetHint,
+     L"Padrão usa a escolha global e depois a predefinição do jogo. Auto fixa uma cadência "
+     L"uniforme. 40 FG exige saída em 120 Hz."},

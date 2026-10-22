@@ -26,41 +26,13 @@ inline int Read(const std::filesystem::path& local) {
 }
 inline unsigned ReadFrameGenerationMode(const std::filesystem::path& local) {
     std::ifstream in(local / "eden_settings.txt");
-    unsigned enabled = 0;
-    for (std::string line; std::getline(in, line);) {
-        const auto entry = TitleSettings::ParseLine(line);
-        if (entry && (entry->label == "frame_generation" || entry->label == "frame_gen"))
-            enabled = entry->value == "4" || entry->value == "4x"                          ? 4
-                      : entry->value == "1" || entry->value == "2" || entry->value == "2x" ? 2
-                                                                                           : 0;
-    }
-    return enabled;
+    return TitleSettings::ReadFrameGeneration(in).value_or(0);
 }
 inline bool ReadFrameGeneration(const std::filesystem::path& local) {
     return ReadFrameGenerationMode(local) != 0;
 }
 inline bool SaveFrameGenerationMode(const std::filesystem::path& local, unsigned mode) {
-    const auto file = local / "eden_settings.txt";
-    std::error_code error;
-    const bool exists = std::filesystem::exists(file, error);
-    if (error)
-        return false;
-    std::ifstream in(file);
-    if (exists && !in)
-        return false;
-    std::string content;
-    for (std::string line; std::getline(in, line);) {
-        const auto entry = TitleSettings::ParseLine(line);
-        if (!entry || (entry->label != "frame_generation" && entry->label != "frame_gen"))
-            content += line + '\n';
-    }
-    if (in.bad())
-        return false;
-    in.close();
-    std::ofstream out(file, std::ios::trunc);
-    out << content << "frame_generation=" << (mode == 4 ? 4 : mode ? 1 : 0) << '\n';
-    out.close();
-    return !out.fail();
+    return TitleSettings::SaveFrameGeneration(local / "eden_settings.txt", mode);
 }
 inline bool SaveFrameGeneration(const std::filesystem::path& local, bool enabled) {
     return SaveFrameGenerationMode(local, enabled ? 2 : 0);

@@ -10,7 +10,8 @@ public:
     // No swapchain writes. Returns null on warmup, cut, fast input or session failure.
     ResourcePtr Generate(const ResourcePtr& current, double game_seconds) noexcept;
     // Configure once per real presentation; unknown refresh conservatively selects 2x.
-    unsigned Configure(IDXGISwapChain3* swapchain, unsigned requested);
+    unsigned Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked = false);
+    double RefreshHz() const;
     ResourcePtr Interpolate(float fraction) noexcept;
     // Native-resolution analysis shared by temporal upscaling; no warp dispatch.
     bool Analyze(const ResourcePtr& source) noexcept;

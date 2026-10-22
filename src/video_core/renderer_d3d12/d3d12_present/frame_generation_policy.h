@@ -10,14 +10,16 @@ namespace D3D12::Present {
 inline unsigned FrameGenerationMode(unsigned preference, const char* environment) {
     if (environment) {
         const std::string_view value(environment);
-        if (value == "0")
+        if (value == "auto" || value == "3")
+            return 3;
+        if (value == "0" || value == "off")
             return 0;
         if (value == "1" || value == "2")
             return 2;
         if (value == "4")
             return 4;
     }
-    return preference == 4 ? 4 : preference ? 2 : 0;
+    return preference == 3 ? 3 : preference == 4 ? 4 : preference ? 2 : 0;
 }
 inline unsigned DisplayFrameGenerationMode(unsigned requested, double refresh_hz) {
     return requested == 4 && (!std::isfinite(refresh_hz) || refresh_hz < 119.0) ? 2 : requested;
@@ -72,9 +74,11 @@ struct FrameGenerationCadence {
 };
 struct FrameGenerationPolicy {
     bool failed{};
+    bool locked{};
     bool CanGenerate(bool history, double game_seconds, double mean_difference) const {
-        return !failed && history && std::isfinite(game_seconds) && game_seconds > 1.0 / 55.0 &&
-               game_seconds < 0.2 && std::isfinite(mean_difference) && mean_difference < 0.22;
+        return !failed && history && std::isfinite(game_seconds) &&
+               game_seconds > (locked ? 1.0 / 121.0 : 1.0 / 55.0) && game_seconds < 0.2 &&
+               std::isfinite(mean_difference) && mean_difference < 0.22;
     }
     // Only the first failure emits a diagnostic; never retry during this session.
     bool Fail() {

@@ -98,8 +98,8 @@ int main(int argc, char** argv) {
 
     def test_ui_and_boot_wiring(self):
         ui = (ROOT / "src/eden_uwp/ui/library_screen.cpp").read_text()
-        self.assertIn("RendererSettings::ReadFsr(local_state_)", ui)
-        self.assertIn("RendererSettings::SaveFsr(local_state_, !fsr_)", ui)
+        self.assertIn("RendererSettings::ReadUpscaler(local_state_)", ui)
+        self.assertIn("RendererSettings::SaveUpscaler(local_state_, next)", ui)
         boot = (ROOT / "src/eden_uwp/mesa_window.cpp").read_text()
         self.assertLess(
             boot.index('_putenv_s("NXBOX_D3D12_FSR"'),
