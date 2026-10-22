@@ -270,6 +270,7 @@ public:
         });
         // The system wants the GPU memory trimmed when the app is suspended.
         const auto suspending_token = CoreApplication::Suspending([this](const auto&, const auto&) {
+            Diagnostic("UI suspending");
             ftp_.Stop();
             renderer_.Trim();
         });
