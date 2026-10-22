@@ -258,6 +258,14 @@ public:
         const int bit = KeyBit(static_cast<int>(key));
         if (bit < 0)
             return false;
+        // The Xbox raises these Gamepad* keys for every connected pad, and key_state drives
+        // player 1, so with a second pad its buttons also moved player 1. Pads are read
+        // directly per slot; key events only stand in for a remote when one pad (or none) is
+        // connected. Still handled, so B and Menu never become system navigation.
+        if (winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() > 1) {
+            key_state.store(0, std::memory_order_release);
+            return true;
+        }
         key_seen.store(true, std::memory_order_release);
         if (down)
             key_state.fetch_or(1u << bit, std::memory_order_acq_rel);

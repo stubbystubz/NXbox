@@ -111,6 +111,12 @@ class LocalMultiplayerTests(unittest.TestCase):
         self.assertIn("const bool primary = PlayerOneControls(slot)", pad)
         self.assertIn("primary ? key_state.load", pad)
         self.assertIn("primary ? ScriptedKeys() : 0u", pad)
+        # Gamepad* key events come from every pad; with two pads they must not reach player 1.
+        on_key = pad[pad.index("bool OnKey("):]
+        on_key = on_key[: on_key.index("\n    }\n")]
+        guard = on_key.index("Gamepads().Size() > 1")
+        self.assertLess(guard, on_key.index("key_state.fetch_or"))
+        self.assertIn("key_state.store(0", on_key[guard:])
         self.assertIn("suppress_guest && PlayerOneControls(slot)", pad)
         self.assertIn("hid.IsSupportedPlayer(slot,", pad)
         self.assertIn("if (!controller.IsControllerSupported())", pad)
