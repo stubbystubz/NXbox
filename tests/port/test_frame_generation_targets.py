@@ -57,11 +57,11 @@ int main() {
 int main(int, char** argv) {
     using namespace EdenXbox::TitleSettings;
     const std::filesystem::path local(argv[1]);
-    const auto title="0100000000010000";
-    assert(DefaultFrameGeneration(title)==3);
-    assert(DefaultFrameGeneration("0100152000022000")==2);
+    const auto title="0100152000022000";
+    assert(DefaultFrameGeneration(title)==2);
+    assert(DefaultFrameGeneration("0100000000010000")==0);
     assert(DefaultFrameGeneration("0100000000000000")==0);
-    assert(EffectiveFrameGeneration(local,title)==3);
+    assert(EffectiveFrameGeneration(local,title)==2);
     auto global=local/"eden_settings.txt", game=File(local,title);
     assert(SaveFrameGeneration(global,0));
     assert(EffectiveFrameGeneration(local,title)==0);
@@ -70,7 +70,7 @@ int main(int, char** argv) {
     assert(SaveFrameGeneration(game,std::nullopt));
     assert(EffectiveFrameGeneration(local,title)==0);
     assert(SaveFrameGeneration(global,std::nullopt));
-    assert(EffectiveFrameGeneration(local,title)==3);
+    assert(EffectiveFrameGeneration(local,title)==2);
     assert(SaveResolution(game,3));
     assert(SaveFrameGeneration(game,2));
     assert(SaveFrameGeneration(game,3));

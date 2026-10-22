@@ -128,10 +128,10 @@ struct FrameGenerationDefault {
     std::string_view title;
     unsigned mode;
 };
-// Series X, 60 Hz: Odyssey ~24 real fps, uneven 2x; MK8D 28-29 real,
-// 2x measured even 16.68 ms gaps. Auto reselects for the active output.
-inline constexpr std::array<FrameGenerationDefault, 2> kFrameGenerationDefaults{
-    {{"0100000000010000", 3}, {"0100152000022000", 2}}};
+// Series X, 60 Hz: MK8D 28-29 real, 2x measured even 16.68 ms gaps. Odyssey is off: auto
+// presented 22 fps against 26.6 without it and added multi-second hitches.
+inline constexpr std::array<FrameGenerationDefault, 1> kFrameGenerationDefaults{
+    {{"0100152000022000", 2}}};
 inline unsigned DefaultFrameGeneration(std::string_view title) {
     for (const auto& entry : kFrameGenerationDefaults)
         if (entry.title == title)
