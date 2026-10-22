@@ -471,7 +471,10 @@ void FrameProfile::BindRecordingThread(bool rebind) {
         counts.fill(0);
         transitions.clear();
         waits.clear();
-        frames = fence_wall = 0;
+        frames = fence_wall = output_presents = 0;
+        real_present_calls = generated_present_calls = 0;
+        frame_generation = {};
+        display_statistics = {};
     }
     if (enabled && !owner.load()) {
         initial_cpu = ProfileCpuTime();
@@ -595,7 +598,10 @@ void FrameProfile::EndFrame(bool presented) {
         }
         timing.cpu.fill(0);
         counts.fill(0);
-        frames = fence_wall = 0;
+        frames = fence_wall = output_presents = 0;
+        real_present_calls = generated_present_calls = 0;
+        frame_generation = {};
+        display_statistics = {};
     }
     BindRecordingThread();
     Switch(timing.active);
@@ -796,6 +802,29 @@ void FrameProfile::EndFrame(bool presented) {
             present_gaps.count, present_gaps.Percentile(50), present_gaps.Percentile(95),
             present_call_gaps.count, present_call_gaps.Percentile(50),
             present_call_gaps.Percentile(95));
+        line +=
+            fmt::format(" native_fps={:.2f} gated={}", native_fps, frame_generation_gated ? 1 : 0);
+        for (std::size_t event = 0; event < Present::FrameGenerationEvents::Names.size(); ++event)
+            line += fmt::format(" fg_{}={}", Present::FrameGenerationEvents::Names[event],
+                                frame_generation.counts[event]);
+        line += fmt::format(" fg_real_present_ms={:.3f} fg_generated_service_ms={:.3f}"
+                            " fg_fence_ms={:.3f} fg_late_ms={:.3f}"
+                            " fg_configure_ms={:.3f} fg_prepare_ms={:.3f}",
+                            frame_generation.real_present_ms, frame_generation.generated_service_ms,
+                            frame_generation.fence_ms, frame_generation.late_ms,
+                            frame_generation.configure_ms, frame_generation.prepare_ms);
+        line += fmt::format(" output_fps={:.2f} output_presents={}",
+                            static_cast<double>(output_presents) * 10000000.0 / elapsed,
+                            output_presents);
+        line += fmt::format(
+            " real_present_calls={} generated_present_calls={} displayed_fps={:.2f}"
+            " dxgi_present_delta={} dxgi_present_refresh_delta={} display_stats_valid={}"
+            " display_stats_samples={} display_stats_errors={}",
+            real_present_calls, generated_present_calls,
+            display_statistics.FramesPerSecond(static_cast<double>(elapsed) / 10000000.0),
+            display_statistics.presents, display_statistics.refreshes,
+            display_statistics.Valid() ? 1 : 0, display_statistics.samples,
+            display_statistics.errors);
         present_gaps.Clear();
         present_call_gaps.Clear();
         // Queue waits use the same exclusive clock, but must not rank as CPU work.
@@ -945,7 +974,10 @@ void FrameProfile::EndFrame(bool presented) {
     counts.fill(0);
     transitions.clear();
     waits.clear();
-    frames = fence_wall = 0;
+    frames = fence_wall = output_presents = 0;
+    real_present_calls = generated_present_calls = 0;
+    frame_generation = {};
+    display_statistics.ClearWindow();
     initial_cpu = ProfileCpuTime();
     start_wall = ProfileWallTime();
     timing.Reset(start_wall);

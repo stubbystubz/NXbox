@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -44,6 +45,12 @@ public:
 
     /// Finalize rendering the guest frame and draw into the presentation texture
     virtual void Composite(std::span<const Tegra::FramebufferConfig> layers) = 0;
+
+    // Optional idle presentation on the GPU owner, interrupted by queued real work.
+    virtual std::chrono::steady_clock::time_point PresentationDeadline() const {
+        return std::chrono::steady_clock::time_point::max();
+    }
+    virtual void PresentIdle() {}
 
     /// Get the tiled applet layer capture buffer
     virtual std::vector<u8> GetAppletCaptureBuffer() = 0;

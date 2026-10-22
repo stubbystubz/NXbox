@@ -30,6 +30,7 @@ class FrameGenerationTests(unittest.TestCase):
 #include <limits>
 #include "eden_uwp/renderer_settings.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 int main(int, char** argv) {
     using namespace EdenXbox::RendererSettings;
     using namespace D3D12::Present;
@@ -127,6 +128,7 @@ int main(int, char** argv) {
 #include <memory>
 #include <vector>
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 using u64 = std::uint64_t;
 struct Resource {
     struct Desc { unsigned Width = 8, Height = 8; };
@@ -159,6 +161,7 @@ struct Context {
     }
 };
 struct Generator {
+    using FrameGenerationEvent = D3D12::Present::FrameGenerationEvent;
     Context context;
     D3D12::Present::FrameGenerationPolicy policy;
     struct Slot {
@@ -174,6 +177,7 @@ struct Generator {
     double latest_difference{};
     unsigned width = 8, height = 8, bx = 1, by = 1, output_width = 8, output_height = 8;
     bool history{}, analyze_only{}, gpu_budget_missed{};
+    D3D12::Present::FrameGenerationEvent last_rejection{};
     struct Heap { explicit operator bool() const { return false; } void* Get() { return nullptr; } } timing_heap;
     unsigned mode{2};
     Slot* active_slot{};
@@ -206,6 +210,7 @@ int main() {
     auto source = std::make_shared<Resource>();
     Generator g;
     assert(!g.Generate(source, 1.0 / 30)); // Seed history.
+    assert(g.last_rejection == Generator::FrameGenerationEvent::History);
     g.context.tick = 2;
     g.context.sum = 4095; // Current pair is a cut, but no completed sample yet.
     assert(g.Generate(source, 1.0 / 30));
@@ -216,6 +221,7 @@ int main() {
     g.context.sum = 0;
     assert(!g.Generate(source, 1.0 / 30)); // Reject using the previous pair.
     assert(g.decision == 1 && g.tally.too_different == 1);
+    assert(g.last_rejection == Generator::FrameGenerationEvent::Difference);
     g.context.tick = 4;
     assert(!g.Generate(source, 1.0 / 30)); // Newer zero is still in flight.
     assert(g.decision == 1);
@@ -245,6 +251,7 @@ int main() {
     assert(!busy.AcquireSlot());
     assert((busy.context.checked == std::vector<u64>{7, 9, 8}));
     assert(!busy.Generate(source, 1.0 / 30));
+    assert(busy.last_rejection == Generator::FrameGenerationEvent::ResourcePressure);
     assert(!busy.history && busy.tally.no_history == 1 && busy.views == 0);
     busy.context.completed = 7;
     assert(busy.AcquireSlot() == &busy.slots[0]);
@@ -260,9 +267,14 @@ int main() {
         Generator fast;
         fast.history = true;
         assert(!fast.Generate(source, seconds));
+        assert(fast.last_rejection == Generator::FrameGenerationEvent::Timing);
         assert(fast.initialized == 0 && fast.views == 0 && fast.passes == 0);
         assert(!fast.history && fast.tally.slow_or_fast == 1);
     }
+    Generator budget;
+    budget.gpu_budget_missed = true;
+    assert(!budget.Generate(source, 1.0 / 30));
+    assert(budget.last_rejection == Generator::FrameGenerationEvent::GpuBudget);
     Generator downsample;
     downsample.real = std::make_shared<Resource>();
     assert(!downsample.Generate(source, 1.0 / 30));
@@ -304,11 +316,13 @@ int main() {
         end = source.index("        // Each swapchain buffer", start)
         source = source[:start] + source[end:]
         source = re.sub(
-            r"if \(frame_generation_mode == 3 && !frame_generation_failed &&\s*"
-            r"target_policy.current.output\)\s*return swapchain->Present\(target_interval, 0\);\s*",
+            r"if \(frame_generation_enabled && !frame_generation_failed &&\s*"
+            r"effective_frame_generation_mode\)\s*\{.*?return result;\s*\}\s*",
             "",
             source,
+            flags=re.DOTALL,
         )
+        source = source.replace("                    CountPresentCall(false);\n", "")
         source = source.replace(
             """[&] {
                     if (frame_pacing_enabled)
@@ -326,6 +340,22 @@ int main() {
         self.assertEqual(source.count(recorder), 1)
         source = source.replace(recorder, "")
         source = source.replace("        RecordPresentation();", "")
+        # New diagnostics contain no GPU commands; retain the original frozen hash.
+        for diagnostic in (
+            """        if (frame_generation_enabled && frame_generation_failed && !layers.empty())
+            CountGeneration(Present::FrameGenerationEvent::Failure);""",
+            "        const double real_present_started = PresentationTime();",
+            """        if (frame_generation_enabled && context.Profile().Enabled())
+            context.Profile().frame_generation.real_present_ms +=
+                (PresentationTime() - real_present_started) * 1000.0;""",
+        ):
+            self.assertEqual(source.count(diagnostic), 1)
+            source = source.replace(diagnostic, "")
+
+        source = source.replace(
+            "            context.Profile().display_statistics.Unavailable();", ""
+        )
+        source = source.replace("            have_statistics = false;", "")
         source = source.replace("UINT index =", "const UINT index =")
         # Normalize the independent output-size policy before freezing command order.
         source = source.replace(
@@ -364,15 +394,13 @@ int main() {
         self.assertNotIn("swapchain->Present(", source)
         self.assertNotIn("Copy(source,", source)
         presenter = PRESENT.read_text()
-        branch = function(presenter, "    void PresentGenerated(")
+        branch = function(presenter, "    bool PresentGenerated(")
         self.assertLess(
             branch.index("copy(buffers[index], generated)"),
             branch.index('"Present generated frame"'),
         )
-        self.assertLess(
-            branch.index('"Present generated frame"'),
-            branch.index("copy(buffers[index], frame_generator->Current())"),
-        )
+        self.assertNotIn("frame_generator->Current()", branch)
+        self.assertNotIn("WaitSubmitted", branch)
         self.assertIn(
             "context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET)", presenter
         )
@@ -384,10 +412,12 @@ int main() {
         boundary = function(source, "ResourcePtr FrameGenerator::Generate(")
         driver = r"""
 #include <cassert>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 namespace D3D12::Present {
 using ResourcePtr = std::shared_ptr<int>;
 int diagnostics = 0;
@@ -395,6 +425,8 @@ void Diagnostic(std::string_view) noexcept { ++diagnostics; }
 struct FrameGenerator {
     struct Impl {
         FrameGenerationPolicy policy;
+        FrameGenerationEvent last_rejection{};
+        float fraction{};
         int calls{}, failure{}, released{};
         void ReleaseResources() noexcept { ++released; }
         ResourcePtr Generate(const ResourcePtr&, double) {
@@ -407,7 +439,7 @@ struct FrameGenerator {
         }
     };
     std::unique_ptr<Impl> impl = std::make_unique<Impl>();
-    ResourcePtr Generate(const ResourcePtr&, double) noexcept;
+    ResourcePtr Generate(const ResourcePtr&, double, float fraction = 0.5f) noexcept;
 };
 // BOUNDARY
 }
@@ -429,7 +461,10 @@ int main() {
     }
     FrameGenerator success;
     auto real = std::make_shared<int>(42);
-    assert(*success.Generate(real, 1.0 / 30) == 99);
+    assert(*success.Generate(real, 1.0 / 30, 1.5f) == 99);
+    assert(success.impl->fraction == 1.5f);
+    assert(!success.Generate(real, 1.0 / 30, 2.01f));
+    assert(success.impl->last_rejection == FrameGenerationEvent::Failure);
     assert(*real == 42);
 }
 """
@@ -441,7 +476,7 @@ int main() {
             )
 
     def test_production_generated_present_order_and_slot_reuse(self):
-        body = function(PRESENT.read_text(), "    void PresentGenerated(")
+        body = function(PRESENT.read_text(), "    bool PresentGenerated(")
         driver = r"""
 #include <array>
 #include <cassert>
@@ -449,6 +484,9 @@ int main() {
 #include <string_view>
 #include <vector>
 using UINT = unsigned;
+constexpr unsigned DXGI_PRESENT_DO_NOT_WAIT = 1;
+constexpr int DXGI_ERROR_WAS_STILL_DRAWING = -1, DXGI_ERROR_INVALID_CALL = -2;
+void Diagnostic(const char*) {}
 using ResourcePtr = std::shared_ptr<struct Resource>;
 struct Resource {
     int pixel;
@@ -475,8 +513,13 @@ struct Swapchain {
     std::array<ResourcePtr, 2>* buffers;
     unsigned index{};
     std::vector<int> displayed;
+    unsigned expected_interval{1};
+    int response{};
+    unsigned calls{};
     int Present(unsigned sync, unsigned flags) {
-        assert(sync == 1 && flags == 0);
+        assert(sync == expected_interval && flags == DXGI_PRESENT_DO_NOT_WAIT);
+        ++calls;
+        if (response) return response;
         displayed.push_back((*buffers)[index]->pixel);
         index ^= 1;
         return 0;
@@ -497,10 +540,12 @@ struct Presenter {
     Recorder* recorder{};
     unsigned Rtv(unsigned index) { return index; }
     void RecordPresentation() {}
+    void CountPresentCall(bool generated) { assert(generated); }
     Context context;
     std::array<ResourcePtr, 2> buffers;
     std::array<unsigned, 2> present_ticks{7, 8};
     unsigned target_interval{1};
+    bool frame_generation_failed{};
     Swapchain* swapchain;
     Generator* frame_generator;
 // BODY
@@ -521,23 +566,44 @@ int main() {
     generated->handle.value = generated.get();
     RasterizerD3D12 rasterizer;
     UINT index = 0;
-    presenter.PresentGenerated(generated, rasterizer, index);
-    assert(index == 1);
-    assert(presenter.context.waited == 8);
+    assert(presenter.PresentGenerated(generated, rasterizer, index));
+    assert(index == 0); // Synthetic never touches the next real backbuffer.
+    assert(presenter.context.waited == 0);
     assert(presenter.present_ticks[0] == 1);
     assert(presenter.context.acknowledged == 1 && rasterizer.notifications == 1);
     assert(Common::FpsOverlay::displayed == 1);
     assert((recorder.captures == std::vector<int>{15}));
-    assert(presenter.buffers[1]->pixel == 20);
-    swapchain.Present(1, 0);
+    assert(presenter.buffers[1]->pixel == 0); // No redundant restore copy.
+    presenter.buffers[1]->pixel = 20; // Next real Draw clears/composites this buffer.
+    swapchain.Present(1, DXGI_PRESENT_DO_NOT_WAIT);
     assert((swapchain.displayed == std::vector<int>{15, 20}));
+    // A 120 Hz display uses interval 2 for a distinct synthetic submission too.
+    presenter.target_interval = swapchain.expected_interval = 2;
+    index = swapchain.GetCurrentBackBufferIndex();
+    generated->pixel = 35;
+    presenter.PresentGenerated(generated, rasterizer, index);
+    assert((swapchain.displayed == std::vector<int>{15, 20, 35}));
+    assert(Common::FpsOverlay::displayed == 2);
+    for (int response : {DXGI_ERROR_WAS_STILL_DRAWING, DXGI_ERROR_INVALID_CALL}) {
+        swapchain.response = response;
+        const unsigned before = swapchain.calls;
+        const auto shown = swapchain.displayed;
+        const unsigned next_buffer = swapchain.GetCurrentBackBufferIndex();
+        index = next_buffer;
+        assert(!presenter.PresentGenerated(generated, rasterizer, index));
+        assert(swapchain.calls == before + 1); // Never a blocking retry.
+        assert(swapchain.displayed == shown && index == next_buffer);
+        assert(Common::FpsOverlay::displayed == 2); // Failed attempt is not output.
+        assert(presenter.context.waited == 0);
+        assert(presenter.frame_generation_failed == (response == DXGI_ERROR_INVALID_CALL));
+    }
 }
 """
         with tempfile.TemporaryDirectory() as directory:
             compile_run(
                 driver.replace("// BODY", body),
                 Path(directory),
-                extra_flags=["-Wall", "-Wextra", "-Werror"],
+                extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
             )
 
     def test_shader_embedding_and_settings_wiring(self):

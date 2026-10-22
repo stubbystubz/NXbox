@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fmt/format.h>
 #include "d3d12_present_shader_source.h"
+#include "video_core/renderer_d3d12/d3d12_present/display_refresh.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
@@ -32,8 +34,11 @@ struct FrameGenerator::Impl {
     unsigned mode{2};
     float fraction{0.5f};
     double refresh_hz{};
-    DXGI_FRAME_STATISTICS refresh_sample{};
-    bool have_refresh_sample{}, logged_refresh{};
+    bool queried_refresh{};
+    double specified_refresh_hz{};
+    std::chrono::steady_clock::time_point next_refresh_poll{};
+    DisplayRefreshEstimate refresh_estimate;
+    bool logged_refresh{};
     u64 sample_id{}, completed_sample{};
     double latest_difference{};
     std::array<ComPtr<ID3D12PipelineState>, 4> pipelines;
@@ -41,6 +46,7 @@ struct FrameGenerator::Impl {
     unsigned width{}, height{}, bx{}, by{};
     unsigned output_width{}, output_height{}, source_width{}, source_height{};
     bool history{}, analyze_only{};
+    FrameGenerationEvent last_rejection{FrameGenerationEvent::Failure};
     DXGI_FORMAT history_format{DXGI_FORMAT_R8G8B8A8_UNORM};
     // Why frames were or were not generated, logged every 300 real frames.
     struct Tally {
@@ -325,6 +331,7 @@ struct FrameGenerator::Impl {
     ResourcePtr Generate(const ResourcePtr& source, double seconds) {
         if (seconds > 0 && !policy.CanGenerate(true, seconds, 0)) {
             ResetHistory();
+            last_rejection = FrameGenerationEvent::Timing;
             Count(&Tally::slow_or_fast);
             return {}; // Fast games do not copy history or wait for GPU completion.
         }
@@ -338,12 +345,14 @@ struct FrameGenerator::Impl {
         }
         ReadDifferences();
         if (gpu_budget_missed) {
+            last_rejection = FrameGenerationEvent::GpuBudget;
             ResetHistory();
             Count(&Tally::slow_or_fast);
             return {};
         }
         auto* available = AcquireSlot();
         if (!available) {
+            last_rejection = FrameGenerationEvent::ResourcePressure;
             ResetHistory();
             Count(&Tally::no_history);
             return {}; // Backpressure skips the effect, never waits for a descriptor heap.
@@ -369,6 +378,8 @@ struct FrameGenerator::Impl {
         const bool had_history = history;
         history = true;
         if (!policy.CanGenerate(had_history, seconds, 0)) {
+            last_rejection =
+                had_history ? FrameGenerationEvent::Timing : FrameGenerationEvent::History;
             Count(had_history ? &Tally::slow_or_fast : &Tally::no_history);
             return {};
         }
@@ -391,6 +402,7 @@ struct FrameGenerator::Impl {
         slot.cells = bx * by;
         slot.pending = true;
         if (!policy.CanGenerate(true, seconds, difference)) {
+            last_rejection = FrameGenerationEvent::Difference;
             Count(&Tally::too_different, difference);
             return {};
         }
@@ -421,7 +433,12 @@ struct FrameGenerator::Impl {
 };
 FrameGenerator::FrameGenerator(Context& context) : impl{std::make_unique<Impl>(context)} {}
 FrameGenerator::~FrameGenerator() = default;
-ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds) noexcept {
+ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds,
+                                     float fraction) noexcept {
+    impl->last_rejection = FrameGenerationEvent::Failure;
+    if (!std::isfinite(fraction) || fraction <= 0 || fraction > 2)
+        return {};
+    impl->fraction = fraction;
     if (impl->policy.failed)
         return {};
     try {
@@ -439,6 +456,9 @@ ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds) 
     // Root, heaps and PSOs stay alive until renderer teardown drains the queue.
     impl->ReleaseResources();
     return {};
+}
+FrameGenerationEvent FrameGenerator::LastRejection() const {
+    return impl->last_rejection;
 }
 bool FrameGenerator::Analyze(const ResourcePtr& source) noexcept {
     impl->analyze_only = true;
@@ -461,34 +481,43 @@ double FrameGenerator::RefreshHz() const {
     return impl->refresh_hz;
 }
 unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked) {
-    DXGI_SWAP_CHAIN_DESC desc{};
-    const bool specified_refresh = SUCCEEDED(swapchain->GetDesc(&desc)) &&
-                                   desc.BufferDesc.RefreshRate.Denominator &&
-                                   desc.BufferDesc.RefreshRate.Numerator;
-    if (specified_refresh)
-        impl->refresh_hz =
-            double(desc.BufferDesc.RefreshRate.Numerator) / desc.BufferDesc.RefreshRate.Denominator;
-    // Flip-model composition often reports 0/0 in GetDesc. Refresh counters measure
-    // the actual containing output rather than selecting a merely supported mode.
-    DXGI_FRAME_STATISTICS sample{};
-    if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
-        LARGE_INTEGER frequency{};
-        QueryPerformanceFrequency(&frequency);
-        const auto ticks = sample.SyncQPCTime.QuadPart - impl->refresh_sample.SyncQPCTime.QuadPart;
-        if (impl->have_refresh_sample && ticks > 0 && frequency.QuadPart > 0 &&
-            sample.SyncRefreshCount > impl->refresh_sample.SyncRefreshCount) {
-            const double hz =
-                double(sample.SyncRefreshCount - impl->refresh_sample.SyncRefreshCount) *
-                frequency.QuadPart / ticks;
-            if (hz >= 23 && hz <= 250)
-                impl->refresh_hz = hz;
-        }
-        impl->refresh_sample = sample;
-        impl->have_refresh_sample = true;
-    } else {
-        impl->have_refresh_sample = false;
-        if (!specified_refresh)
+    // The swapchain mode is fixed for this presenter (ResizeBuffers only changes
+    // extent). Querying its descriptor on every guest present can synchronize
+    // with DXGI even when generation is gated off.
+    if (!impl->queried_refresh) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (SUCCEEDED(swapchain->GetDesc(&desc)) && desc.BufferDesc.RefreshRate.Denominator &&
+            desc.BufferDesc.RefreshRate.Numerator)
+            impl->specified_refresh_hz = double(desc.BufferDesc.RefreshRate.Numerator) /
+                                         desc.BufferDesc.RefreshRate.Denominator;
+        impl->queried_refresh = true;
+    }
+    // A specified output mode is authoritative. For flip-model 0/0, use a
+    // sustained counter window rather than a quotient between adjacent frames.
+    const auto now = std::chrono::steady_clock::now();
+    if (impl->specified_refresh_hz > 0) {
+        impl->refresh_hz = impl->specified_refresh_hz;
+        impl->refresh_estimate.Reset();
+    } else if (now >= impl->next_refresh_poll) {
+        // The estimator already requires two-second windows. Four polls per
+        // second retain counter-window accuracy without a DXGI query per frame.
+        impl->next_refresh_poll = now + std::chrono::milliseconds{250};
+        DXGI_FRAME_STATISTICS sample{};
+        if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            if (frequency.QuadPart > 0) {
+                impl->refresh_estimate.Observe(sample.SyncRefreshCount,
+                                               static_cast<double>(sample.SyncQPCTime.QuadPart) /
+                                                   static_cast<double>(frequency.QuadPart));
+            } else {
+                impl->refresh_estimate.Reset();
+            }
+            impl->refresh_hz = impl->refresh_estimate.Hertz();
+        } else {
+            impl->refresh_estimate.Reset();
             impl->refresh_hz = 0;
+        }
     }
     const unsigned mode =
         locked ? requested : DisplayFrameGenerationMode(requested, impl->refresh_hz);
@@ -504,12 +533,12 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
     }
     impl->policy.locked = locked;
     impl->mode = mode;
-    impl->fraction = mode > 1 ? 1.f / mode : .5f;
+    impl->fraction = mode > 1 ? 1.f / static_cast<float>(mode) : .5f;
     return mode;
 }
 ResourcePtr FrameGenerator::Interpolate(float fraction) noexcept {
     if (!impl->active_slot || impl->policy.failed || !std::isfinite(fraction) || fraction <= 0 ||
-        fraction >= 1 || impl->active_slot->query_pairs >= 4)
+        fraction > 2 || impl->active_slot->query_pairs >= 4)
         return {};
     try {
         impl->fraction = fraction;

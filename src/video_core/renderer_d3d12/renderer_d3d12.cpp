@@ -17,6 +17,7 @@
 #include "common/fps_overlay.h"
 #include "common/logging.h"
 #include "common/maxwell_method_profile.h"
+#include "common/scope_exit.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
 #include "eden_uwp/renderer_boundary.h"
@@ -24,8 +25,8 @@
 #include "video_core/capture.h"
 #include "video_core/renderer_d3d12/d3d12_output_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
-#include "video_core/renderer_d3d12/d3d12_present/frame_generation_target.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
 #include "video_core/renderer_d3d12/d3d12_present/present.h"
 #include "video_core/renderer_d3d12/d3d12_present/present_policy.h"
@@ -82,14 +83,17 @@ struct RendererD3D12::Impl {
     DXGI_FRAME_STATISTICS previous_statistics{};
     bool have_statistics{};
     bool frame_generation_enabled{};
-    unsigned frame_generation_mode{}, effective_frame_generation_mode{2};
+    unsigned frame_generation_mode{}, effective_frame_generation_mode{};
     bool frame_generation_failed{};
-    Present::FrameGenerationCadence frame_generation_cadence;
-    Present::FrameGenerationTargetPolicy target_policy;
+    Present::NativeFrameGenerationGate native_frame_gate;
+    Present::FrameGenerationVblankSchedule vblank_schedule;
+    ResourcePtr pending_generated;
+    std::atomic<double> idle_deadline{};
+    std::atomic<bool> real_ready{};
+    double output_hz{60};
+    bool logged_native_gate{};
+    unsigned logged_native_mode{};
     unsigned target_interval{1};
-    double previous_generation_wait{};
-    bool logged_40hz{};
-    std::chrono::steady_clock::time_point previous_game_frame{};
     ComPtr<ID3D12DescriptorHeap> rtv_heap;
     ComPtr<ID3D12DescriptorHeap> srv_heap;
     ComPtr<ID3D12RootSignature> root;
@@ -509,6 +513,8 @@ struct RendererD3D12::Impl {
             pacing_interval =
                 frame_pacing.Observe(seconds, frame_generation_enabled || layers.empty());
         }
+        if (!layers.empty())
+            ObserveNativeFrame();
         // Each swapchain buffer owns a descriptor slice; wait only when reusing it.
         context.Collect();
         const auto size = OutputSize(layout.width, layout.height);
@@ -517,6 +523,8 @@ struct RendererD3D12::Impl {
         if (width != new_width || height != new_height) {
             context.Finish(FrameCount::ForcedSubmitLifecycle);
             present_ticks.fill(0);
+            context.Profile().display_statistics.Unavailable();
+            have_statistics = false;
             for (auto& buffer : buffers)
                 buffer.reset();
             Check(swapchain->ResizeBuffers(active_buffers, new_width, new_height,
@@ -540,13 +548,11 @@ struct RendererD3D12::Impl {
         output_layout.width = width;
         output_layout.height = height;
         Draw(output_layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
+        if (frame_generation_enabled && frame_generation_failed && !layers.empty())
+            CountGeneration(Present::FrameGenerationEvent::Failure);
         if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {
-            const auto now = std::chrono::steady_clock::now();
-            const double seconds =
-                previous_game_frame.time_since_epoch().count() == 0
-                    ? 0.0
-                    : std::chrono::duration<double>(now - previous_game_frame).count();
-            previous_game_frame = now;
+            const double preparation_started = PresentationTime();
+            DropGenerated(Present::FrameGenerationEvent::CancelReal);
             ResourcePtr generated;
             try {
                 if (!frame_generator)
@@ -557,66 +563,68 @@ struct RendererD3D12::Impl {
                     source_width = std::max(source_width, rotated ? layer.height : layer.width);
                     source_height = std::max(source_height, rotated ? layer.width : layer.height);
                 }
-                const bool automatic = frame_generation_mode == 3;
-                effective_frame_generation_mode = frame_generator->Configure(
-                    swapchain.Get(),
-                    automatic ? target_policy.current.multiplier : frame_generation_mode,
-                    automatic);
-                target_interval = 1;
-                if (automatic) {
-                    const double producer = seconds - previous_generation_wait;
-                    const double refresh = frame_generator->RefreshHz();
-                    if (!logged_40hz && refresh >= 59 && refresh <= 61 && producer > 1.0 / 28 &&
-                        producer < 1.0 / 20) {
-                        Diagnostic("D3D12_FRAME_GEN 40 FG requires 120 Hz output; choose 30 FG 2x "
-                                   "over 60 FG 4x: same 15 real fps, fewer synthetic frames");
-                        logged_40hz = true;
-                    }
-                    if (target_policy.Observe(producer, refresh, seconds)) {
-                        frame_generator->Reset();
-                        frame_generator->Configure(swapchain.Get(),
-                                                   target_policy.current.multiplier, true);
-                        Diagnostic(
-                            fmt::format("D3D12_FRAME_GEN lock={} multiplier={} refresh_hz={:.2f}",
-                                        target_policy.current.output,
-                                        target_policy.current.multiplier, refresh));
-                    }
-                    const auto target = target_policy.current;
-                    Common::FpsOverlay::frame_generation_target.store(target.output);
-                    effective_frame_generation_mode = target.multiplier;
-                    target_interval = target.interval ? target.interval : 1;
+                // Every preference (including legacy 4x/auto and env overrides) shares
+                // the native floor and the same 60 fps ceiling.
+                const double configure_started = PresentationTime();
+                frame_generator->Configure(swapchain.Get(), 2, true);
+                if (context.Profile().Enabled())
+                    context.Profile().frame_generation.configure_ms +=
+                        (PresentationTime() - configure_started) * 1000.0;
+                const double refresh = frame_generator->RefreshHz();
+                effective_frame_generation_mode = native_frame_gate.Multiplier(refresh);
+                target_interval = native_frame_gate.Interval(refresh);
+                if (!target_interval)
+                    target_interval = 1;
+                output_hz = refresh / target_interval;
+                const bool gated = effective_frame_generation_mode == 0;
+                context.Profile().frame_generation_gated = gated;
+                Common::FpsOverlay::frame_generation_target.store(gated ? 0u : 60u);
+                if (!logged_native_gate || logged_native_mode != effective_frame_generation_mode) {
+                    Diagnostic(
+                        fmt::format("D3D12_FRAME_GEN native_fps={:.2f} gated={} mode={}x target=60 "
+                                    "refresh_hz={:.2f} interval={}",
+                                    native_frame_gate.NativeFps(), gated ? 1 : 0,
+                                    effective_frame_generation_mode, refresh, target_interval));
+                    logged_native_gate = true;
+                    logged_native_mode = effective_frame_generation_mode;
+                    frame_generator->Reset();
                 }
                 frame_generator->UseMotion(layers.size() == 1 && upscaler ? upscaler->Motion()
                                                                           : ResourcePtr{});
                 frame_generator->SetSourceExtent(source_width, source_height);
-                if (automatic && (!std::isfinite(seconds) || seconds >= 0.2)) {
+                if (gated) {
+                    CountGeneration(Present::FrameGenerationEvent::Gated);
+                    CountGeneration(!native_frame_gate.Interval(refresh)
+                                        ? Present::FrameGenerationEvent::GateRefresh
+                                    : native_frame_gate.NativeFps() >= 50
+                                        ? Present::FrameGenerationEvent::GateFast
+                                        : Present::FrameGenerationEvent::GateFloor);
                     frame_generator->Reset();
-                } else if (!automatic || target_policy.current.output) {
+                } else {
+                    // Record the forward warp before submitting the real endpoint,
+                    // ahead of all commands belonging to the next guest frame.
+                    const float fraction =
+                        1.0f + static_cast<float>(native_frame_gate.NativeFps() / output_hz);
                     generated = frame_generator->Generate(
-                        buffers[index], automatic ? double(target_policy.current.multiplier) /
-                                                        target_policy.current.output
-                                                  : frame_generation_cadence.Observe(seconds));
+                        buffers[index], 1.0 / native_frame_gate.NativeFps(), fraction);
+                    CountGeneration(generated ? Present::FrameGenerationEvent::Candidate
+                                              : frame_generator->LastRejection());
                 }
             } catch (const std::exception&) {
                 frame_generation_failed = true;
+                CountGeneration(Present::FrameGenerationEvent::Failure);
                 Diagnostic("D3D12 frame generation disabled for session: initialization failed");
             } catch (...) {
                 frame_generation_failed = true;
+                CountGeneration(Present::FrameGenerationEvent::Failure);
                 Diagnostic(
                     "D3D12 frame generation disabled for session: unknown initialization failure");
             }
-            frame_generation_cadence.Completed(bool(generated));
-            if (generated) {
-                const Present::GeneratedFrameSchedule schedule{effective_frame_generation_mode};
-                for (unsigned i = 0; i < schedule.Count(); ++i) {
-                    const auto frame = i == 0 ? generated :
-                        frame_generator->Interpolate(schedule.Fraction(i));
-                    if (!frame)
-                        break; // The last generated present already restored the real image.
-                    PresentGenerated(frame, rasterizer, index);
-                }
-            }
+            pending_generated = std::move(generated);
             context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (context.Profile().Enabled())
+                context.Profile().frame_generation.prepare_ms +=
+                    (PresentationTime() - preparation_started) * 1000.0;
         }
         // Only the display target receives host diagnostics; Capture() never reaches this path.
         if (!layers.empty()) {
@@ -643,42 +651,125 @@ struct RendererD3D12::Impl {
         if (log_present)
             Diagnostic("D3D12 Present begin");
         HRESULT status;
+        const double real_present_started = PresentationTime();
         {
             const EdenXbox::ThreadProfile::Scope present_scope{
                 EdenXbox::ThreadProfile::Wait::Present};
             status = Common::MaxwellMethodProfile::Measure(
                 Common::MaxwellMethodProfile::PresentSwapchain, [&] {
-                    if (frame_generation_mode == 3 && !frame_generation_failed &&
-                        target_policy.current.output)
-                        return swapchain->Present(target_interval, 0);
+                    if (frame_generation_enabled && !frame_generation_failed &&
+                        effective_frame_generation_mode) {
+                        // Positive-interval DXGI presents already serialize vblanks.
+                        // Sleeping another period here double-paces the producer.
+                        const double submitted_at = PresentationTime();
+                        CountPresentCall(false);
+                        const auto result = swapchain->Present(target_interval, 0);
+                        vblank_schedule.Presented(submitted_at, output_hz, true,
+                                                  bool(pending_generated));
+                        idle_deadline.store(vblank_schedule.Deadline());
+                        return result;
+                    }
                     if (frame_pacing_enabled)
                         return PresentPaced(pacing_interval);
+                    CountPresentCall(false);
                     return swapchain->Present(1, 0);
                 });
         }
+        if (frame_generation_enabled && context.Profile().Enabled())
+            context.Profile().frame_generation.real_present_ms +=
+                (PresentationTime() - real_present_started) * 1000.0;
         context.LogInfoQueue();
         Check(status, "Present", context.Device());
         RecordPresentation();
         if (frame_generation_enabled)
             Common::FpsOverlay::Presented();
         if (frame_generation_enabled) {
-            if (frame_generation_failed)
+            if (frame_generation_failed) {
                 Common::FpsOverlay::frame_generation_target.store(0);
-            if (frame_generation_mode == 3 && previous_game_frame.time_since_epoch().count())
-                previous_generation_wait =
-                    std::chrono::duration<double>(std::chrono::steady_clock::now() -
-                                                  previous_game_frame)
-                        .count();
+                context.Profile().frame_generation_gated = true;
+            }
         }
         Check(context.Device()->GetDeviceRemovedReason(), "after Present", context.Device());
         if (log_present)
             Diagnostic("D3D12 Present complete");
+    }
+    static double PresentationTime() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+    void CountGeneration(Present::FrameGenerationEvent event) {
+        if (context.Profile().Enabled())
+            context.Profile().frame_generation.Count(event);
+    }
+    void DropGenerated(Present::FrameGenerationEvent reason) {
+        if (pending_generated)
+            CountGeneration(reason);
+        pending_generated.reset();
+        vblank_schedule.RealReady();
+        idle_deadline.store(0);
+    }
+    void PresentIdle(RasterizerD3D12& rasterizer) {
+        if (!pending_generated || !effective_frame_generation_mode || frame_generation_failed)
+            return;
+        if (real_ready.load()) {
+            DropGenerated(Present::FrameGenerationEvent::CancelReady);
+            return;
+        }
+        if (!vblank_schedule.Generate(PresentationTime(), real_ready.load()))
+            return;
+        const double late = std::max(0.0, PresentationTime() - vblank_schedule.Deadline());
+        if (late >= 1.0 / output_hz)
+            CountGeneration(Present::FrameGenerationEvent::DeadlineMiss);
+        const double wait_started = PresentationTime();
+        UINT index = swapchain->GetCurrentBackBufferIndex();
+        // Optional output must never wait for a buffer needed by the real producer.
+        if (!context.IsFree(present_ticks[index])) {
+            DropGenerated(Present::FrameGenerationEvent::CancelBackpressure);
+            return;
+        }
+        if (context.Profile().Enabled()) {
+            context.Profile().frame_generation.fence_ms +=
+                (PresentationTime() - wait_started) * 1000.0;
+            context.Profile().frame_generation.late_ms += late * 1000.0;
+        }
+        if (real_ready.load()) {
+            DropGenerated(Present::FrameGenerationEvent::CancelFence);
+            return;
+        }
+        const double submitted_at = PresentationTime();
+        bool presented = false;
+        try {
+            presented = PresentGenerated(pending_generated, rasterizer, index);
+        } catch (...) {
+            DropGenerated(Present::FrameGenerationEvent::Failure);
+            throw;
+        }
+        if (context.Profile().Enabled())
+            context.Profile().frame_generation.generated_service_ms +=
+                (PresentationTime() - submitted_at) * 1000.0;
+        if (!presented) {
+            DropGenerated(frame_generation_failed
+                              ? Present::FrameGenerationEvent::Failure
+                              : Present::FrameGenerationEvent::CancelBackpressure);
+            return;
+        }
+        CountGeneration(Present::FrameGenerationEvent::Submitted);
+        vblank_schedule.Presented(submitted_at, output_hz, false);
+        pending_generated.reset();
+        idle_deadline.store(0);
+    }
+    void ObserveNativeFrame() {
+        const double timestamp = PresentationTime();
+        native_frame_gate.ObservePresent(timestamp);
+        auto& profile = context.Profile();
+        profile.native_fps = native_frame_gate.NativeFps();
     }
     HRESULT PresentPaced(unsigned interval) {
         bool accepted_pacing = false;
         const auto result = Present::SubmitPaced(
             interval,
             [&](unsigned sync, bool nonblocking) {
+                CountPresentCall(false);
                 const auto status =
                     swapchain->Present(sync, nonblocking ? DXGI_PRESENT_DO_NOT_WAIT : 0);
                 accepted_pacing = nonblocking && status == S_OK;
@@ -688,10 +779,20 @@ struct RendererD3D12::Impl {
         frame_pacing.Completed(accepted_pacing);
         return result;
     }
+    void CountPresentCall(bool generated) {
+        auto& profile = context.Profile();
+        if (profile.Enabled()) {
+            if (generated)
+                ++profile.generated_present_calls;
+            else
+                ++profile.real_present_calls;
+        }
+    }
     void RecordPresentation() {
         auto& profile = context.Profile();
         if (!profile.Enabled())
             return;
+        ++profile.output_presents;
         // CPU return times are deliberately separate from observed display times.
         const auto now = std::chrono::steady_clock::now();
         if (previous_present_return.time_since_epoch().count())
@@ -700,9 +801,11 @@ struct RendererD3D12::Impl {
         previous_present_return = now;
         DXGI_FRAME_STATISTICS stats{};
         if (swapchain->GetFrameStatistics(&stats) != S_OK) {
+            profile.display_statistics.Unavailable();
             have_statistics = false; // Unsupported/occluded/disjoint: no invented display sample.
             return;
         }
+        profile.display_statistics.Observe(stats.PresentCount, stats.PresentRefreshCount);
         if (have_statistics && stats.PresentCount == previous_statistics.PresentCount)
             return;
         if (have_statistics && stats.PresentCount == previous_statistics.PresentCount + 1 &&
@@ -721,8 +824,7 @@ struct RendererD3D12::Impl {
         previous_statistics = stats;
         have_statistics = true;
     }
-    void PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
-        // The complete real image is safe in Current(), before touching the swapchain.
+    bool PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
         const auto copy = [&](const ResourcePtr& destination, const ResourcePtr& source) {
             context.Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
             context.Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -737,12 +839,26 @@ struct RendererD3D12::Impl {
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
-        Check(swapchain->Present(target_interval, 0), "Present generated frame", context.Device());
+        CountPresentCall(true);
+        // Keep the positive interval for scanout cadence, but never block the
+        // guest producer on an optional DXGI queue slot. Do not retry with a
+        // blocking Present when this platform rejects DO_NOT_WAIT.
+        const auto status = swapchain->Present(target_interval, DXGI_PRESENT_DO_NOT_WAIT);
+        if (status == DXGI_ERROR_WAS_STILL_DRAWING)
+            return false;
+        if (status == DXGI_ERROR_INVALID_CALL) {
+            frame_generation_failed = true;
+            Diagnostic(
+                "D3D12 frame generation disabled for session: nonblocking Present unsupported");
+            return false;
+        }
+        Check(status, "Present generated frame", context.Device());
         Common::FpsOverlay::Presented();
         RecordPresentation();
-        index = swapchain->GetCurrentBackBufferIndex();
-        context.WaitSubmitted(present_ticks[index], "frame generation real frame");
-        copy(buffers[index], frame_generator->Current());
+        // The next real Draw clears and composites its own buffer. Restoring the
+        // previous endpoint here adds a fence round trip and a full output copy
+        // that is overwritten before anyone can display it.
+        return true;
     }
 };
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& window,
@@ -777,9 +893,29 @@ bool RendererD3D12::ReportFailure(const std::exception& error) noexcept {
 bool RendererD3D12::HasFailed() const {
     return impl->failed;
 }
+std::chrono::steady_clock::time_point RendererD3D12::PresentationDeadline() const {
+    const double deadline = impl->idle_deadline.load();
+    if (!deadline || impl->real_ready.load() || HasFailed())
+        return std::chrono::steady_clock::time_point::max();
+    return std::chrono::steady_clock::time_point{
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>{deadline})};
+}
+void RendererD3D12::PresentIdle() {
+    if (!render_window.IsShown() || HasFailed()) {
+        rasterizer.RunGpuPipeline(
+            [&] { impl->DropGenerated(Present::FrameGenerationEvent::CancelHidden); });
+        return;
+    }
+    rasterizer.RunGpuPipeline([&] { impl->PresentIdle(rasterizer); });
+}
 void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> layers) {
+    impl->real_ready.store(true);
     if (rasterizer.OnGpuPipeline())
         return rasterizer.RunGpuPipeline([&] { Composite(layers); });
+    SCOPE_EXIT {
+        impl->real_ready.store(false);
+    };
     const Common::MaxwellMethodProfile::NamedScope composite_profile{
         Common::MaxwellMethodProfile::CompositeRest};
     impl->context.Profile().EndFrame();
