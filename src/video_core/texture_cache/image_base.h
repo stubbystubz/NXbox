@@ -93,6 +93,8 @@ struct ImageBase {
     u32 guest_size_bytes = 0;
     u32 unswizzled_size_bytes = 0;
     u32 converted_size_bytes = 0;
+    // Latched before scheduling uploads; workers must use the same storage layout.
+    bool astc_uncompressed = false;
     u32 scale_rating = 0;
     u64 scale_tick = 0;
     bool has_scaled = false;

@@ -604,13 +604,14 @@ u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept {
     return NumBlocksPerLayer(info, tile_size) * info.resources.layers * BytesPerBlock(info.format);
 }
 
-u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
+u32 CalculateConvertedSizeBytes(const ImageInfo& info, bool astc_uncompressed) noexcept {
     if (info.type == ImageType::Buffer) {
         return info.size.width * BytesPerBlock(info.format);
     }
     static constexpr Extent2D TILE_SIZE{1, 1};
-    if (IsPixelFormatASTC(info.format) && Settings::values.astc_recompression.GetValue() !=
-                                              Settings::AstcRecompression::Uncompressed) {
+    if (!astc_uncompressed && IsPixelFormatASTC(info.format) &&
+        Settings::values.astc_recompression.GetValue() !=
+            Settings::AstcRecompression::Uncompressed) {
         const u32 bpp_div =
             Settings::values.astc_recompression.GetValue() == Settings::AstcRecompression::Bc1 ? 2
                                                                                                : 1;
@@ -620,7 +621,7 @@ u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
             const auto mip_size = AdjustMipSize(info.size, i);
             const u32 plane_dim =
                 Common::AlignUp(mip_size.width, 4U) * Common::AlignUp(mip_size.height, 4U);
-            output_size += (plane_dim * info.size.depth * info.resources.layers) / bpp_div;
+            output_size += (plane_dim * mip_size.depth * info.resources.layers) / bpp_div;
         }
         return output_size;
     }
@@ -924,7 +925,7 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
 }
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
-                  std::span<BufferImageCopy> copies) {
+                  std::span<BufferImageCopy> copies, bool astc_uncompressed) {
     NxboxStall::Scope stall_scope{NxboxStall::Kind::Convert};
     u32 output_offset = 0;
     Common::ScratchBuffer<u8> decode_scratch;
@@ -942,7 +943,9 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
         const auto input_offset = input.subspan(copy.buffer_offset);
         copy.buffer_offset = output_offset;
 
-        const auto recompression_setting = Settings::values.astc_recompression.GetValue();
+        const auto recompression_setting = astc_uncompressed
+                                               ? Settings::AstcRecompression::Uncompressed
+                                               : Settings::values.astc_recompression.GetValue();
         const bool astc = IsPixelFormatASTC(info.format);
 
         if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
@@ -952,7 +955,7 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 tile_size.height, output.subspan(output_offset));
 
             output_offset += copy.image_extent.width * copy.image_extent.height *
-                             copy.image_subresource.num_layers *
+                             copy.image_subresource.num_layers * copy.image_extent.depth *
                              BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
         } else if (astc) {
             // BC1 uses 0.5 bytes per texel

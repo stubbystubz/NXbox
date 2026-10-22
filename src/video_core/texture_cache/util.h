@@ -51,7 +51,8 @@ struct OverlapResult {
 
 [[nodiscard]] u32 CalculateUnswizzledSizeBytes(const ImageInfo& info) noexcept;
 
-[[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept;
+[[nodiscard]] u32 CalculateConvertedSizeBytes(const ImageInfo& info,
+                                              bool astc_uncompressed = false) noexcept;
 
 [[nodiscard]] u32 CalculateLayerStride(const ImageInfo& info) noexcept;
 
@@ -87,7 +88,7 @@ struct OverlapResult {
     std::span<const u8> input, std::span<u8> output);
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
-                  std::span<BufferImageCopy> copies);
+                  std::span<BufferImageCopy> copies, bool astc_uncompressed = false);
 
 [[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(
     const ImageInfo& info);
