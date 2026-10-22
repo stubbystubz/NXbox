@@ -379,6 +379,7 @@ void Diagnostic(const std::string&) {}
 using DescriptorKey=int;
 using CachedDescriptor=int;
 using DescriptorKeyHash=std::hash<int>;
+template <class Key, class Handle, std::size_t Capacity = 64> struct DescriptorLookupCache {};
 struct D3D12DescriptorAllocator {
 """
             + ring
