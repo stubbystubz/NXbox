@@ -93,13 +93,13 @@ public:
                 player.buttons[i] = parameters.Serialize();
             }
             // Both motion mappings use this player's sensor, including styles selected by
-            // AutoStyle. Keep HID's standard gyro deadband so its automatic bias estimate cannot
-            // drift at rest.
+            // AutoStyle. The threshold is an absolute rate in turns/s, not a multiplier:
+            // 1 would filter out even full-stick aim (0.5 turns/s). Keep the standard deadband.
             Common::ParamPackage motion{{"engine", "nxbox"},
                                         {"port", std::to_string(slot)},
                                         {"pad", "0"},
                                         {"motion", "0"},
-                                        {"threshold", "1"}};
+                                        {"threshold", "0.007"}};
             for (auto& mapping : player.motions)
                 mapping = motion.Serialize();
             for (int i = 0; i < 2; ++i) {
