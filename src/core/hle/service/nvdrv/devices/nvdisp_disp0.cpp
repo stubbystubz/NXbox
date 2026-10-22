@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <boost/container/small_vector.hpp>
 
 #include "common/adpf.h"
@@ -66,6 +68,18 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
     output_layers.reserve(sorted_layers.size());
     output_fences.reserve(sorted_layers.size());
 
+    static const bool layer_diag = [] {
+        const char* value = std::getenv("NXBOX_LAYER_DIAG");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    // Composite calls are serialized by SurfaceFlinger. Count only when tracing is enabled.
+    static u64 diagnostic_frame = 0;
+    if (layer_diag) {
+        ++diagnostic_frame;
+        LOG_INFO(Service_VI, "NXBOX_LAYER frame={} layers={}", diagnostic_frame,
+                 sorted_layers.size());
+    }
+
     for (auto& layer : sorted_layers) {
         output_layers.emplace_back(Tegra::FramebufferConfig{
             .address = nvmap.GetHandleAddress(layer.buffer_handle),
@@ -79,6 +93,24 @@ void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers
             .blending = ConvertBlending(layer.blending),
             .layer_stack_mask = layer.layer_stack_mask,
         });
+
+        if (layer_diag) {
+            const auto& framebuffer = output_layers.back();
+            // VI position/size setters are unimplemented; all backends draw to layout.screen.
+            LOG_INFO(Service_VI,
+                     "NXBOX_LAYER frame={} index={} handle={} address={:#x} offset={:#x} "
+                     "buffer={:#x} size={}x{} stride_pixels={} format={:#x} crop={},{},{},{} "
+                     "position=0,0 destination=full_screen z={} blending={:#x} transform={:#x} "
+                     "stack_mask={:#x}",
+                     diagnostic_frame, output_layers.size() - 1, layer.buffer_handle,
+                     framebuffer.address, framebuffer.offset,
+                     framebuffer.address + framebuffer.offset, framebuffer.width,
+                     framebuffer.height, framebuffer.stride,
+                     static_cast<u32>(framebuffer.pixel_format), framebuffer.crop_rect.left,
+                     framebuffer.crop_rect.top, framebuffer.crop_rect.right,
+                     framebuffer.crop_rect.bottom, layer.z_index, static_cast<u32>(layer.blending),
+                     static_cast<u32>(framebuffer.transform_flags), framebuffer.layer_stack_mask);
+        }
 
         for (size_t i = 0; i < layer.acquire_fence.num_fences; i++) {
             if (layer.acquire_fence.fences[i].id >= 0) {

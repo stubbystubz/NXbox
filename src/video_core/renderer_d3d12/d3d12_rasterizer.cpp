@@ -4426,7 +4426,11 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
         // On by default since chain76 (MK8D, Odyssey, Wonder, Mario Party); "0" opts out.
         return !(value && value[0] == '0' && value[1] == '\0');
     }();
-    const bool diagnose_lookup = !std::exchange(presentation_lookup_logged, true);
+    static const bool layer_diag = [] {
+        const char* value = std::getenv("NXBOX_LAYER_DIAG");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    const bool diagnose_lookup = !std::exchange(presentation_lookup_logged, true) || layer_diag;
     auto [view, scaled] = texture_cache.TryFindFramebufferImageView(
         config, config.address + config.offset, gpu_lookup, diagnose_lookup);
     if (diagnose_lookup && view && !view->ImageHandle())
@@ -4438,7 +4442,7 @@ RasterizerD3D12::DisplayTexture RasterizerD3D12::FramebufferTexture(
             config.address + config.offset, cached ? view : nullptr);
         if (!mapping.empty())
             Diagnostic("D3D12_PASS_PRESENT " + mapping);
-        if (presentation_logged)
+        if (presentation_logged && !layer_diag)
             return;
         presentation_logged = true;
         const auto desc = resource->handle->GetDesc();
