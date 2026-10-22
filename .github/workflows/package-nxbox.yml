@@ -99,7 +99,15 @@ jobs:
             python tools/nxbox/prepare_dxil.py --output $executables[0].DirectoryName
             if ($LASTEXITCODE -ne 0) { throw 'DXIL runtime staging failed' }
           }
-          $version = if ($env:RELEASE_VERSION) { $env:RELEASE_VERSION } else { "0.3.$env:GITHUB_RUN_NUMBER.0" }
+          # A diagnostic must install over the latest release (Windows refuses a lower version
+          # and uninstalling wipes LocalState), so it takes that release's first three parts.
+          # ponytail: a later hotfix in the same x.y.z (x.y.z.2) sorts below an installed diagnostic.
+          $latest = git ls-remote --tags --refs origin 'v*' |
+            ForEach-Object { ($_ -split 'refs/tags/v')[1] } |
+            Where-Object { $_ -match '^\d+\.\d+\.\d+(\.\d+)?$' } |
+            Sort-Object { [version]$_ } | Select-Object -Last 1
+          $base = if ($latest) { [version]$latest } else { [version]'0.3.0' }
+          $version = if ($env:RELEASE_VERSION) { $env:RELEASE_VERSION } else { "$($base.Major).$($base.Minor).$($base.Build).$env:GITHUB_RUN_NUMBER" }
           python tools/nxbox/package_uwp.py --kind "$env:PACKAGE_KIND" --exe $executables[0].FullName --version "$version" --output out
           if ($LASTEXITCODE -ne 0) { throw 'Package creation failed' }
           @{
