@@ -20,6 +20,8 @@ DRIVER = r"""
 #include <vector>
 using u64 = std::uint64_t;
 using u8 = std::uint8_t;
+bool emergency = true;
+bool NativeAllocationPressureWait(u64 bytes) { assert(bytes == 0); return emergency; }
 bool BisectEnabled(const char*) { return false; }
 constexpr u64 Align(u64 size, u64 alignment) { return (size + alignment - 1) & ~(alignment - 1); }
 struct Resource {
@@ -165,6 +167,60 @@ int main() {
     assert(trimming.pages.empty());
     auto after_trim = trimming.Request(256);
     assert(after_trim.offset == 0 && after_trim.mapped_span.size() == 256);
+    // Soft pressure retains recent pages without relaxing GPU/CPU ownership.
+    emergency = false;
+    Context history_context;
+    StagingRing history{history_context};
+    auto hot = history.Request(4 * mib);
+    auto hot_lifetime = std::weak_ptr<Resource>{hot.buffer};
+    hot = {};
+    history_context.Finish();
+    history.Collect(true);
+    assert(history.pages.size() == 1 && history_context.resources == 1);
+    hot = history.Request(4 * mib);
+    assert(hot.buffer == hot_lifetime.lock() && history_context.resources == 1);
+    const auto last_use = history.pages.front().tick;
+    history_context.tick = last_use + 15;
+    history_context.completed = last_use;
+    history.Collect(true);
+    assert(history.pages.size() == 1);
+    history_context.tick = last_use + 16;
+    history.Collect(true);
+    assert(history.pages.size() == 1); // CPU lease survives age threshold.
+    hot = {};
+    history_context.completed = last_use - 1;
+    history.Collect(true);
+    assert(history.pages.size() == 1); // An old page can still be busy.
+    history_context.completed = last_use;
+    history.Collect(true);
+    assert(history.pages.empty() && hot_lifetime.expired());
+    // Freshly reused pages must survive another sweep; real exhaustion overrides age.
+    hot = history.Request(4 * mib);
+    hot_lifetime = hot.buffer;
+    hot = {};
+    history_context.Finish();
+    history.Collect(true);
+    assert(history.pages.size() == 1);
+    emergency = true;
+    history.Collect(true);
+    assert(history.pages.empty() && hot_lifetime.expired());
+    // Repeated critical sweeps: identical transfer work creates one hot page,
+    // versus one new page per frame under immediate eligible-page trimming.
+    for (bool reclaim_all : {false, true}) {
+        emergency = reclaim_all;
+        Context steady_context;
+        StagingRing steady{steady_context};
+        for (int frame = 0; frame < 32; ++frame) {
+            {
+                auto transfer = steady.Request(4 * mib);
+                assert(transfer.offset == 0 && transfer.mapped_span.size() == 4 * mib);
+                transfer.mapped_span[0] = static_cast<u8>(frame);
+            }
+            steady_context.Finish();
+            steady.Collect(true);
+        }
+        assert(steady_context.resources == (reclaim_all ? 32 : 1));
+    }
     bool rejected = false;
     try { ring.Request(0); } catch (const std::invalid_argument&) { rejected = true; }
     assert(rejected);

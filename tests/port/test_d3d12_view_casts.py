@@ -111,6 +111,7 @@ struct Device {
     }
 };
 namespace FrameCount { constexpr unsigned ForcedSubmitMemoryPressure=1, ForcedSubmitAllocationRetry=2; }
+bool NativeAllocationPressureWait(u64) noexcept { return true; }
 u64 NativeBufferMemoryTarget(u64) { return UINT64_MAX; }
 struct Pool { void Trim() {} } pool;
 Pool* BufferPool(std::shared_ptr<Budget>) { return &pool; }

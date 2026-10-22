@@ -123,6 +123,10 @@ std::shared_ptr<BufferHeapPool> active_pool;
 std::shared_ptr<BufferHeapPool> BufferPool(const std::shared_ptr<MemoryBudget>&) {
     return active_pool;
 }
+bool NativeAllocationPressureWait(u64 bytes) noexcept {
+    assert(bytes == BufferHeapPage::Size);
+    return !std::getenv("TEST_ALLOCATION_HAS_HEADROOM");
+}
 u64 NativeBufferMemoryTarget(u64) noexcept { return 1ULL << 30; }
 enum class FrameCount { ForcedSubmitMemoryPressure, ForcedSubmitAllocationRetry, Barriers };
 enum class FramePhase { Barriers };
@@ -162,12 +166,13 @@ int main() {
     using namespace D3D12;
     const auto* knob=std::getenv("NXBOX_D3D12_BUFFER_PRESSURE_REUSE");
     const bool fast=!knob || std::string(knob)!="0";
+    const unsigned wait_count = std::getenv("TEST_ALLOCATION_HAS_HEADROOM") ? 0u : 1u;
     active_pool=std::make_shared<BufferHeapPool>();
     Context context;
     if (std::getenv("NXBOX_D3D12_NO_PLACED")) {
         context.budget->used=2ULL << 30;
         auto committed=context.CreateBuffer(17,D3D12_HEAP_TYPE_DEFAULT);
-        assert(committed && context.committed==1 && context.finishes==1);
+        assert(committed && context.committed==1 && context.finishes==wait_count);
         assert(context.device->heaps==0 && context.barriers==0);
         return 0;
     }
@@ -177,7 +182,7 @@ int main() {
     context.budget->used=2ULL << 30;
     const auto heaps=context.device->heaps;
     auto reused=context.CreateBuffer(17,D3D12_HEAP_TYPE_DEFAULT);
-    assert(context.finishes==(fast ? 0u : 1u));
+    assert(context.finishes==(fast ? 0u : wait_count));
     assert(context.device->heaps==heaps && context.budget->used==(2ULL << 30));
     assert(reused->handle.Get()!=live->handle.Get());
     assert(reused->allocation_size==65536 && reused->state==D3D12_RESOURCE_STATE_COMMON);
@@ -188,15 +193,15 @@ int main() {
     const auto before_released=context.finishes;
     auto released=context.CreateBuffer(256,D3D12_HEAP_TYPE_DEFAULT);
     assert(released->handle->offset==0);
-    assert(context.finishes==before_released+(fast ? 0u : 1u));
+    assert(context.finishes==before_released+(fast ? 0u : wait_count));
     // A no-growth miss must not allocate a heap or bypass pressure handling.
     const auto before=context.finishes;
     auto large=context.CreateBuffer(16ULL << 20,D3D12_HEAP_TYPE_DEFAULT);
-    assert(context.finishes==before+1 && context.device->heaps==heaps+1);
+    assert(context.finishes==before+wait_count && context.device->heaps==heaps+1);
     // Heap types stay isolated; mapped staging buffers retain their requested extent.
     const auto before_upload=context.finishes;
     auto upload=context.CreateBuffer(33,D3D12_HEAP_TYPE_UPLOAD);
-    assert(context.finishes==before_upload+1 && upload->mapped.size()==256);
+    assert(context.finishes==before_upload+wait_count && upload->mapped.size()==256);
     assert(upload->heap==D3D12_HEAP_TYPE_UPLOAD);
     // A failed placed allocation releases its slot and falls back to committed memory.
     const auto used=active_pool->pages.front()->slots.Used();
@@ -232,16 +237,24 @@ int main() {
                 ],
                 check=True,
             )
-            for value, no_placed in (
-                (None, False),
-                ("0", False),
-                ("1", False),
-                ("0", True),
-                ("1", True),
+            for value, no_placed, headroom in (
+                (None, False, False),
+                (None, False, True),
+                ("0", False, False),
+                ("0", False, True),
+                ("1", False, False),
+                ("1", False, True),
+                ("0", True, False),
+                ("0", True, True),
+                ("1", True, False),
+                ("1", True, True),
             ):
                 environment = dict(os.environ)
                 environment.pop("NXBOX_D3D12_NO_PLACED", None)
                 environment.pop("NXBOX_D3D12_BUFFER_PRESSURE_REUSE", None)
+                environment.pop("TEST_ALLOCATION_HAS_HEADROOM", None)
+                if headroom:
+                    environment["TEST_ALLOCATION_HAS_HEADROOM"] = "1"
                 if no_placed:
                     environment["NXBOX_D3D12_NO_PLACED"] = "1"
                 if value is not None:

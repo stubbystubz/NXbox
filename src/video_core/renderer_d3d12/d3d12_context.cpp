@@ -2102,6 +2102,27 @@ u64 NativeDecodeMemoryBudget() noexcept {
 #endif
     return UINT64_MAX;
 }
+bool NativeAllocationPressureWait(u64 bytes) noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NXBOX_D3D12_ALLOCATION_HEADROOM");
+        return !value || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled)
+        return true;
+#ifdef NXBOX_UWP
+    try {
+        using winrt::Windows::System::MemoryManager;
+        return AllocationNeedsRetirement(MemoryManager::AppMemoryUsageLimit(),
+                                         MemoryManager::AppMemoryUsage(), bytes);
+    } catch (...) {
+        // Unknown process headroom retains the conservative retirement path.
+    }
+#else
+    static_cast<void>(bytes);
+#endif
+    return true;
+}
+
 namespace {
 NxboxMemory::Kind HeapMemoryKind(D3D12_HEAP_TYPE heap, bool texture = false) {
     if (heap == D3D12_HEAP_TYPE_UPLOAD)
@@ -2273,7 +2294,8 @@ ResourcePtr Context::CreateResource(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_
     // hold live resources after fence retirement; only the device can reject them.
     const auto target = NativeBufferMemoryTarget(budget->used);
     if (budget->used >= target || allocation.SizeInBytes > target - budget->used) {
-        Finish(FrameCount::ForcedSubmitMemoryPressure);
+        if (NativeAllocationPressureWait(allocation.SizeInBytes))
+            Finish(FrameCount::ForcedSubmitMemoryPressure);
         BufferPool(budget)->Trim();
     }
     auto resource = std::make_shared<Resource>();
@@ -2451,7 +2473,8 @@ ResourcePtr Context::CreateBuffer(u64 size, D3D12_HEAP_TYPE heap) {
                             : ResourcePtr{};
         if (!resource) {
             if (budget->used >= NativeBufferMemoryTarget(budget->used)) {
-                Finish(FrameCount::ForcedSubmitMemoryPressure);
+                if (NativeAllocationPressureWait(BufferHeapPage::Size))
+                    Finish(FrameCount::ForcedSubmitMemoryPressure);
                 pool->Trim();
             }
             if (!no_placed)
@@ -2489,8 +2512,14 @@ void StagingRing::Collect(bool trim) {
     if (trim) {
         // Fence completion alone is insufficient: mapped spans and uniform caches
         // may still own a CPU lease. Only the ring's last reference can be dropped.
-        std::erase_if(pages, [&is_free](const Page& page) {
-            return is_free(page.tick) && page.resource.use_count() == 1;
+        // Keep the working set across ordinary pressure sweeps. Exhaustion (or the
+        // legacy switch) still releases every eligible page immediately.
+        const u64 idle_ticks = NativeAllocationPressureWait(0) ? 0 : 16;
+        const u64 current = context.CurrentTick();
+        std::erase_if(pages, [&](const Page& page) {
+            const bool stale =
+                idle_ticks == 0 || (current >= page.tick && current - page.tick >= idle_ticks);
+            return stale && is_free(page.tick) && page.resource.use_count() == 1;
         });
     }
     for (auto& page : pages) {
