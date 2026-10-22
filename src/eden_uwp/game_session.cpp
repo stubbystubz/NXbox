@@ -30,6 +30,7 @@
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.System.UserProfile.h>
 #include <winrt/Windows.System.h>
 
 #include <fmt/format.h>
@@ -360,6 +361,10 @@ void ApplyEdenSettingsFile(const std::filesystem::path& settings_file) {
             // once per session so per-title files cannot disagree with the physical mapping.
             continue;
         }
+        if (label == "language_index") {
+            // Applied separately with validated precedence and a source diagnostic.
+            continue;
+        }
         if (label == "resolution_setup" && !TitleSettings::ParseResolution(value)) {
             Diagnostic(fmt::format("SETTING {}={} invalid", label, value));
             continue;
@@ -381,9 +386,31 @@ void ApplyEdenSettingsFile(const std::filesystem::path& settings_file) {
         winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path())));
 }
 
+// Guest language is independent of NXBOX_LANG (the frontend translation override).
+void ApplyConsoleLanguage(const std::filesystem::path& local, std::string_view title = {}) {
+    std::string tag;
+    try {
+        const auto languages =
+            winrt::Windows::System::UserProfile::GlobalizationPreferences::Languages();
+        if (languages.Size())
+            tag = winrt::to_string(languages.GetAt(0));
+    } catch (const winrt::hresult_error&) {
+        // An unavailable preference list maps to American English.
+    }
+    std::ifstream global(local / "eden_settings.txt");
+    std::ifstream game(TitleSettings::File(local, title));
+    const auto selection = ConsoleLanguage::Resolve(tag, TitleSettings::ReadLanguage(global),
+                                                    TitleSettings::ReadLanguage(game));
+    Settings::values.language_index.SetValue(selection.language);
+    // Eden selects guest/application language directly; region_index remains independent.
+    Diagnostic(fmt::format("SYSTEM_LANGUAGE source={} xbox={} switch={}", selection.source, tag,
+                           ConsoleLanguage::kNames[static_cast<unsigned>(selection.language)]));
+}
+
 void ApplyEdenSettingsFile() {
     const std::filesystem::path local_state(std::wstring_view(
         winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
+    ApplyConsoleLanguage(local_state);
     char show_fps[16]{};
     GetEnvironmentVariableA("NXBOX_SHOW_FPS", show_fps, sizeof(show_fps));
     Common::FpsOverlay::Initialize(ReadShowFps(local_state), show_fps);
@@ -968,6 +995,7 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
             const auto title = fmt::format("{:016X}", title_id);
             Recording::Configure(local_state, title);
             ApplyEdenSettingsFile(TitleSettings::File(local_state, title));
+            ApplyConsoleLanguage(local_state, title);
             _putenv_s("NXBOX_FRAME_GEN_SETTING",
                       std::to_string(TitleSettings::EffectiveFrameGeneration(local_state, title))
                           .c_str());

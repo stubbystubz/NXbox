@@ -519,3 +519,5 @@ Fixture JSON/HTML/binary payloads live in `tests/port/fixtures/tinfoil_*`. Pure 
 authentication, metadata/grouping/sorting, installed-version and queue tests run on the host. The
 application requires MSVC CI and a console run to validate WinRT networking, Direct2D rendering and
 controller/script behavior; it cannot be built on this Mac.
+
+Guest console language follows the first Xbox language preference (BCP-47), with American English as fallback. The per-game **Console language** choice saves `language_index` in `LocalState/settings/<TITLE_ID>.txt`; **Automatic (Xbox language)** removes that override. Precedence is title > `LocalState/eden_settings.txt` > Xbox. Eden selects game language directly, so `region_index` remains independent and explicit region settings are preserved. Boot diagnostics report `SYSTEM_LANGUAGE source=<xbox|setting|title> xbox=<tag> switch=<enum name>`.

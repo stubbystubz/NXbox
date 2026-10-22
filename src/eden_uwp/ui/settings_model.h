@@ -30,6 +30,7 @@ enum class Setting {
     FramePacing,
     ShowFps,
     RecordVideo,
+    ConsoleLanguage,
     Version,
     Count
 };
@@ -50,10 +51,24 @@ inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
      {Setting::ProfilePicture, Setting::Accounts, Setting::Moru, Setting::SaveSync},
      4},
     {Text::SettingsSystem,
-     {Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox, Setting::RecordVideo},
-     4},
+     {Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox, Setting::RecordVideo,
+      Setting::ConsoleLanguage},
+     5},
     {Text::SettingsAbout, {Setting::Version, Setting::Credits}, 2},
 }};
+// Index 0 is "automatic"; index n is Settings::Language n - 1.
+inline constexpr std::array<Text, 21> kConsoleLanguageChoices{
+    Text::ConsoleLanguageAutomatic,          Text::ConsoleLanguageJapanese,
+    Text::ConsoleLanguageEnglishAmerican,    Text::ConsoleLanguageFrench,
+    Text::ConsoleLanguageGerman,             Text::ConsoleLanguageItalian,
+    Text::ConsoleLanguageSpanish,            Text::ConsoleLanguageChinese,
+    Text::ConsoleLanguageKorean,             Text::ConsoleLanguageDutch,
+    Text::ConsoleLanguagePortuguese,         Text::ConsoleLanguageRussian,
+    Text::ConsoleLanguageTaiwanese,          Text::ConsoleLanguageEnglishBritish,
+    Text::ConsoleLanguageFrenchCanadian,     Text::ConsoleLanguageSpanishLatin,
+    Text::ConsoleLanguageChineseSimplified,  Text::ConsoleLanguageChineseTraditional,
+    Text::ConsoleLanguagePortugueseBrazilian, Text::ConsoleLanguagePolish,
+    Text::ConsoleLanguageThai};
 inline constexpr std::array<unsigned, 3> kFrameGenerationModes{0, 2, 4};
 inline constexpr std::array<Text, 3> kFrameGenerationChoices{
     Text::FrameGenerationOff, Text::FrameGeneration2x, Text::FrameGeneration4x};

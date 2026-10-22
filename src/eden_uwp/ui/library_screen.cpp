@@ -137,7 +137,8 @@ constexpr int kActionMods = 1;
 constexpr int kActionDetails = 2;
 constexpr int kActionResolution = 3;
 constexpr int kActionFrameGeneration = 4;
-constexpr int kActionCount = 5;
+constexpr int kActionConsoleLanguage = 5;
+constexpr int kActionCount = 6;
 
 constexpr std::size_t Idx(int index) {
     return static_cast<std::size_t>(index);
@@ -243,6 +244,11 @@ public:
         {
             std::ifstream global(local_state_ / "eden_settings.txt");
             frame_generation_ = TitleSettings::ReadFrameGeneration(global).value_or(5);
+        }
+        {
+            std::ifstream global(local_state_ / "eden_settings.txt");
+            const auto language = TitleSettings::ReadLanguage(global);
+            console_language_ = language ? static_cast<int>(*language) + 1 : 0;
         }
         frame_pacing_ = RendererSettings::ReadFramePacing(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
@@ -605,6 +611,42 @@ private:
             // Never start a game or another download while replacing the running package.
             return;
         }
+        if (resolution_open_ && language_sheet_) {
+            if (input_.Pressed(Button::B)) {
+                resolution_open_ = false;
+                input_.ConsumeUntilRelease();
+            }
+            int direction = 0;
+            if (input_.Pressed(Button::Left))
+                direction = -1;
+            if (input_.Pressed(Button::Right))
+                direction = 1;
+            if (input_.Pressed(Button::Up))
+                direction = -3;
+            if (input_.Pressed(Button::Down))
+                direction = 3;
+            if (direction) {
+                resolution_choice_ = std::clamp(resolution_choice_ + direction, 0, 20);
+                resolution_save_failed_ = false;
+            }
+            if (input_.Pressed(Button::A)) {
+                const auto language =
+                    resolution_choice_ == 0
+                        ? std::nullopt
+                        : std::optional{static_cast<Settings::Language>(resolution_choice_ - 1)};
+                resolution_save_failed_ = !TitleSettings::SaveLanguage(
+                    resolution_global_ ? local_state_ / "eden_settings.txt"
+                                       : TitleSettings::File(local_state_, Game(selected_).title_id),
+                    language);
+                if (!resolution_save_failed_ && resolution_global_)
+                    console_language_ = resolution_choice_;
+                if (!resolution_save_failed_) {
+                    resolution_open_ = false;
+                    input_.ConsumeUntilRelease();
+                }
+            }
+            return;
+        }
         if (resolution_open_ && frame_generation_sheet_) {
             if (input_.Pressed(Button::B)) {
                 resolution_open_ = false;
@@ -847,7 +889,17 @@ private:
             } else if (action_ == kActionResolution) {
                 resolution_global_ = false;
                 OpenResolution();
+            } else if (action_ == kActionConsoleLanguage) {
+                std::ifstream title(TitleSettings::File(local_state_, Game(selected_).title_id));
+                const auto language = TitleSettings::ReadLanguage(title);
+                resolution_choice_ = language ? static_cast<int>(*language) + 1 : 0;
+                language_sheet_ = true;
+                frame_generation_sheet_ = false;
+                resolution_save_failed_ = false;
+                resolution_open_ = true;
+                input_.ConsumeUntilRelease();
             } else if (action_ == kActionFrameGeneration) {
+                language_sheet_ = false;
                 std::ifstream title(TitleSettings::File(local_state_, Game(selected_).title_id));
                 const auto mode = TitleSettings::ReadFrameGeneration(title);
                 resolution_choice_ = !mode        ? 0
@@ -885,6 +937,7 @@ private:
     }
 
     void OpenResolution() {
+        language_sheet_ = false;
         frame_generation_sheet_ = false;
         if (!resolution_global_ && !HasGame()) {
             return;
@@ -1043,6 +1096,16 @@ private:
         if (SelectedSetting() == Setting::Resolution) {
             resolution_global_ = true;
             OpenResolution();
+            return;
+        }
+        if (SelectedSetting() == Setting::ConsoleLanguage) {
+            resolution_global_ = true;
+            resolution_choice_ = console_language_;
+            language_sheet_ = true;
+            frame_generation_sheet_ = false;
+            resolution_save_failed_ = false;
+            resolution_open_ = true;
+            input_.ConsumeUntilRelease();
             return;
         }
         if (SelectedSetting() == Setting::Version)
@@ -1547,8 +1610,9 @@ private:
     // The focused game's actions.
     void DrawActions() {
         const std::array<const wchar_t*, kActionCount> labels = {
-            Tr(Text::ActionPlay), Tr(Text::ActionMods), Tr(Text::ActionDetails),
-            Tr(Text::ResolutionTitle), Tr(Text::FrameGenerationTitle)};
+            Tr(Text::ActionPlay),           Tr(Text::ActionMods),
+            Tr(Text::ActionDetails),        Tr(Text::ResolutionTitle),
+            Tr(Text::FrameGenerationTitle), Tr(Text::ConsoleLanguageTitle)};
         float x = kMargin;
         for (int i = 0; i < kActionCount; ++i) {
             const bool primary = i == kActionPlay;
@@ -1901,6 +1965,8 @@ private:
               Tr(std::array{Text::RecordManual, Text::Record72030, Text::Record72060,
                             Text::Record108030, Text::Record108060}[recording_.mode]),
               Theme::kTextSecondary, Tr(Text::RecordVideoHint)},
+             {Tr(Text::ConsoleLanguageTitle), Tr(kConsoleLanguageChoices[Idx(console_language_)]),
+              Theme::kTextSecondary, Tr(Text::ConsoleLanguageHint)},
              {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
               Tr(Text::SettingsBuildHint)}}};
         constexpr float kRowTop = 340.0f;
@@ -2088,7 +2154,33 @@ private:
         }
     }
 
+    void DrawConsoleLanguage() {
+        const auto sheet = RectF(250.0f, 120.0f, 1670.0f, 960.0f);
+        DrawSheet(renderer_, sheet);
+        const float left = sheet.left + kSheetPadding;
+        const float right = sheet.right - kSheetPadding;
+        renderer_.DrawString(Tr(Text::ConsoleLanguageTitle), Font::Heading,
+                             RectF(left, 150.0f, right, 220.0f), Theme::kText);
+        renderer_.DrawString(resolution_global_ ? Tr(Text::SettingsGlobalResolution) : Game(selected_).name.c_str(), Font::Meta, RectF(left, 225.0f, right, 265.0f),
+                             Theme::kTextSecondary);
+        const auto& labels = kConsoleLanguageChoices;
+        const float column = (right - left) / 3.0f;
+        for (int i = 0; i < static_cast<int>(labels.size()); ++i) {
+            const float x = left + (i % 3) * column;
+            const float y = 290.0f + (i / 3) * 76.0f;
+            DrawChoicePill(renderer_, RectF(x, y, x + column - kPillGap, y + kPillHeight),
+                           Tr(labels[Idx(i)]), false, resolution_choice_ == i);
+        }
+        renderer_.DrawString(
+            Tr(resolution_save_failed_ ? Text::ResolutionSaveFailed : Text::ConsoleLanguageHint),
+            Font::Body, RectF(left, 845.0f, right, 935.0f), Theme::kTextSecondary);
+    }
+
     void DrawResolution() {
+        if (language_sheet_) {
+            DrawConsoleLanguage();
+            return;
+        }
         const D2D1_RECT_F sheet =
             RectF(kSheetLeft, kSheetTop, kSheetLeft + kSheetWidth, kSheetTop + kSheetHeight);
         DrawSheet(renderer_, sheet);
@@ -2196,6 +2288,8 @@ private:
     bool settings_rows_focused_ = false;
     bool renderer_open_ = false;
     int renderer_choice_ = 0;
+    bool language_sheet_ = false;
+    int console_language_ = 0; // global choice, index into kConsoleLanguageChoices
     bool resolution_global_ = false;
     unsigned frame_generation_ = 0;
     bool frame_pacing_ = false;

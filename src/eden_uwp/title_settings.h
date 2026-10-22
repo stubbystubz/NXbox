@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "eden_uwp/console_language.h"
+
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -70,6 +72,18 @@ inline int ReadResolution(std::istream& in, int fallback = kDefaultResolution) {
         }
     }
     return fallback;
+}
+
+inline std::optional<Settings::Language> ReadLanguage(std::istream& in) {
+    std::optional<Settings::Language> result;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = ParseLine(line);
+        if (entry && entry->label == "language_index") {
+            if (const auto language = ConsoleLanguage::Parse(entry->value))
+                result = language;
+        }
+    }
+    return result;
 }
 
 inline std::filesystem::path File(const std::filesystem::path& local, std::string_view title_id) {
@@ -166,6 +180,37 @@ inline bool SaveFrameGeneration(const std::filesystem::path& file, std::optional
                 : *mode == 2 ? "1"
                              : "0")
             << '\n';
+    out.close();
+    return !out.fail();
+}
+
+inline bool SaveLanguage(const std::filesystem::path& file,
+                         std::optional<Settings::Language> mode) {
+    if (file.empty() || (mode && static_cast<unsigned>(*mode) >= ConsoleLanguage::kNames.size()))
+        return false;
+    std::error_code error;
+    const bool exists = std::filesystem::exists(file, error);
+    if (error)
+        return false;
+    std::ifstream in(file);
+    if (exists && !in)
+        return false;
+    std::string content;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = ParseLine(line);
+        if (!entry || entry->label != "language_index")
+            content += line + '\n';
+    }
+    if (in.bad())
+        return false;
+    in.close();
+    std::filesystem::create_directories(file.parent_path(), error);
+    if (error)
+        return false;
+    std::ofstream out(file, std::ios::trunc);
+    out << content;
+    if (mode)
+        out << "language_index=" << static_cast<unsigned>(*mode) << '\n';
     out.close();
     return !out.fail();
 }
