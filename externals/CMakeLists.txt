@@ -308,6 +308,11 @@ endif()
 # TZDB (Time Zone Database)
 add_subdirectory(nx_tzdb)
 
+# zip/7z/rar reading for the NXbox mod store (src/eden_uwp/ui/mod_archive.cpp)
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    add_subdirectory(mod-archive)
+endif()
+
 add_library(tz tz/tz/tz.cpp)
 target_include_directories(tz PUBLIC ./tz)
 
