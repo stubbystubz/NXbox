@@ -229,7 +229,11 @@ D3D12_SAMPLER_DESC MakeSamplerDesc(const Tegra::Texture::TSCEntry& entry, bool s
 
 D3D12DescriptorAllocator::D3D12DescriptorAllocator(Context& context, u32 view_capacity,
                                                    u32 sampler_capacity)
-    : handle_table_reuse{[] {
+    : descriptor_lookup_cache{[] {
+          const char* value = std::getenv("NXBOX_D3D12_DESCRIPTOR_LOOKUP_CACHE");
+          return !value || std::strcmp(value, "0") != 0;
+      }()},
+      handle_table_reuse{[] {
           const char* value = std::getenv("NXBOX_D3D12_HANDLE_TABLE_CACHE");
           return !value || std::strcmp(value, "0") != 0;
       }()},
@@ -260,6 +264,7 @@ D3D12DescriptorAllocator::D3D12DescriptorAllocator(Context& context, u32 view_ca
         InitCache(null_view_cache, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32);
     InitCache(bound_rtvs, D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 8);
     InitCache(bound_dsv, D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1);
+    Diagnostic(fmt::format("D3D12 descriptor_lookup_cache={}", descriptor_lookup_cache));
     Diagnostic(fmt::format("D3D12 handle_table_cache={}", handle_table_reuse ? 1 : 0));
     Diagnostic(fmt::format("D3D12 descriptor_fastpath={}", descriptor_fastpath ? 1 : 0));
     Diagnostic(fmt::format("D3D12 descriptor_key_patch={}",
@@ -462,7 +467,8 @@ DescriptorTable D3D12DescriptorAllocator::FinishDrawTable(DescriptorPlan& plan, 
         // The destination is contiguous. Merge adjacent CPU sources, but keep
         // repeated null handles separate so every GPU slot gets initialized.
         if (descriptor_ranges) {
-            DescriptorCopyRanges<D3D12_CPU_DESCRIPTOR_HANDLE, 4096> sources;
+            auto& sources = draw_copy_sources;
+            sources.count = 0;
             for (u32 slot = 0; slot < count; ++slot) {
                 const D3D12_CPU_DESCRIPTOR_HANDLE handle{plan.sources.handles[slot]};
                 sources.Add(handle, cache.stride, IsNullDescriptorHandle(handle));
@@ -471,7 +477,7 @@ DescriptorTable D3D12DescriptorAllocator::FinishDrawTable(DescriptorPlan& plan, 
                                               static_cast<UINT>(sources.count),
                                               sources.starts.data(), sources.sizes.data(), type);
         } else {
-            std::array<D3D12_CPU_DESCRIPTOR_HANDLE, 4096> sources;
+            auto& sources = draw_copy_sources.starts;
             for (u32 slot = 0; slot < count; ++slot)
                 sources[slot].ptr = plan.sources.handles[slot];
             context.Device()->CopyDescriptors(1, &table.cpu, &count, count, sources.data(), nullptr,
@@ -550,13 +556,24 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12DescriptorAllocator::ResolveDescriptor(
     // recycling any handles borrowed by an unfinished descriptor plan.
     const bool null_view = persistent_null_descriptors && !resource && kind < 3;
     if (null_view) {
+        if (descriptor_lookup_cache) {
+            if (const auto* handle = null_view_cache.lookup.Find(null_view_cache.generation, key))
+                return *handle;
+        }
         if (const auto found = null_view_cache.entries.find(key);
-            found != null_view_cache.entries.end())
+            found != null_view_cache.entries.end()) {
+            if (descriptor_lookup_cache)
+                null_view_cache.lookup.Store(null_view_cache.generation, key, found->second.handle);
             return found->second.handle;
+        }
     }
     auto& cache = null_view && null_view_cache.cursor < null_view_cache.capacity ? null_view_cache
                   : type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER                   ? sampler_cache
                                                                                  : view_cache;
+    if (descriptor_lookup_cache) {
+        if (const auto* handle = cache.lookup.Find(cache.generation, key))
+            return *handle;
+    }
     auto found = cache.entries.find(key);
     if (found == cache.entries.end()) {
         if (cache.cursor == cache.capacity) {
@@ -629,6 +646,8 @@ D3D12_CPU_DESCRIPTOR_HANDLE D3D12DescriptorAllocator::ResolveDescriptor(
         context.Profile().Count(by_kind[kind]);
         found = cache.entries.emplace(key, CachedDescriptor{handle, resource}).first;
     }
+    if (descriptor_lookup_cache)
+        cache.lookup.Store(cache.generation, key, found->second.handle);
     return found->second.handle;
 }
 

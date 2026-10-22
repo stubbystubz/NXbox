@@ -82,10 +82,12 @@ struct D3D12DescriptorAllocator {
         std::unordered_map<DescriptorKey, CachedDescriptor, KeyHash> entries;
         u32 cursor{}, stride{32}, capacity{};
         u64 generation{1};
+        D3D12::DescriptorLookupCache<DescriptorKey, D3D12_CPU_DESCRIPTOR_HANDLE> lookup;
     };
     using CopyBatch = D3D12::DescriptorCopyBatch<D3D12_CPU_DESCRIPTOR_HANDLE>;
     FakeContext context;
     DescriptorCache view_cache, sampler_cache, null_view_cache;
+    bool descriptor_lookup_cache{true};
     bool persistent_null_descriptors{true}, new_frame{true};
     u64 cache_tick{};
     std::unordered_map<SIZE_T, DescriptorKey> slot_contents;
@@ -191,6 +193,7 @@ class DescriptorRangesTests(unittest.TestCase):
         source = (NATIVE / "d3d12_descriptor.cpp").read_text()
         checks = []
         for knob in (
+            "NXBOX_D3D12_DESCRIPTOR_LOOKUP_CACHE",
             "NXBOX_D3D12_DESCRIPTOR_RANGES",
             "NXBOX_D3D12_PERSISTENT_NULL_DESCRIPTORS",
             "NXBOX_D3D12_BATCH_DESCRIPTOR_COPIES",
@@ -216,6 +219,7 @@ class DescriptorRangesTests(unittest.TestCase):
     def test_opt_out_and_production_wiring(self):
         source = (NATIVE / "d3d12_descriptor.cpp").read_text()
         for knob in (
+            "NXBOX_D3D12_DESCRIPTOR_LOOKUP_CACHE",
             "NXBOX_D3D12_DESCRIPTOR_RANGES",
             "NXBOX_D3D12_PERSISTENT_NULL_DESCRIPTORS",
             "NXBOX_D3D12_BATCH_DESCRIPTOR_COPIES",
