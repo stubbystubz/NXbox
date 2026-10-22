@@ -21,6 +21,7 @@
 #include <fmt/ranges.h>
 #include "common/alignment.h"
 #include "common/logging.h"
+#include "common/nxbox_seam_diagnostics.h"
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/memory.h"
@@ -3259,15 +3260,32 @@ void RasterizerD3D12::DrawTexture() {
         formats.sample_count =
             static_cast<u8>(target->ImageHandle()->handle->GetDesc().SampleDesc.Count);
         Pso::ApplyFramebufferFormats(state, formats);
+        const auto size = framebuffer.Size();
+        const float destination_width = static_cast<float>(
+            texture_cache.IsRescaling() ? static_cast<u32>(maxwell3d->regs.surface_clip.width)
+                                        : size.width);
+        const float destination_height = static_cast<float>(
+            texture_cache.IsRescaling() ? static_cast<u32>(maxwell3d->regs.surface_clip.height)
+                                        : size.height);
+        const bool fullscreen_triangle =
+            (Nxbox::SeamDiagnostics::Mode() & Nxbox::SeamDiagnostics::DrawTextureTriangle) &&
+            Shader::Backend::HLSL::DrawTextureFillsViewport(blit.dst_x0, blit.dst_y0, blit.dst_x1,
+                                                            blit.dst_y1, destination_width,
+                                                            destination_height);
+        const auto draw_topology = fullscreen_triangle ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+                                                       : D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
         const std::array<StageInput, 2> stages{{
-            {Shader::Stage::VertexB, 0, Shader::Backend::HLSL::DRAW_TEXTURE_VERTEX, {}},
+            {Shader::Stage::VertexB,
+             0,
+             fullscreen_triangle ? Shader::Backend::HLSL::DRAW_TEXTURE_TRIANGLE_VERTEX
+                                 : Shader::Backend::HLSL::DRAW_TEXTURE_VERTEX,
+             {}},
             {Shader::Stage::Fragment,
              0,
              Shader::Backend::HLSL::DRAW_TEXTURE_FRAGMENT,
              {0, 1, 0, 1}},
         }};
-        auto& pipeline = default_pipeline_cache->GetGraphics(
-            state, D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, stages);
+        auto& pipeline = default_pipeline_cache->GetGraphics(state, draw_topology, stages);
         descriptors.Reserve(3, 1, 1);
         const auto tables = descriptors.AllocateViews(3);
         const auto sampler_table = descriptors.AllocateSamplers(1);
@@ -3294,24 +3312,18 @@ void RasterizerD3D12::DrawTexture() {
         commands->SetGraphicsRootDescriptorTable(2, tables.Slice(1, 1).gpu);
         commands->SetGraphicsRootDescriptorTable(3, tables.Slice(2, 1).gpu);
         commands->SetGraphicsRootDescriptorTable(4, sampler_table.gpu);
-        const auto size = framebuffer.Size();
-        const std::array<float, 12> constants{
-            blit.dst_x0,
-            blit.dst_y0,
-            blit.dst_x1,
-            blit.dst_y1,
-            blit.src_x0,
-            blit.src_y0,
-            blit.src_x1,
-            blit.src_y1,
-            static_cast<float>(texture_cache.IsRescaling()
-                                   ? static_cast<u32>(maxwell3d->regs.surface_clip.width)
-                                   : size.width),
-            static_cast<float>(texture_cache.IsRescaling()
-                                   ? static_cast<u32>(maxwell3d->regs.surface_clip.height)
-                                   : size.height),
-            static_cast<float>(source.size.width),
-            static_cast<float>(source.size.height)};
+        const std::array<float, 12> constants{blit.dst_x0,
+                                              blit.dst_y0,
+                                              blit.dst_x1,
+                                              blit.dst_y1,
+                                              blit.src_x0,
+                                              blit.src_y0,
+                                              blit.src_x1,
+                                              blit.src_y1,
+                                              destination_width,
+                                              destination_height,
+                                              static_cast<float>(source.size.width),
+                                              static_cast<float>(source.size.height)};
         if (!size.width || !size.height || !source.size.width || !source.size.height)
             return;
         commands->SetGraphicsRoot32BitConstants(0, static_cast<UINT>(constants.size()),
@@ -3323,7 +3335,7 @@ void RasterizerD3D12::DrawTexture() {
                                  static_cast<LONG>(size.height)};
         commands->RSSetViewports(1, &viewport);
         commands->RSSetScissorRects(1, &scissor);
-        commands->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        commands->IASetPrimitiveTopology(draw_topology);
         transform_feedback.Unbind();
         query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                   maxwell3d->regs.zpass_pixel_count_enable != 0);
@@ -3333,7 +3345,12 @@ void RasterizerD3D12::DrawTexture() {
             profile->Target({size.width, size.height, target->HostFormat().view_format, 0, 0});
         VideoCommon::SubmissionTrace::Log("host_draw_texture src_gpu={:x} dst_gpu={:x}",
                                           source.GpuAddr(), target->GpuAddr());
-        commands->DrawInstanced(4, 1, 0, 0);
+        if (fullscreen_triangle) {
+            static std::atomic_flag reported{};
+            if (!reported.test_and_set())
+                Diagnostic("D3D12_SEAM_DIAGNOSTICS DrawTexture fullscreen triangle active");
+        }
+        commands->DrawInstanced(fullscreen_triangle ? 3u : 4u, 1, 0, 0);
         if (pipeline_cache)
             pipeline_cache->RecordGraphicsDraw(texture_cache.CaptureFrame());
         query_runtime.EndDraw();

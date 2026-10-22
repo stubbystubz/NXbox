@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <algorithm>
 #include <bit>
+#include "common/nxbox_seam_diagnostics.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/hlsl/hlsl_emit_context.h"
 #include "shader_recompiler/backend/hlsl/hlsl_helpers.h"
@@ -335,7 +336,11 @@ EmitContext::EmitContext(IR::Program& program, Bindings& bindings, const Profile
     header += system_inputs;
     header += "};\nstruct Output {\n";
     if (stage != Stage::Fragment) {
-        header += "float4 position : SV_Position;\n";
+        // Mark the output sink, so precision propagates through guest arithmetic and
+        // the final Y/depth conversion. Fragment/geometry inputs remain unqualified.
+        header += (Nxbox::SeamDiagnostics::Mode() & Nxbox::SeamDiagnostics::PrecisePosition)
+                      ? "precise float4 position : SV_Position;\n"
+                      : "float4 position : SV_Position;\n";
         for (size_t i = 0; i < 32; ++i)
             if (info.stores.Generic(i))
                 header += fmt::format("float4 attr{} : TEXCOORD{};\n", i, i);
