@@ -183,6 +183,7 @@ enum class Text {
     NextendoOff,
     NextendoRowHint,
     NextendoInstructions,
+    NextendoNeedsSignIn,
     NextendoToggle,
     NextendoFriends,
     NextendoBusy,

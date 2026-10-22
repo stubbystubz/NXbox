@@ -210,6 +210,8 @@
     {Text::NextendoRowHint, L"Play on community servers with your Nextendo account."},
     {Text::NextendoInstructions,
      L"Turn Nextendo on, then sign in. No console account is ever used."},
+    {Text::NextendoNeedsSignIn,
+     L"Not signed in yet. Press X to sign in: until then, online modes show an error."},
     {Text::NextendoToggle, L"Toggle online"}, {Text::NextendoFriends, L"Friends"},
     {Text::NextendoBusy, L"Connecting to Nextendo…"},
     {Text::NextendoSignedIn, L"Signed in. Turn online on to play."},

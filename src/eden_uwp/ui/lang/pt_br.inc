@@ -219,6 +219,8 @@
     {Text::NextendoRowHint, L"Jogue nos servidores da comunidade com sua conta Nextendo."},
     {Text::NextendoInstructions,
      L"Ative o Nextendo e entre na sua conta. Nenhuma conta do console é usada."},
+    {Text::NextendoNeedsSignIn,
+     L"Nenhuma conta conectada. Aperte X para entrar: até lá, o modo online dá erro."},
     {Text::NextendoToggle, L"Ativar/desativar"}, {Text::NextendoFriends, L"Amigos"},
     {Text::NextendoBusy, L"Conectando ao Nextendo…"},
     {Text::NextendoSignedIn, L"Conta conectada. Ative o online para jogar."},

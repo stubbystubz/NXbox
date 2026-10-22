@@ -189,7 +189,12 @@ bool RunNextendoScreen(Renderer& renderer, const winrt::Windows::UI::Core::CoreW
     SCOPE_EXIT {
         stop_phone();
     };
-    Text feedback = Text::NextendoInstructions;
+    // Without a linked account games that go online fail with a Nintendo error code, so say so.
+    const auto idle_feedback = [] {
+        return NextendoOnline::LinkedAccount().pid != 0 ? Text::NextendoInstructions
+                                                        : Text::NextendoNeedsSignIn;
+    };
+    Text feedback = idle_feedback();
     // All network/vault operations run off the UI thread, and errors are fixed localized keys.
     const auto run = [&](auto work) {
         task = std::async(std::launch::async, [work] {
@@ -223,7 +228,7 @@ bool RunNextendoScreen(Renderer& renderer, const winrt::Windows::UI::Core::CoreW
         if (busy && task.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             feedback = task.get();
             if (feedback == Text::NextendoPhoneHint && !authorization)
-                feedback = Text::NextendoInstructions;
+                feedback = idle_feedback();
             busy = false;
             if (feedback == Text::NextendoFailed && phone) {
                 stop_phone();
@@ -235,7 +240,7 @@ bool RunNextendoScreen(Renderer& renderer, const winrt::Windows::UI::Core::CoreW
             stop_phone();
             authorization->Cancel();
             authorization.reset();
-            feedback = Text::NextendoInstructions;
+            feedback = idle_feedback();
             input.ConsumeUntilRelease();
         }
         if (phone && !busy) {
@@ -258,7 +263,7 @@ bool RunNextendoScreen(Renderer& renderer, const winrt::Windows::UI::Core::CoreW
                 authorization.reset();
                 browser_flow = false;
                 keyboard.reset();
-                feedback = Text::NextendoInstructions;
+                feedback = idle_feedback();
             } else if (result == TextEntry::Result::Confirmed) {
                 const auto callback = winrt::to_string(keyboard->Text());
                 keyboard.reset();
@@ -271,10 +276,10 @@ bool RunNextendoScreen(Renderer& renderer, const winrt::Windows::UI::Core::CoreW
                 stop_phone();
                 authorization->Cancel();
                 authorization.reset();
-                feedback = Text::NextendoInstructions;
+                feedback = idle_feedback();
             }
             if (input.Pressed(Button::A) && !authorization) {
-                feedback = NextendoOnline::SetEnabled(!nx::IsEnabled()) ? Text::NextendoInstructions
+                feedback = NextendoOnline::SetEnabled(!nx::IsEnabled()) ? idle_feedback()
                                                                         : Text::NextendoFailed;
             }
             if (input.Pressed(Button::X)) {
