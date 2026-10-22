@@ -499,6 +499,12 @@ private:
     }
 
     void OpenDelete() {
+        // A copy or move in Files may be writing into the games folder: do not delete under it.
+        if (files_ && files_->Busy()) {
+            Toast(Tr(Text::FilesWorking), Clock::now());
+            input_.ConsumeUntilRelease();
+            return;
+        }
         delete_stage_ = 1;
         delete_row_ = 0;
         delete_confirm_ = false;

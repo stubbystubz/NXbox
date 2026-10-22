@@ -135,7 +135,7 @@ class LibraryDeletion(unittest.TestCase):
         adopt = SCREEN.split("void AdoptDelete(")[1].split("void OpenDelete()")[0]
         self.assertIn("StartScan(false);", adopt)
         opening = SCREEN.split("void OpenDelete()")[1].split("void HandleInput(")[0]
-        self.assertLess(opening.index("shop_->HasDownloads()"), opening.index("delete_stage_ = 1"))
+        self.assertLess(opening.index("files_->Busy()"), opening.index("delete_stage_ = 1"))
         self.assertIn("std::async(std::launch::async", SCREEN)
         self.assertIn("wait_for(std::chrono::seconds(0))", adopt)
         for lang in ("en", "pt_br"):
