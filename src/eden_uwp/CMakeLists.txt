@@ -88,8 +88,11 @@ add_executable(eden-uwp WIN32
     ui/mods_screen.h
     ui/renderer.cpp
     ui/renderer.h
-    ui/sources_screen.cpp
-    ui/sources_screen.h
+    ui/files_screen.cpp
+    ui/files_screen.h
+    file_manager.cpp
+    file_manager.h
+    files_policy.h
     ui/savesync_ui.cpp
     ui/savesync_ui.h
     ui/strings.cpp

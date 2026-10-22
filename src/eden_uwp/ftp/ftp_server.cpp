@@ -704,6 +704,18 @@ std::wstring Server::Password() const {
     std::lock_guard lock(state_->mutex);
     return std::wstring(winrt::to_hstring(state_->password));
 }
+void Server::NotifyChanges() {
+    ++*state_->changes;
+}
+bool Server::ClientConnected() const {
+    std::lock_guard lock(state_->mutex);
+    return state_->session && !state_->session->done;
+}
+std::wstring Server::LastPeer() const {
+    std::lock_guard lock(state_->mutex);
+    return state_->session ? std::wstring(winrt::to_hstring(state_->session->peer))
+                           : std::wstring{};
+}
 std::uint64_t Server::Changes() const {
     return state_->changes->load();
 }

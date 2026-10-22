@@ -150,7 +150,7 @@ class OwnArtTests(unittest.TestCase):
         transport = (ROOT / "src/eden_uwp/ui/art.cpp").read_text()
         self.assertIn("AllowAutoRedirect(false)", transport)
         self.assertIn("HttpCookieUsageBehavior::NoCookies", transport)
-        self.assertIn("AllowedArt(url, origin)", transport)
+        self.assertNotIn("ShopArtSource", transport)
 
 
 if __name__ == "__main__":

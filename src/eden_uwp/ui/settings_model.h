@@ -7,7 +7,6 @@
 namespace EdenXbox::Ui {
 enum class Setting {
     SaveSync,
-    Sources,
     Usb,
     Credits,
     Nextendo,
@@ -31,7 +30,6 @@ enum class Setting {
     FramePacing,
     ShowFps,
     Version,
-    FtpServer,
     Count
 };
 struct SettingsCategory {
@@ -45,8 +43,8 @@ inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
       Setting::ButtonLayout, Setting::MaxPlayers, Setting::Resolution, Setting::Upscaler,
       Setting::FrameGeneration, Setting::FramePacing, Setting::ShowFps, Setting::InternetArt},
      12},
-    {Text::NavShop, {Setting::Sources, Setting::Usb}, 2},
-    {Text::SettingsOnline, {Setting::Nextendo, Setting::Multiplayer, Setting::FtpServer}, 3},
+    {Text::NavFiles, {Setting::Usb}, 1},
+    {Text::SettingsOnline, {Setting::Nextendo, Setting::Multiplayer}, 2},
     {Text::AccountSection,
      {Setting::ProfilePicture, Setting::Accounts, Setting::Moru, Setting::SaveSync},
      4},

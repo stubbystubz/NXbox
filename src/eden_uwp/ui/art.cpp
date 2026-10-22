@@ -29,14 +29,7 @@
 namespace EdenXbox::Ui {
 namespace fs = std::filesystem;
 namespace {
-// Stable filename within a worker's session directory; no URL or header is logged.
-std::string CacheKey(const std::string& value) {
-    std::uint64_t hash = 14695981039346656037ull;
-    for (unsigned char c : value)
-        hash = (hash ^ c) * 1099511628211ull;
-    return std::to_string(hash);
-}
-std::vector<std::uint8_t> Download(const std::string& url, const Tinfoil::Headers& headers = {}) {
+std::vector<std::uint8_t> Download(const std::string& url) {
     using namespace winrt::Windows::Web::Http;
     using namespace winrt::Windows::Storage::Streams;
     constexpr auto timeout = std::chrono::seconds(15);
@@ -47,9 +40,6 @@ std::vector<std::uint8_t> Download(const std::string& url, const Tinfoil::Header
     HttpClient client{filter};
     HttpRequestMessage message{HttpMethod::Get(),
                                winrt::Windows::Foundation::Uri{winrt::to_hstring(url)}};
-    for (const auto& [name, value] : headers)
-        void(message.Headers().TryAppendWithoutValidation(winrt::to_hstring(name),
-                                                          winrt::to_hstring(value)));
     const auto response = AwaitBounded(
         client.SendRequestAsync(message, HttpCompletionOption::ResponseHeadersRead), timeout);
     if (!response || response->StatusCode() != HttpStatusCode::Ok)
@@ -75,107 +65,6 @@ std::vector<std::uint8_t> Download(const std::string& url, const Tinfoil::Header
 bool CacheBitmap(const fs::path& file, const Pixels& pixels) {
     const auto bytes = Art::EncodeBitmap(pixels.bgra, pixels.width, pixels.height);
     return !bytes.empty() && Art::WriteBytes(file, bytes);
-}
-
-struct ShopArtSource::Impl {
-    struct Job {
-        std::string url;
-        Tinfoil::Headers headers;
-    };
-    explicit Impl(fs::path path)
-        : folder(std::move(path) / "shop-art" / std::to_string(ClockTicks())) {
-        // No responses from another authenticated session are reused.
-    }
-    static std::int64_t ClockTicks() {
-        return std::chrono::steady_clock::now().time_since_epoch().count();
-    }
-    fs::path folder;
-    std::mutex mutex;
-    std::condition_variable wake;
-    bool stop = false;
-    std::map<std::string, ArtState> states;
-    std::vector<Job> stack;
-    fs::path File(const std::string& url) const {
-        return folder / (CacheKey(url) + ".image");
-    }
-    ArtState Fetch(const Job& job) {
-        const auto bytes = Download(job.url, job.headers);
-        return !bytes.empty() && Art::WriteBytes(File(job.url), bytes) ? ArtState::Ready
-                                                                       : ArtState::None;
-    }
-
-    void Loop() {
-        bool apartment = false;
-        try {
-            winrt::init_apartment(winrt::apartment_type::multi_threaded);
-            apartment = true;
-            for (;;) {
-                Job job;
-                {
-                    std::unique_lock<std::mutex> lock(mutex);
-                    wake.wait(lock, [&] { return stop || !stack.empty(); });
-                    if (stop)
-                        break;
-                    job = std::move(stack.back());
-                    stack.pop_back();
-                }
-                auto result = ArtState::None;
-                try {
-                    result = Fetch(job);
-                } catch (...) { /* Keep the placeholder. */
-                }
-                const std::lock_guard<std::mutex> lock(mutex);
-                states[job.url] = result;
-            }
-        } catch (...) {
-            const std::lock_guard<std::mutex> lock(mutex);
-            stop = true;
-            for (auto& [url, state] : states)
-                state = ArtState::None;
-        }
-        std::error_code ec;
-        fs::remove_all(folder, ec);
-        if (apartment)
-            winrt::uninit_apartment();
-    }
-};
-ShopArtSource::ShopArtSource(fs::path path) : impl_(std::make_shared<Impl>(std::move(path))) {
-    std::thread([impl = impl_] { impl->Loop(); }).detach();
-}
-ShopArtSource::~ShopArtSource() {
-    {
-        const std::lock_guard<std::mutex> lock(impl_->mutex);
-        impl_->stop = true;
-    }
-    impl_->wake.notify_all();
-}
-void ShopArtSource::Request(const std::string& url, const std::string& origin,
-                            const Tinfoil::Headers& headers) {
-    if (!Tinfoil::AllowedArt(url, origin))
-        return;
-    {
-        const std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (impl_->stop || impl_->states.count(url))
-            return;
-        impl_->states[url] = ArtState::Pending;
-        impl_->stack.push_back({url, headers});
-    }
-    impl_->wake.notify_one();
-}
-ArtState ShopArtSource::Get(const std::string& url, fs::path& file) const {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
-    const auto found = impl_->states.find(url);
-    if (found == impl_->states.end())
-        return ArtState::None;
-    if (found->second == ArtState::Ready)
-        file = impl_->File(url);
-    return found->second;
-}
-void ShopArtSource::Discard(const std::string& url) {
-    const std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->states[url] = ArtState::None;
-    std::error_code ec;
-    fs::remove(impl_->File(url), ec);
 }
 
 namespace {

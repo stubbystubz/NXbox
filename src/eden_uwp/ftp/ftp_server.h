@@ -19,6 +19,10 @@ public:
     std::wstring Address() const;
     std::wstring Password() const;
     std::uint64_t Changes() const;
+    // Local file operations use the same library-rescan signal as FTP uploads.
+    void NotifyChanges();
+    bool ClientConnected() const;
+    std::wstring LastPeer() const;
 
 private:
     struct State;

@@ -36,7 +36,7 @@ class InputStateTests(unittest.TestCase):
 
     def test_library_transition_fences_are_wired(self):
         source = (ROOT / "src/eden_uwp/ui/library_screen.cpp").read_text()
-        for name in ("OpenMods", "OpenUsbImport", "OpenSources", "OpenCredits"):
+        for name in ("OpenMods", "OpenUsbImport", "OpenCredits"):
             with self.subTest(screen=name):
                 body = source.split(f"    void {name}() {{", 1)[1].split("\n    }", 1)[0]
                 self.assertIn("const InputTransition transition(input_);", body)

@@ -164,6 +164,10 @@ releases it fully before the game boots.
 
 ### Increment 3: sources and art
 
+The Shop and its source management were removed in p66. The replacement is
+[Files](nxbox-files.md), including the FTP panel formerly in Settings. The source
+plan below is historical. Community library backgrounds remain available.
+
 - Original plan: Settings → Sources (superseded by the Shop tab below), one list:
   - built-in GameBanana for mods;
   - shop-provided artwork on the index origin, or a generated title placeholder;

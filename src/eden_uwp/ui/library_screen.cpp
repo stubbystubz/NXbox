@@ -25,20 +25,19 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Storage.h>
 
-#include "common/scope_exit.h"
 #include "common/fps_overlay.h"
-#include "eden_uwp/fps_settings.h"
 #include "common/scm_rev.h"
-#include "eden_uwp/renderer_settings.h"
-#include "eden_uwp/ui/settings_model.h"
+#include "common/scope_exit.h"
 #include "eden_uwp/accounts.h"
 #include "eden_uwp/diagnostic.h"
 #include "eden_uwp/firmware.h"
+#include "eden_uwp/fps_settings.h"
 #include "eden_uwp/ftp/ftp_server.h"
 #include "eden_uwp/home_ui_settings.h"
 #include "eden_uwp/multiplayer_screen.h"
 #include "eden_uwp/multiplayer_strings.h"
 #include "eden_uwp/nextendo_online.h"
+#include "eden_uwp/renderer_settings.h"
 #include "eden_uwp/save_sync.h"
 #include "eden_uwp/title_settings.h"
 #include "eden_uwp/ui/accounts_screen.h"
@@ -46,6 +45,7 @@
 #include "eden_uwp/ui/art.h"
 #include "eden_uwp/ui/art_colors.h"
 #include "eden_uwp/ui/cheats_screen.h"
+#include "eden_uwp/ui/files_screen.h"
 #include "eden_uwp/ui/input.h"
 #include "eden_uwp/ui/library.h"
 #include "eden_uwp/ui/mods_screen.h"
@@ -53,7 +53,7 @@
 #include "eden_uwp/ui/nextendo_screen.h"
 #include "eden_uwp/ui/renderer.h"
 #include "eden_uwp/ui/savesync_ui.h"
-#include "eden_uwp/ui/sources_screen.h"
+#include "eden_uwp/ui/settings_model.h"
 #include "eden_uwp/ui/strings.h"
 #include "eden_uwp/ui/theme.h"
 #include "eden_uwp/ui/updater.h"
@@ -127,7 +127,7 @@ enum class Layer {
     Nav,     // the tabs at the top
 };
 
-enum class Tab { Library, Shop, Settings };
+enum class Tab { Library, Files, Settings };
 
 constexpr int kTabCount = 3;
 constexpr int kActionPlay = 0;
@@ -253,7 +253,6 @@ public:
         firmware_status_ = GetFirmwareStatus();
         sync_account_ = GetSyncAccount();
         accounts_multi_ = Accounts::Load(local_state_).multi;
-        sources_count_ = CountSources(local_state_);
         usb_mode_ = LoadUsbMode(local_state_);
         usb_detection_ = std::make_unique<UsbDetection>(local_state_);
         if (!return_home_)
@@ -271,6 +270,8 @@ public:
         // The system wants the GPU memory trimmed when the app is suspended.
         const auto suspending_token = CoreApplication::Suspending([this](const auto&, const auto&) {
             Diagnostic("UI suspending");
+            if (files_)
+                files_->Suspend();
             ftp_.Stop();
             renderer_.Trim();
         });
@@ -339,7 +340,6 @@ private:
     void StartScan(bool convert_nsz = true) {
         keep_title_id_ = SelectedTitleId();
         games_.clear();
-        tinfoil_index_ = -1;
         visuals_.clear();
 
         lift_.clear();
@@ -358,14 +358,6 @@ private:
             return;
         }
         games_ = scan_->Take();
-        // Use the library model, never a filename guess or another disk scan.
-        tinfoil_index_ = -1;
-        for (int i = 0; i < GameCount(); ++i) {
-            if (Game(i).title_id == "050000BADDAD0000") {
-                tinfoil_index_ = i;
-                break;
-            }
-        }
         keys_missing_ = scan_->KeysMissing();
         const auto& failures = scan_->FailedConversions();
         if (!failures.empty()) {
@@ -446,14 +438,12 @@ private:
         AdoptMove(now);
         AdoptDelete(now);
         AdoptScan();
-        if (!scan_ && ftp_changes_ != ftp_.Changes()) {
+        if (!scan_ && !(files_ && files_->Busy()) && ftp_changes_ != ftp_.Changes()) {
             ftp_changes_ = ftp_.Changes();
             StartScan();
         }
-        if (shop_) {
-            shop_->SetTinfoilAvailable(tinfoil_index_ >= 0);
-            shop_->Tick(now, false);
-        }
+        if (files_)
+            files_->Tick(now);
         if (!launching_) {
             HandleInput(now);
         }
@@ -502,13 +492,6 @@ private:
     }
 
     void OpenDelete() {
-        // The shop keeps downloading across tabs. Do not delete a live .partial file or
-        // race a transfer publishing a replacement under the path the player reviewed.
-        if (shop_ && shop_->HasDownloads()) {
-            Toast(Tr(Text::DeleteDownloadBusy), Clock::now());
-            input_.ConsumeUntilRelease();
-            return;
-        }
         delete_stage_ = 1;
         delete_row_ = 0;
         delete_confirm_ = false;
@@ -543,7 +526,7 @@ private:
     }
 
     void OpenMove(Clock::time_point now) {
-        if (scan_ || (shop_ && shop_->HasDownloads()) || ftp_.Running()) {
+        if (scan_ || (files_ && files_->Busy()) || ftp_.Running()) {
             Toast(Tr(Text::MoveBusy), now);
             return;
         }
@@ -655,33 +638,17 @@ private:
             }
             return;
         }
-        const bool shop_typing = tab_ == Tab::Shop && shop_ && shop_->Typing();
-        if (!shop_typing && input_.Pressed(Button::LeftShoulder)) {
+        if (tab_ == Tab::Files && layer_ != Layer::Nav) {
+            if (files_->HandleInput(now))
+                layer_ = Layer::Nav;
+            return;
+        }
+        if (input_.Pressed(Button::LeftShoulder)) {
             SetTab(static_cast<Tab>((static_cast<int>(tab_) + kTabCount - 1) % kTabCount));
             return;
         }
-        if (!shop_typing && input_.Pressed(Button::RightShoulder)) {
+        if (input_.Pressed(Button::RightShoulder)) {
             SetTab(static_cast<Tab>((static_cast<int>(tab_) + 1) % kTabCount));
-            return;
-        }
-        if (tab_ == Tab::Shop && layer_ != Layer::Nav) {
-            shop_->Tick(now, true);
-            if (shop_->TakeTinfoilRequest() && tinfoil_index_ >= 0 &&
-                tinfoil_index_ < GameCount()) {
-                selected_ = tinfoil_index_;
-                Launch(now);
-                return;
-            }
-            if (shop_->TakeSourcesRequest()) {
-                SetTab(Tab::Settings);
-                settings_category_ = 1;
-                settings_row_ = 0;
-                settings_rows_focused_ = true;
-                layer_ = Layer::Rail;
-                OpenSources();
-            }
-            if (shop_->TakeNavigationRequest())
-                layer_ = Layer::Nav;
             return;
         }
         if (input_.Pressed(Button::Left)) {
@@ -732,15 +699,9 @@ private:
         update_focused_ = false;
         renderer_open_ = false;
         tab_ = tab;
-        if (tab_ == Tab::Shop) {
-            if (!shop_)
-                shop_ = std::make_unique<ShopScreen>(renderer_, window_, input_, local_state_);
-            layer_ = Layer::Nav;
-        } else if (tab_ == Tab::Settings) {
-            layer_ = Layer::Nav;
-        } else if (shop_) {
-            StartScan();
-        }
+        if (tab_ == Tab::Files && !files_)
+            files_ = std::make_unique<FilesScreen>(renderer_, input_, local_state_, ftp_);
+        layer_ = Layer::Nav;
     }
 
     void MoveHorizontal(int direction) {
@@ -806,7 +767,9 @@ private:
         } else if (layer_ == Layer::Actions) {
             layer_ = Layer::Rail;
         } else if (layer_ == Layer::Nav) {
-            if (tab_ == Tab::Settings) {
+            if (tab_ == Tab::Settings || tab_ == Tab::Files) {
+                if (tab_ == Tab::Files)
+                    files_->Enter();
                 layer_ = Layer::Rail;
             } else {
                 layer_ = HasGame() ? Layer::Actions : Layer::Rail;
@@ -815,7 +778,8 @@ private:
     }
 
     void Activate(Clock::time_point now) {
-        if (tab_ == Tab::Shop && layer_ == Layer::Nav) {
+        if (tab_ == Tab::Files && layer_ == Layer::Nav) {
+            files_->Enter();
             layer_ = Layer::Rail;
             return;
         }
@@ -926,22 +890,6 @@ private:
             StartScan();
     }
 
-    // The sources screen, on this window and this renderer. It runs its own loop and returns when
-    // the player leaves with B; a download it finished is picked up by a new scan.
-    void OpenSources() {
-        const InputTransition transition(input_);
-        Diagnostic("UI library open sources");
-        if (RunSourcesScreen(renderer_, window_, input_, local_state_)) {
-            closed_ = true;
-            return;
-        }
-        sources_count_ = CountSources(local_state_);
-        if (shop_)
-            shop_->ReloadSources();
-        if (!return_home_)
-            StartScan();
-    }
-
     // Settings > Credits: who made what NXbox builds on (cheats_screen.cpp).
     void OpenCredits() {
         const InputTransition transition(input_);
@@ -1042,13 +990,6 @@ private:
         }
         if (SelectedSetting() == Setting::Version)
             return;
-        if (SelectedSetting() == Setting::FtpServer) {
-            if (ftp_.Running())
-                ftp_.Stop();
-            else if (!ftp_.Start(local_state_))
-                Toast(Tr(Text::FtpStartFailed), now);
-            return;
-        }
         if (SelectedSetting() == Setting::ShowFps) {
             if (SaveShowFps(local_state_, !show_fps_)) {
                 show_fps_ = !show_fps_;
@@ -1163,10 +1104,6 @@ private:
             }
             return;
         }
-        if (SelectedSetting() == Setting::Sources) {
-            OpenSources();
-            return;
-        }
         if (SelectedSetting() != Setting::SaveSync)
             return;
         switch (sync_account_) {
@@ -1278,10 +1215,6 @@ private:
             DrawHints(renderer_, CurrentHints());
             return;
         }
-        if (tab_ == Tab::Shop && shop_) {
-            shop_->Draw(now, layer_ == Layer::Nav);
-            return;
-        }
         if (tab_ == Tab::Library)
             DrawBackdrop(now);
         else
@@ -1295,7 +1228,7 @@ private:
             DrawHeroArt(now);
             DrawHeroText(now);
             DrawRail(now);
-        } else {
+        } else if (tab_ == Tab::Settings) {
             DrawSettings();
         }
         DrawTabs(renderer_, static_cast<int>(tab_), layer_ == Layer::Nav && !update_focused_);
@@ -1319,6 +1252,8 @@ private:
         }
         if (update_open_)
             DrawUpdateSheet();
+        if (tab_ == Tab::Files)
+            files_->Draw(now, layer_ == Layer::Nav);
         DrawHints(renderer_, CurrentHints()); // above the sheet's veil: the sheet's own hint says how to close it
         if (launching_) {
             const float progress =
@@ -1766,6 +1701,8 @@ private:
                     {Theme::kButtonX, L"X", Tr(Text::MoveToHd)},
                     {Theme::kButtonB, L"B", Tr(Text::HintBack)}};
         }
+        if (tab_ == Tab::Files && files_)
+            return files_->Hints();
         std::vector<Hint> hints;
         if (return_home_)
             hints.push_back({Theme::kTextSecondary, L"R", Tr(Text::HintStickMotion)});
@@ -1790,7 +1727,7 @@ private:
         return hints;
     }
 
-    // Settings shares the Shop sidebar and plain rows, with a separate focus for each pane.
+    // Settings and Files share a sidebar and plain rows, with separate focus for each pane.
     void DrawSettings() {
         renderer_.DrawString(Tr(Text::SettingsTitle), Font::Heading,
                              RectF(kMargin + 28.0f, 210.0f, kCanvasWidth - kMargin, 310.0f),
@@ -1817,15 +1754,6 @@ private:
         case SyncAccount::SignedOut:
             break;
         }
-        Row sources_row = {Tr(Text::SourcesRowTitle), Tr(Text::SourcesRowState),
-                           Theme::kTextTertiary, Tr(Text::SourcesRowHint)};
-        std::wstring sources_state;
-        if (sources_count_ > 0) {
-            sources_state = std::to_wstring(sources_count_) + L" " +
-                            Tr(sources_count_ == 1 ? Text::SourcesUnitOne : Text::SourcesUnitMany);
-            sources_row.state = sources_state.c_str();
-            sources_row.state_color = Theme::kSuccessText;
-        }
         const Row usb_row = {Tr(Text::UsbSetting), UsbModeLabel(usb_mode_), Theme::kTextSecondary,
                              Tr(Text::UsbSettingHint)};
         const Row credits_row = {Tr(Text::CreditsRowTitle), Tr(Text::CreditsRowState),
@@ -1845,70 +1773,60 @@ private:
                                       : resolution == 7 ? Text::Resolution3X
                                                         : Text::Resolution1X;
         const auto max_players_label = std::to_wstring(max_players_);
-        const bool ftp_running = ftp_.Running();
-        const auto ftp_address = ftp_running ? ftp_.Address() : Tr(Text::NextendoOff);
-        const auto ftp_credentials = ftp_running
-                                         ? std::wstring(Tr(Text::FtpUser)) + L" nxbox · " +
-                                               Tr(Text::FtpPassword) + L" " + ftp_.Password()
-                                         : std::wstring(Tr(Text::FtpHint));
-        const std::array<Row, static_cast<std::size_t>(Setting::Count)> rows = {
-            {sync_row,
-             sources_row,
-             usb_row,
-             credits_row,
-             nextendo_row,
-             {Tr(Text::SettingsMultiplayer), Tr(Text::HintSelect), Theme::kTextSecondary,
-              Tr(Text::SettingsMultiplayerHint)},
-             {Tr(Text::InternetArtwork), Tr(internet_art_ ? Text::NextendoOn : Text::NextendoOff),
-              Theme::kTextSecondary, Tr(Text::InternetArtworkHint)},
-             {Tr(Text::SystemMenuTitle), Tr(Text::SystemMenuBoot), Theme::kTextSecondary,
-              Tr(Text::SystemMenuHint)},
-             {Tr(Text::OfficialSwitchInterface),
-              Tr(official_interface_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(firmware_status_.home_available ? Text::SystemMenuHint : Text::RequiresFirmware)},
-             {Tr(Text::ProfilePicture), Tr(Text::HintSelect), Theme::kTextSecondary,
-              Tr(Text::ProfilePictureHint)},
-             {Tr(Text::MultipleAccounts),
-              Tr(accounts_multi_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(Text::MultipleAccountsHint)},
-             {Tr(Text::MoruTitle), Tr(Text::HintSelect), Theme::kTextSecondary,
-              Tr(Text::MoruSettingsHint)},
-             {Tr(Text::BackToNXboxInterface), Tr(Text::HintSelect), Theme::kTextSecondary,
-              Tr(Text::BackToNXboxHint)},
-             {Tr(Text::RendererTitle),
-              Tr(renderer_backend_ == RendererSettings::kOpenGL ? Text::RendererOpenGL
-                                                                : Text::RendererDirectX),
-              Theme::kTextSecondary, Tr(Text::RendererNextLaunch)},
-             {Tr(Text::ShaderPreloadTitle),
-              Tr(shader_preload_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(Text::ShaderPreloadHint)},
-             {Tr(Text::AsyncShadersTitle),
-              Tr(async_shaders_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(Text::AsyncShadersHint)},
-             {Tr(Text::XboxButtonIconsTitle),
-              Tr(xbox_button_icons_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(Text::XboxButtonIconsHint)},
-             {Tr(Text::ButtonLayoutTitle),
-              Tr(button_layout_ == ButtonLayout::Position ? Text::ButtonLayoutPositionShort
-                                                          : Text::ButtonLayoutNameShort),
-              Theme::kTextSecondary, Tr(Text::ButtonLayoutHint)},
-             {Tr(Text::MaxPlayersTitle), max_players_label.c_str(), Theme::kTextSecondary,
-              Tr(Text::MaxPlayersHint)},
-             {Tr(Text::ResolutionTitle), Tr(resolution_label), Theme::kTextSecondary,
-              Tr(Text::ResolutionMemoryHint)},
-             {Tr(Text::UpscalerTitle), Tr(fsr_ ? Text::UpscalerFsr : Text::UpscalerBilinear),
-              Theme::kTextSecondary, Tr(Text::UpscalerHint)},
-             {Tr(Text::FrameGenerationTitle),
-              Tr(frame_generation_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
-              Tr(Text::FrameGenerationHint)},
-             {Tr(Text::FramePacingTitle), Tr(frame_pacing_ ? Text::NextendoOn : Text::NextendoOff),
-              Theme::kTextSecondary, Tr(Text::FramePacingHint)},
-             {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
-              Theme::kTextSecondary, Tr(Text::ShowFpsHint)},
-             {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
-              Tr(Text::SettingsBuildHint)},
-             {Tr(Text::FtpServer), ftp_address.c_str(), Theme::kTextSecondary,
-              ftp_credentials.c_str()}}};
+        const std::array<Row, static_cast<std::size_t>(Setting::Count)> rows = {{
+            sync_row,
+            usb_row,
+            credits_row,
+            nextendo_row,
+            {Tr(Text::SettingsMultiplayer), Tr(Text::HintSelect), Theme::kTextSecondary,
+             Tr(Text::SettingsMultiplayerHint)},
+            {Tr(Text::InternetArtwork), Tr(internet_art_ ? Text::NextendoOn : Text::NextendoOff),
+             Theme::kTextSecondary, Tr(Text::InternetArtworkHint)},
+            {Tr(Text::SystemMenuTitle), Tr(Text::SystemMenuBoot), Theme::kTextSecondary,
+             Tr(Text::SystemMenuHint)},
+            {Tr(Text::OfficialSwitchInterface),
+             Tr(official_interface_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+             Tr(firmware_status_.home_available ? Text::SystemMenuHint : Text::RequiresFirmware)},
+            {Tr(Text::ProfilePicture), Tr(Text::HintSelect), Theme::kTextSecondary,
+             Tr(Text::ProfilePictureHint)},
+            {Tr(Text::MultipleAccounts), Tr(accounts_multi_ ? Text::NextendoOn : Text::NextendoOff),
+             Theme::kTextSecondary, Tr(Text::MultipleAccountsHint)},
+            {Tr(Text::MoruTitle), Tr(Text::HintSelect), Theme::kTextSecondary,
+             Tr(Text::MoruSettingsHint)},
+            {Tr(Text::BackToNXboxInterface), Tr(Text::HintSelect), Theme::kTextSecondary,
+             Tr(Text::BackToNXboxHint)},
+            {Tr(Text::RendererTitle),
+             Tr(renderer_backend_ == RendererSettings::kOpenGL ? Text::RendererOpenGL
+                                                               : Text::RendererDirectX),
+             Theme::kTextSecondary, Tr(Text::RendererNextLaunch)},
+            {Tr(Text::ShaderPreloadTitle),
+             Tr(shader_preload_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+             Tr(Text::ShaderPreloadHint)},
+            {Tr(Text::AsyncShadersTitle), Tr(async_shaders_ ? Text::NextendoOn : Text::NextendoOff),
+             Theme::kTextSecondary, Tr(Text::AsyncShadersHint)},
+            {Tr(Text::XboxButtonIconsTitle),
+             Tr(xbox_button_icons_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+             Tr(Text::XboxButtonIconsHint)},
+            {Tr(Text::ButtonLayoutTitle),
+             Tr(button_layout_ == ButtonLayout::Position ? Text::ButtonLayoutPositionShort
+                                                         : Text::ButtonLayoutNameShort),
+             Theme::kTextSecondary, Tr(Text::ButtonLayoutHint)},
+            {Tr(Text::MaxPlayersTitle), max_players_label.c_str(), Theme::kTextSecondary,
+             Tr(Text::MaxPlayersHint)},
+            {Tr(Text::ResolutionTitle), Tr(resolution_label), Theme::kTextSecondary,
+             Tr(Text::ResolutionMemoryHint)},
+            {Tr(Text::UpscalerTitle), Tr(fsr_ ? Text::UpscalerFsr : Text::UpscalerBilinear),
+             Theme::kTextSecondary, Tr(Text::UpscalerHint)},
+            {Tr(Text::FrameGenerationTitle),
+             Tr(frame_generation_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+             Tr(Text::FrameGenerationHint)},
+            {Tr(Text::FramePacingTitle), Tr(frame_pacing_ ? Text::NextendoOn : Text::NextendoOff),
+             Theme::kTextSecondary, Tr(Text::FramePacingHint)},
+            {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
+             Theme::kTextSecondary, Tr(Text::ShowFpsHint)},
+            {Tr(Text::SettingsVersion), build.c_str(), Theme::kTextSecondary,
+             Tr(Text::SettingsBuildHint)},
+        }};
         constexpr float kRowTop = 340.0f;
         const float kRowPitch = kSettingsCategories[Idx(settings_category_)].count > 6   ? 92.0f
                                 : kSettingsCategories[Idx(settings_category_)].count > 5 ? 106.0f
@@ -2138,15 +2056,14 @@ private:
     CoreWindow window_;
     Input input_;
     std::filesystem::path local_state_;
-    std::unique_ptr<ShopScreen> shop_;
     Ftp::Server ftp_;
+    std::unique_ptr<FilesScreen> files_;
     LibraryMoveProgress move_progress_;
     std::future<LibraryTransfer::Result> move_result_;
     bool move_active_ = false;
     std::uint64_t ftp_changes_ = 0;
     bool internet_art_ = true;
     std::unique_ptr<BackgroundArtSource> backgrounds_;
-    int sources_count_ = 0; // sources saved by the Sources screen, shown on its Settings row
     Updater updater_;
     bool update_focused_ = false;
     bool update_open_ = false;
@@ -2165,7 +2082,6 @@ private:
 
     Tab tab_ = Tab::Library;
     Layer layer_ = Layer::Rail;
-    int tinfoil_index_ = -1;
     int selected_ = 0; // rail index; GameCount() is the "add games" tile
     int action_ = kActionPlay;
     std::atomic<bool>* return_home_ = nullptr;
