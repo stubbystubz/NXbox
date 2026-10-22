@@ -38,13 +38,13 @@
 #include <winrt/Windows.Storage.Streams.h>
 #include <winrt/Windows.Web.Http.Headers.h>
 #include <winrt/Windows.Web.Http.h>
-#include <zlib.h>
 
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "eden_uwp/diagnostic.h"
+#include "eden_uwp/ui/mod_archive.h"
 #include "eden_uwp/ui/mods_paths.h"
 #include "eden_uwp/ui/widgets.h"
 #include "eden_uwp/usb_library.h"
@@ -349,296 +349,6 @@ std::string HtmlToText(const std::string& html) {
     return clean;
 }
 
-// ---- Zip ----
-
-std::uint16_t U16(const std::uint8_t* p) {
-    return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
-}
-
-std::uint32_t U32(const std::uint8_t* p) {
-    return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
-           (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
-}
-
-struct ZipEntry {
-    std::string name;
-    std::uint16_t flags = 0;
-    std::uint16_t method = 0;
-    std::uint32_t crc = 0;
-    std::uint64_t compressed = 0;
-    std::uint64_t size = 0;
-    std::uint64_t offset = 0;
-};
-
-bool ReadZipDirectory(std::ifstream& in, std::uint64_t file_size, std::vector<ZipEntry>& entries,
-                      std::string& error) {
-    constexpr std::uint64_t kTail = 22 + 65535;
-    const std::uint64_t tail_size = std::min(file_size, kTail);
-    if (tail_size < 22) {
-        error = "not a zip file";
-        return false;
-    }
-    std::vector<std::uint8_t> tail(static_cast<std::size_t>(tail_size));
-    in.seekg(static_cast<std::streamoff>(file_size - tail_size));
-    in.read(reinterpret_cast<char*>(tail.data()), static_cast<std::streamsize>(tail.size()));
-    if (!in) {
-        error = "cannot read the zip";
-        return false;
-    }
-    std::size_t at = tail.size() - 22 + 1;
-    bool found = false;
-    while (at-- > 0) {
-        if (U32(&tail[at]) == 0x06054B50u) {
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        error = "not a zip file";
-        return false;
-    }
-    const std::uint8_t* eocd = &tail[at];
-    const std::uint32_t count = U16(eocd + 10);
-    const std::uint32_t directory_size = U32(eocd + 12);
-    const std::uint32_t directory_offset = U32(eocd + 16);
-    if (count == 0xFFFFu || directory_size == 0xFFFFFFFFu || directory_offset == 0xFFFFFFFFu) {
-        error = "zip64 archives are not supported";
-        return false;
-    }
-    if (static_cast<std::uint64_t>(directory_offset) + directory_size > file_size) {
-        error = "the zip directory is damaged";
-        return false;
-    }
-    std::vector<std::uint8_t> directory(directory_size);
-    in.seekg(directory_offset);
-    in.read(reinterpret_cast<char*>(directory.data()),
-            static_cast<std::streamsize>(directory.size()));
-    if (!in) {
-        error = "cannot read the zip directory";
-        return false;
-    }
-    std::size_t pos = 0;
-    for (std::uint32_t i = 0; i < count; ++i) {
-        if (pos + 46 > directory.size() || U32(&directory[pos]) != 0x02014B50u) {
-            error = "the zip directory is damaged";
-            return false;
-        }
-        const std::uint8_t* header = &directory[pos];
-        ZipEntry entry;
-        entry.flags = U16(header + 8);
-        entry.method = U16(header + 10);
-        entry.crc = U32(header + 16);
-        entry.compressed = U32(header + 20);
-        entry.size = U32(header + 24);
-        const std::size_t name_length = U16(header + 28);
-        const std::size_t extra_length = U16(header + 30);
-        const std::size_t comment_length = U16(header + 32);
-        entry.offset = U32(header + 42);
-        if (pos + 46 + name_length + extra_length + comment_length > directory.size()) {
-            error = "the zip directory is damaged";
-            return false;
-        }
-        entry.name.assign(reinterpret_cast<const char*>(header + 46), name_length);
-        entries.push_back(std::move(entry));
-        pos += 46 + name_length + extra_length + comment_length;
-    }
-    return true;
-}
-
-// The relative path an entry unpacks to. Returns false when the name must be refused because it
-// would leave the destination folder; `out` is empty when there is nothing to unpack.
-bool SafeEntryPath(const std::string& name, fs::path& out) {
-    std::string normal = name;
-    std::replace(normal.begin(), normal.end(), '\\', '/');
-    out.clear();
-    std::size_t start = 0;
-    while (start <= normal.size()) {
-        std::size_t end = normal.find('/', start);
-        if (end == std::string::npos) {
-            end = normal.size();
-        }
-        std::string part = normal.substr(start, end - start);
-        start = end + 1;
-        if (part.empty() || part == ".") {
-            continue;
-        }
-        if (part == ".." || part.find(':') != std::string::npos) {
-            out.clear();
-            return false;
-        }
-        for (char& letter : part) {
-            if (letter == '<' || letter == '>' || letter == '"' || letter == '|' ||
-                letter == '?' || letter == '*' || static_cast<unsigned char>(letter) < 32) {
-                letter = '_';
-            }
-        }
-        out /= fs::path(Widen(part));
-    }
-    return true;
-}
-
-// Unpacks one entry's data into `out_path`. Returns why it failed, or an empty string.
-std::string ExtractEntry(std::ifstream& in, const ZipEntry& entry, const fs::path& out_path,
-                         std::uint64_t& written_total, const std::atomic<bool>& cancel) {
-    std::uint8_t local[30];
-    in.clear();
-    in.seekg(static_cast<std::streamoff>(entry.offset));
-    in.read(reinterpret_cast<char*>(local), sizeof(local));
-    if (!in || U32(local) != 0x04034B50u) {
-        return "a zip entry header is damaged";
-    }
-    const std::uint64_t data_start = entry.offset + 30 + U16(local + 26) + U16(local + 28);
-    in.seekg(static_cast<std::streamoff>(data_start));
-
-    std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
-    if (!out) {
-        return "cannot create " + winrt::to_string(out_path.filename().wstring());
-    }
-    std::vector<std::uint8_t> input(64 * 1024);
-    std::vector<std::uint8_t> output(64 * 1024);
-    std::uint64_t remaining = entry.compressed;
-    uLong crc = crc32(0L, Z_NULL, 0);
-    std::uint64_t produced_total = 0;
-
-    if (entry.method == 0) {
-        while (remaining > 0) {
-            if (cancel.load()) {
-                return "cancelled";
-            }
-            const std::size_t chunk =
-                static_cast<std::size_t>(std::min<std::uint64_t>(remaining, input.size()));
-            in.read(reinterpret_cast<char*>(input.data()), static_cast<std::streamsize>(chunk));
-            if (!in) {
-                return "the zip is truncated";
-            }
-            crc = crc32(crc, input.data(), static_cast<uInt>(chunk));
-            out.write(reinterpret_cast<const char*>(input.data()),
-                      static_cast<std::streamsize>(chunk));
-            remaining -= chunk;
-            produced_total += chunk;
-        }
-    } else if (entry.method == 8) {
-        z_stream stream{};
-        if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
-            return "zlib could not start";
-        }
-        int status = Z_OK;
-        std::string failure;
-        while (status != Z_STREAM_END) {
-            if (cancel.load()) {
-                failure = "cancelled";
-                break;
-            }
-            if (stream.avail_in == 0) {
-                const std::size_t chunk =
-                    static_cast<std::size_t>(std::min<std::uint64_t>(remaining, input.size()));
-                if (chunk == 0) {
-                    failure = "the zip is truncated";
-                    break;
-                }
-                in.read(reinterpret_cast<char*>(input.data()), static_cast<std::streamsize>(chunk));
-                if (!in) {
-                    failure = "the zip is truncated";
-                    break;
-                }
-                remaining -= chunk;
-                stream.next_in = input.data();
-                stream.avail_in = static_cast<uInt>(chunk);
-            }
-            stream.next_out = output.data();
-            stream.avail_out = static_cast<uInt>(output.size());
-            status = inflate(&stream, Z_NO_FLUSH);
-            if (status != Z_OK && status != Z_STREAM_END) {
-                failure = fmt::format("zlib error {}", status);
-                break;
-            }
-            const std::size_t produced = output.size() - stream.avail_out;
-            if (produced > 0) {
-                crc = crc32(crc, output.data(), static_cast<uInt>(produced));
-                out.write(reinterpret_cast<const char*>(output.data()),
-                          static_cast<std::streamsize>(produced));
-                produced_total += produced;
-                if (written_total + produced_total > kMaxArchiveBytes) {
-                    failure = "the archive unpacks to too much data";
-                    break;
-                }
-            }
-        }
-        inflateEnd(&stream);
-        if (!failure.empty()) {
-            return failure;
-        }
-    } else {
-        return fmt::format("unsupported zip compression method {}", entry.method);
-    }
-    out.close();
-    if (!out) {
-        return "the disk is full or not writable";
-    }
-    if (static_cast<std::uint32_t>(crc) != entry.crc) {
-        return "a file of the zip is corrupt (CRC mismatch)";
-    }
-    written_total += produced_total;
-    return {};
-}
-
-// Unpacks a .zip into `destination`. Returns why it failed, or an empty string.
-std::string ExtractZip(const fs::path& zip_path, const fs::path& destination,
-                       const std::atomic<bool>& cancel) {
-    std::error_code size_error;
-    const std::uint64_t file_size = fs::file_size(zip_path, size_error);
-    if (size_error) {
-        return "cannot read the zip";
-    }
-    std::ifstream in(zip_path, std::ios::binary);
-    if (!in) {
-        return "cannot open the zip";
-    }
-    std::vector<ZipEntry> entries;
-    std::string error;
-    if (!ReadZipDirectory(in, file_size, entries, error)) {
-        return error;
-    }
-    std::uint64_t declared = 0;
-    for (const ZipEntry& entry : entries) {
-        declared += entry.size;
-    }
-    if (declared > kMaxArchiveBytes) {
-        return "the archive unpacks to too much data";
-    }
-    std::error_code ec;
-    fs::create_directories(destination, ec);
-    std::uint64_t written = 0;
-    for (const ZipEntry& entry : entries) {
-        if (cancel.load()) {
-            return "cancelled";
-        }
-        if (entry.flags & 1u) {
-            return "the zip is password protected";
-        }
-        const bool is_directory = !entry.name.empty() && (entry.name.back() == '/' ||
-                                                          entry.name.back() == '\\');
-        fs::path relative;
-        if (!SafeEntryPath(entry.name, relative)) {
-            return "the zip has an unsafe path";
-        }
-        if (relative.empty()) {
-            continue;
-        }
-        const fs::path target = destination / relative;
-        if (is_directory) {
-            fs::create_directories(target, ec);
-            continue;
-        }
-        fs::create_directories(target.parent_path(), ec);
-        const std::string failure = ExtractEntry(in, entry, target, written, cancel);
-        if (!failure.empty()) {
-            return failure;
-        }
-    }
-    return {};
-}
-
 // ---- Finding the mod inside an archive ----
 
 bool IsModFolderName(const std::wstring& name) {
@@ -715,6 +425,64 @@ std::string SanitizeFolderName(const std::string& name, std::int64_t id) {
 std::string Extension(const std::string& file_name) {
     const std::size_t dot = file_name.rfind('.');
     return dot == std::string::npos ? std::string() : Lower(file_name.substr(dot));
+}
+
+// Copies every .pchtxt and .ips under `root` (a few levels deep) into `exefs`. Two patches with
+// the same name in different folders (one per game version, say) keep both, the later one
+// prefixed with its folder's name. Returns false when there was none.
+bool GatherLoosePatches(const fs::path& root, const fs::path& exefs) {
+    std::error_code ec;
+    bool any = false;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    const fs::recursive_directory_iterator end{};
+    for (; !ec && it != end; it.increment(ec)) {
+        if (it.depth() > kMaxSearchDepth) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        std::error_code type_error;
+        if (!it->is_regular_file(type_error)) {
+            continue;
+        }
+        const std::string extension = Extension(winrt::to_string(it->path().filename().wstring()));
+        if (extension != ".pchtxt" && extension != ".ips") {
+            continue;
+        }
+        if (!any) {
+            fs::create_directories(exefs, type_error);
+            any = true;
+        }
+        fs::path target = exefs / it->path().filename();
+        if (fs::exists(target, type_error)) {
+            target = exefs / (it->path().parent_path().filename().wstring() + L"_" +
+                              it->path().filename().wstring());
+        }
+        fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, type_error);
+        if (type_error) {
+            return false;
+        }
+    }
+    return any;
+}
+
+// "x.part2.rar" and later: volumes of a split RAR, which libarchive cannot open alone.
+bool IsLaterRarVolume(const std::string& file_name) {
+    const std::string lower = Lower(file_name);
+    if (lower.size() < 4 || lower.compare(lower.size() - 4, 4, ".rar") != 0) {
+        return false;
+    }
+    const std::size_t part = lower.rfind(".part");
+    if (part == std::string::npos) {
+        return false;
+    }
+    const std::string digits = lower.substr(part + 5, lower.size() - 4 - (part + 5));
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+    // Compare as text (no std::stoul, which throws on a 30-digit name): "1", "01", "001" are
+    // the first volume.
+    const std::size_t first = digits.find_first_not_of('0');
+    return first == std::string::npos || digits.substr(first) != "1";
 }
 
 // Prefix match on the words of a category name, so "ui" does not match "build".
@@ -1406,10 +1174,13 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
             fail(info.failed ? "could not read the mod's files" : "the mod has no files");
             return;
         }
-        // A .zip is the one format that can be unpacked; any other file is reported as such.
+        // .zip, .7z and .rar unpack (mod_archive.cpp). GameBanana lists the main file first, so
+        // the first one in a supported format wins; later volumes of a split .rar are skipped,
+        // since they cannot be read on their own.
         std::size_t chosen = info.files.size();
         for (std::size_t i = 0; i < info.files.size(); ++i) {
-            if (Extension(info.files[i].first) == ".zip") {
+            const std::string& name = info.files[i].first;
+            if (IsModArchiveExtension(Extension(name)) && !IsLaterRarVolume(name)) {
                 chosen = i;
                 break;
             }
@@ -1429,7 +1200,7 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
             std::error_code remove_error;
             fs::remove_all(work, remove_error);
         };
-        const fs::path archive = work / "mod.zip";
+        const fs::path archive = work / Widen("mod" + Extension(info.files[chosen].first));
         const std::string download_error = HttpDownload(
             addresses[chosen], archive, info.files[chosen].second,
             [&](std::uint64_t done, std::uint64_t size) {
@@ -1448,17 +1219,23 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
         entry->state.store(static_cast<int>(ModState::Installing));
 
         const fs::path unpacked = work / "x";
-        const std::string unzip_error = ExtractZip(archive, unpacked, cancel);
-        if (!unzip_error.empty()) {
+        const std::string unpack_error =
+            ExtractModArchive(archive, unpacked, cancel, kMaxArchiveBytes);
+        if (!unpack_error.empty()) {
             cleanup();
-            fail(unzip_error);
+            fail(unpack_error);
             return;
         }
         fs::path root;
         if (!FindModRoot(unpacked, root)) {
-            cleanup();
-            fail("the archive has no romfs, exefs or cheats folder");
-            return;
+            // Many 60 fps / resolution mods are only .pchtxt or .ips patches with no folder
+            // around them; Eden loads those from the mod's exefs folder.
+            root = work / "loose";
+            if (!GatherLoosePatches(unpacked, root / "exefs")) {
+                cleanup();
+                fail("the archive has no romfs, exefs or cheats folder");
+                return;
+            }
         }
         const std::string folder = SanitizeFolderName(entry->name, entry->id);
         const fs::path destination =

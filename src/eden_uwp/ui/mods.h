@@ -22,7 +22,7 @@ enum class ModState : int {
     Downloading,
     Installing,
     Installed,
-    Unsupported, // the only file is a .7z or .rar
+    Unsupported, // no file is a .zip, .7z or .rar
     Failed,
 };
 

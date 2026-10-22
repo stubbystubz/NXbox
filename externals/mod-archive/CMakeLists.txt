@@ -1,0 +1,159 @@
+# SPDX-FileCopyrightText: Copyright 2026 NSPX
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+# Read-only zip / 7z / rar unpacking for the mod store (src/eden_uwp/ui/mod_archive.cpp).
+#
+# A trimmed, vendored libarchive 3.8.1 (BSD-2-Clause, libarchive/COPYING) and the decoder half of
+# liblzma from xz 5.8.1 (0BSD, xz/COPYING.0BSD); exact commits are in VERSIONS. Vendored rather
+# than fetched so the UWP build stays offline-capable, and hand-configured because libarchive's
+# own CMake runs try_run checks that fail when CMAKE_SYSTEM_NAME is WindowsStore. Only the
+# sources the four read formats link against are kept; everything that writes to disk, spawns
+# processes or reads ACLs/xattrs is left out, so no desktop-only Win32 call can sneak in.
+#
+# Targets: nxbox_liblzma, nxbox_libarchive (alias NXbox::ModArchive, which carries the include
+# directory and LIBARCHIVE_STATIC for its users).
+
+set(MODARCHIVE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+# ---- liblzma (decoders only, single-threaded) ----
+
+set(LZMA_DIR "${MODARCHIVE_DIR}/xz/liblzma")
+add_library(nxbox_liblzma STATIC
+    ${LZMA_DIR}/check/check.c
+    ${LZMA_DIR}/check/crc32_fast.c
+    ${LZMA_DIR}/check/crc64_fast.c
+    ${LZMA_DIR}/check/sha256.c
+    ${LZMA_DIR}/common/alone_decoder.c
+    ${LZMA_DIR}/common/block_decoder.c
+    ${LZMA_DIR}/common/block_header_decoder.c
+    ${LZMA_DIR}/common/block_util.c
+    ${LZMA_DIR}/common/common.c
+    ${LZMA_DIR}/common/filter_common.c
+    ${LZMA_DIR}/common/filter_decoder.c
+    ${LZMA_DIR}/common/filter_flags_decoder.c
+    ${LZMA_DIR}/common/index.c
+    ${LZMA_DIR}/common/index_hash.c
+    ${LZMA_DIR}/common/stream_decoder.c
+    ${LZMA_DIR}/common/stream_flags_common.c
+    ${LZMA_DIR}/common/stream_flags_decoder.c
+    ${LZMA_DIR}/common/vli_decoder.c
+    ${LZMA_DIR}/common/vli_size.c
+    ${LZMA_DIR}/delta/delta_common.c
+    ${LZMA_DIR}/delta/delta_decoder.c
+    ${LZMA_DIR}/lz/lz_decoder.c
+    ${LZMA_DIR}/lzma/lzma2_decoder.c
+    ${LZMA_DIR}/lzma/lzma_decoder.c
+    ${LZMA_DIR}/simple/arm.c
+    ${LZMA_DIR}/simple/arm64.c
+    ${LZMA_DIR}/simple/armthumb.c
+    ${LZMA_DIR}/simple/ia64.c
+    ${LZMA_DIR}/simple/powerpc.c
+    ${LZMA_DIR}/simple/riscv.c
+    ${LZMA_DIR}/simple/simple_coder.c
+    ${LZMA_DIR}/simple/simple_decoder.c
+    ${LZMA_DIR}/simple/sparc.c
+    ${LZMA_DIR}/simple/x86.c
+)
+target_include_directories(nxbox_liblzma
+    PRIVATE
+        ${MODARCHIVE_DIR}/xz/common
+        ${LZMA_DIR}/check
+        ${LZMA_DIR}/common
+        ${LZMA_DIR}/delta
+        ${LZMA_DIR}/lz
+        ${LZMA_DIR}/lzma
+        ${LZMA_DIR}/rangecoder
+        ${LZMA_DIR}/simple
+    PUBLIC
+        ${LZMA_DIR}/api
+)
+# What xz's own CMake defines for this feature set (XZ_ENCODERS="" XZ_THREADS=no), minus the
+# GCC-only and CPU-dispatch bits: the CRCs fall back to the portable table code.
+target_compile_definitions(nxbox_liblzma
+    PRIVATE
+        HAVE_CHECK_CRC32 HAVE_CHECK_CRC64 HAVE_CHECK_SHA256
+        HAVE_DECODERS
+        HAVE_DECODER_LZMA1 HAVE_DECODER_LZMA2 HAVE_DECODER_DELTA
+        HAVE_DECODER_X86 HAVE_DECODER_ARM HAVE_DECODER_ARMTHUMB HAVE_DECODER_ARM64
+        HAVE_DECODER_POWERPC HAVE_DECODER_IA64 HAVE_DECODER_SPARC HAVE_DECODER_RISCV
+        HAVE_STDBOOL_H HAVE__BOOL HAVE_STDINT_H HAVE_INTTYPES_H
+        HAVE_VISIBILITY=0
+        TUKLIB_SYMBOL_PREFIX=lzma_
+        $<$<OR:$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},AMD64>,$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},x86_64>,$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},ARM64>,$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},aarch64>>:TUKLIB_FAST_UNALIGNED_ACCESS>
+    PUBLIC
+        LZMA_API_STATIC
+)
+
+# ---- libarchive (zip, 7z, rar, rar5 readers) ----
+
+set(LA_DIR "${MODARCHIVE_DIR}/libarchive")
+set(LA_SOURCES
+    ${LA_DIR}/archive_acl.c
+    ${LA_DIR}/archive_blake2s_ref.c
+    ${LA_DIR}/archive_blake2sp_ref.c
+    ${LA_DIR}/archive_check_magic.c
+    ${LA_DIR}/archive_cryptor.c
+    ${LA_DIR}/archive_entry.c
+    ${LA_DIR}/archive_entry_sparse.c
+    ${LA_DIR}/archive_entry_xattr.c
+    ${LA_DIR}/archive_hmac.c
+    ${LA_DIR}/archive_ppmd7.c
+    ${LA_DIR}/archive_ppmd8.c
+    ${LA_DIR}/archive_rb.c
+    ${LA_DIR}/archive_read.c
+    ${LA_DIR}/archive_read_add_passphrase.c
+    ${LA_DIR}/archive_read_support_format_7zip.c
+    ${LA_DIR}/archive_read_support_format_rar.c
+    ${LA_DIR}/archive_read_support_format_rar5.c
+    ${LA_DIR}/archive_read_support_format_zip.c
+    ${LA_DIR}/archive_string.c
+    ${LA_DIR}/archive_string_sprintf.c
+    ${LA_DIR}/archive_time.c
+    ${LA_DIR}/archive_util.c
+    ${LA_DIR}/archive_virtual.c
+)
+if (WIN32)
+    # The __la_* POSIX shims and BCryptGenRandom; both are WINAPI_FAMILY_APP-clean.
+    list(APPEND LA_SOURCES ${LA_DIR}/archive_windows.c ${LA_DIR}/archive_random.c)
+endif()
+
+add_library(nxbox_libarchive STATIC ${LA_SOURCES})
+add_library(NXbox::ModArchive ALIAS nxbox_libarchive)
+
+if (WIN32)
+    set(LA_CONFIG_DIR "${MODARCHIVE_DIR}/config/windows")
+elseif (DEFINED MODARCHIVE_POSIX_CONFIG_DIR)
+    # Off-target tests only: a config.h generated by libarchive's own CMake on that host.
+    set(LA_CONFIG_DIR "${MODARCHIVE_POSIX_CONFIG_DIR}")
+else()
+    message(FATAL_ERROR "mod-archive: set MODARCHIVE_POSIX_CONFIG_DIR to a libarchive config.h "
+                        "directory to build it off Windows")
+endif()
+
+target_include_directories(nxbox_libarchive
+    PRIVATE ${LA_CONFIG_DIR}
+    PUBLIC ${LA_DIR}
+)
+target_compile_definitions(nxbox_libarchive
+    PRIVATE HAVE_CONFIG_H
+    PUBLIC LIBARCHIVE_STATIC
+)
+if (MSVC)
+    target_compile_definitions(nxbox_libarchive PRIVATE
+        _CRT_SECURE_NO_DEPRECATE _CRT_NONSTDC_NO_DEPRECATE _CRT_SECURE_NO_WARNINGS)
+endif()
+target_link_libraries(nxbox_libarchive PUBLIC nxbox_liblzma ZLIB::ZLIB)
+if (WIN32)
+    target_link_libraries(nxbox_libarchive PUBLIC bcrypt)
+endif()
+
+# Third-party code: keep its warnings out of the build log (and out of /WX). Built as C11,
+# which is what xz's own CMake uses.
+foreach(target nxbox_liblzma nxbox_libarchive)
+    set_target_properties(${target} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED OFF)
+    if (MSVC)
+        target_compile_options(${target} PRIVATE /W0 /WX-)
+    else()
+        target_compile_options(${target} PRIVATE -w)
+    endif()
+endforeach()

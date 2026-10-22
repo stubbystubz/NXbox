@@ -83,6 +83,8 @@ add_executable(eden-uwp WIN32
     ui/library.h
     ui/library_screen.cpp
     ui/library_screen.h
+    ui/mod_archive.cpp
+    ui/mod_archive.h
     ui/mods.cpp
     ui/mods.h
     ui/mods_screen.cpp
@@ -120,8 +122,10 @@ add_executable(eden-uwp WIN32
 # core's NS query service).
 target_link_libraries(eden-uwp PRIVATE common core video_core audio_core frontend_common input_common glad)
 
-# ui/mods.cpp unpacks the mods' .zip files with zlib, which core already links privately.
-target_link_libraries(eden-uwp PRIVATE ZLIB::ZLIB OpenSSL::Crypto nlohmann_json::nlohmann_json)
+# ui/mod_archive.cpp unpacks the mods' .zip, .7z and .rar files through the vendored libarchive
+# (externals/mod-archive), which brings zlib and liblzma with it.
+target_link_libraries(eden-uwp PRIVATE NXbox::ModArchive ZLIB::ZLIB OpenSSL::Crypto
+                      nlohmann_json::nlohmann_json)
 
 # WinRT (CoreApplication, IFrameworkView, ApplicationData) comes from the Store umbrella import lib.
 target_link_libraries(eden-uwp PRIVATE WindowsApp.lib)
