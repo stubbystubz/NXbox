@@ -247,7 +247,7 @@ void DrawHints(Renderer& renderer, const std::vector<Hint>& hints, bool align_ri
 
 void DrawTabs(Renderer& renderer, int active, bool focused) {
     constexpr std::size_t kTabCount = 3;
-    const std::array<const wchar_t*, kTabCount> labels = {Tr(Text::NavLibrary), Tr(Text::NavShop),
+    const std::array<const wchar_t*, kTabCount> labels = {Tr(Text::NavLibrary), Tr(Text::NavFiles),
                                                           Tr(Text::NavSettings)};
     std::array<float, kTabCount> widths{};
     float total = 2.0f * kTabsPadding + kTabsGap * static_cast<float>(kTabCount - 1);

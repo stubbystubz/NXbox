@@ -24,10 +24,9 @@ class DownloadDriveTests(unittest.TestCase):
                 check=True, capture_output=True)
             subprocess.run([str(binary)], check=True, capture_output=True)
 
-    def test_both_download_paths_use_the_policy(self):
+    def test_shared_download_uses_the_policy(self):
         shared = (ROOT / "src/eden_uwp/game_download.cpp").read_text()
-        shop = (ROOT / "src/eden_uwp/ui/sources_screen.cpp").read_text()
-        for source in (shared, shop):
+        for source in (shared,):
             self.assertIn("DownloadDrive::Fits(free, total - have, OnInternalDrive(destination))",
                           source)
             self.assertIn("DownloadDrive::Pick(drives, total)", source)

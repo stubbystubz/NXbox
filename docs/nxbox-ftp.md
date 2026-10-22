@@ -1,9 +1,9 @@
 # FTP uploads in Dev Mode
 
-Open **Settings → Online → FTP server** in NXbox. The server starts disabled on
-each app launch and stops when disabled, when the library screen closes (including
+Open **Files → FTP** in NXbox. Unless `ftp-autostart` is present in LocalState,
+the server starts disabled on each app launch and stops when disabled, when the library screen closes (including
 game launch), or when the app suspends. Enable it again after resuming. Every start
-generates a new six-digit password. The settings row displays the private IPv4 URL,
+generates a new six-digit password. The Files panel displays the private IPv4 URL,
 username `nxbox`, and password. No password is written to diagnostics.
 
 The FTP root exposes `/interno` (LocalState) and `/hd` (the first external drive's
@@ -69,3 +69,9 @@ large-file transfers and visual rendering require Windows/Xbox verification.
 
 If no drive is connected when FTP starts, `/hd` is unavailable; reconnect the
 drive and restart FTP. Virtual roots cannot be renamed or deleted.
+
+The Files browser can manage the same roots locally; see [Files](nxbox-files.md).
+Additional external roots are named `/hd2`, `/hd3`, etc. in discovery order.
+The FTP panel shows the current control client's address while connected.
+An `ftp-autostart` file preserves headless startup; its first line overrides the
+random password when it contains at least eight characters.
