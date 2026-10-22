@@ -24,10 +24,23 @@ SixAxis::SixAxis(Core::HID::HIDCore& hid_core_, std::shared_ptr<NPad> npad_)
     }
 }
 
-SixAxis::~SixAxis() = default;
+SixAxis::~SixAxis() {
+    OnRelease();
+}
 
 void SixAxis::OnInit() {}
-void SixAxis::OnRelease() {}
+void SixAxis::OnRelease() {
+    for (auto& controller : controller_data) {
+        controller.sixaxis_fullkey.active_handles.clear();
+        controller.sixaxis_handheld.active_handles.clear();
+        controller.sixaxis_dual_left.active_handles.clear();
+        controller.sixaxis_dual_right.active_handles.clear();
+        controller.sixaxis_left.active_handles.clear();
+        controller.sixaxis_right.active_handles.clear();
+        controller.sixaxis_unknown.active_handles.clear();
+        controller.device->SetSixAxisSensorRequested(false);
+    }
+}
 
 void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
     std::scoped_lock shared_lock{*shared_mutex};
@@ -80,8 +93,9 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
             sixaxis_left_lifo_state = {};
             sixaxis_right_lifo_state = {};
 
-            if (controller.sixaxis_sensor_enabled && Settings::values.motion_enabled.GetValue()) {
-                controller.sixaxis_at_rest = true;
+            controller.sixaxis_at_rest = true;
+            if (controller.device->IsSixAxisSensorRequested() &&
+                Settings::values.motion_enabled.GetValue()) {
                 for (std::size_t e = 0; e < motion_state.size(); ++e) {
                     controller.sixaxis_at_rest =
                         controller.sixaxis_at_rest && motion_state[e].is_at_rest;
@@ -89,7 +103,8 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
             }
 
             const auto set_motion_state = [&](Core::HID::SixAxisSensorState& state,
-                                              const Core::HID::ControllerMotion& hid_state) {
+                                              const Core::HID::ControllerMotion& hid_state,
+                                              const SixaxisParameters& parameters) {
                 using namespace std::literals::chrono_literals;
                 static constexpr Core::HID::SixAxisSensorState default_motion_state = {
                     .delta_time = std::chrono::nanoseconds(5ms).count(),
@@ -102,7 +117,7 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
                         },
                     .attribute = {1},
                 };
-                if (!controller.sixaxis_sensor_enabled) {
+                if (parameters.active_handles.empty()) {
                     state = default_motion_state;
                     return;
                 }
@@ -123,24 +138,30 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
                 ASSERT(false);
                 break;
             case Core::HID::NpadStyleIndex::Fullkey:
-                set_motion_state(sixaxis_fullkey_state, motion_state[0]);
+                set_motion_state(sixaxis_fullkey_state, motion_state[0],
+                                 controller.sixaxis_fullkey);
                 break;
             case Core::HID::NpadStyleIndex::Handheld:
-                set_motion_state(sixaxis_handheld_state, motion_state[0]);
+                set_motion_state(sixaxis_handheld_state, motion_state[0],
+                                 controller.sixaxis_handheld);
                 break;
             case Core::HID::NpadStyleIndex::JoyconDual:
-                set_motion_state(sixaxis_dual_left_state, motion_state[0]);
-                set_motion_state(sixaxis_dual_right_state, motion_state[1]);
+                set_motion_state(sixaxis_dual_left_state, motion_state[0],
+                                 controller.sixaxis_dual_left);
+                set_motion_state(sixaxis_dual_right_state, motion_state[1],
+                                 controller.sixaxis_dual_right);
                 break;
             case Core::HID::NpadStyleIndex::JoyconLeft:
-                set_motion_state(sixaxis_left_lifo_state, motion_state[0]);
+                set_motion_state(sixaxis_left_lifo_state, motion_state[0], controller.sixaxis_left);
                 break;
             case Core::HID::NpadStyleIndex::JoyconRight:
-                set_motion_state(sixaxis_right_lifo_state, motion_state[1]);
+                set_motion_state(sixaxis_right_lifo_state, motion_state[1],
+                                 controller.sixaxis_right);
                 break;
             case Core::HID::NpadStyleIndex::Pokeball:
                 using namespace std::literals::chrono_literals;
-                set_motion_state(sixaxis_fullkey_state, motion_state[0]);
+                set_motion_state(sixaxis_fullkey_state, motion_state[0],
+                                 controller.sixaxis_fullkey);
                 sixaxis_fullkey_state.delta_time = std::chrono::nanoseconds(15ms).count();
                 break;
             default:
@@ -283,8 +304,23 @@ Result SixAxis::SetSixAxisEnabled(const Core::HID::SixAxisSensorHandle& sixaxis_
         return is_valid;
     }
 
+    std::scoped_lock sensor_lock{*shared_mutex};
+    auto& active_handles = GetSixaxisState(sixaxis_handle).active_handles;
+    const auto handle_key = std::pair{sixaxis_handle.npad_type, sixaxis_handle.device_index};
+    if (sixaxis_status) {
+        active_handles.insert(handle_key);
+    } else {
+        active_handles.erase(handle_key);
+    }
     auto& controller = GetControllerFromHandle(sixaxis_handle);
-    controller.sixaxis_sensor_enabled = sixaxis_status;
+    controller.device->SetSixAxisSensorRequested(
+        !controller.sixaxis_fullkey.active_handles.empty() ||
+        !controller.sixaxis_handheld.active_handles.empty() ||
+        !controller.sixaxis_dual_left.active_handles.empty() ||
+        !controller.sixaxis_dual_right.active_handles.empty() ||
+        !controller.sixaxis_left.active_handles.empty() ||
+        !controller.sixaxis_right.active_handles.empty() ||
+        !controller.sixaxis_unknown.active_handles.empty());
     return ResultSuccess;
 }
 

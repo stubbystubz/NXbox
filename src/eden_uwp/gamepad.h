@@ -126,8 +126,10 @@ public:
         for (std::size_t slot = 0; slot < 4; ++slot) {
             auto& controller = *hid.GetEmulatedControllerByIndex(slot);
             const bool present = devices[slot].has_value();
-            if (devices[slot] != previous_devices[slot])
+            if (devices[slot] != previous_devices[slot]) {
                 stick_motions[slot] = {};
+                view_gestures[slot] = {};
+            }
             if (present || slot == 0)
                 AutoStyle(controller, hid.GetSupportedStyleTag(), slot);
             const bool allowed =
@@ -146,13 +148,19 @@ public:
                     controller.Connect();
             }
             const auto reading = ReadGamepad(devices[slot]);
-            PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot));
+            const bool sensor_requested =
+                slot == 0 && (controller.IsSixAxisSensorRequested() ||
+                              hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)
+                                  ->IsSixAxisSensorRequested());
+            PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot),
+                       sensor_requested && allowed && present &&
+                           Settings::values.motion_enabled.GetValue());
         }
         previous_devices = devices;
     }
 
     void PollPlayer(std::size_t slot, const winrt::Windows::Gaming::Input::GamepadReading& reading,
-                    bool suppress_guest) {
+                    bool suppress_guest, bool sensor_requested) {
         using namespace winrt::Windows::Gaming::Input;
         const PadIdentifier pad{.port = slot};
         const bool primary = PlayerOneControls(slot);
@@ -177,11 +185,20 @@ public:
             !suppress_guest) {
             Recording::toggles.fetch_add(1);
         }
-        const auto motion = stick_motions[slot].Update(
+        const bool minus_pressed = view_gestures[slot].Update(
             view, static_cast<float>(reading.RightThumbstickX),
             static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
         if (primary && view && right_click)
-            stick_motions[slot].CancelTap();
+            view_gestures[slot].CancelTap();
+        const bool modifier =
+            (reading.Buttons & GamepadButtons::LeftThumbstick) != GamepadButtons::None ||
+            (keys & (1u << Settings::NativeButton::LStick)) != 0;
+        const auto motion =
+            stick_motions[slot].Update(sensor_requested && !suppress_guest && !combo_blocked,
+                                       modifier, static_cast<float>(reading.LeftThumbstickX),
+                                       static_cast<float>(reading.LeftThumbstickY),
+                                       static_cast<float>(reading.RightThumbstickX),
+                                       static_cast<float>(reading.RightThumbstickY), now);
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -218,9 +235,9 @@ public:
             pressed = pressed || (physical_keys & (1u << physical)) != 0 ||
                       (scripted_keys & (1u << i)) != 0;
             if (i == Settings::NativeButton::Minus)
-                pressed = motion.minus_pressed;
-            if (i == Settings::NativeButton::RStick &&
-                (motion.suppress_right_stick || (primary && record_shortcut.consume_stick)))
+                pressed = minus_pressed;
+            if ((i == Settings::NativeButton::LStick && motion.suppress_sticks) ||
+                (i == Settings::NativeButton::RStick && primary && record_shortcut.consume_stick))
                 pressed = false;
             if (combo_blocked &&
                 (i == Settings::NativeButton::Minus || i == Settings::NativeButton::Plus)) {
@@ -240,14 +257,20 @@ public:
                 return -1.0f;
             return static_cast<float>(value);
         };
-        SetAxis(pad, 0, key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX));
-        SetAxis(pad, 1, key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY));
+        SetAxis(pad, 0,
+                motion.suppress_sticks
+                    ? 0.0f
+                    : key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX));
+        SetAxis(pad, 1,
+                motion.suppress_sticks
+                    ? 0.0f
+                    : key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY));
         SetAxis(pad, 2,
-                motion.suppress_right_stick
+                motion.suppress_sticks
                     ? 0.0f
                     : key_axis(KeyRightStickRight, KeyRightStickLeft, reading.RightThumbstickX));
         SetAxis(pad, 3,
-                motion.suppress_right_stick
+                motion.suppress_sticks
                     ? 0.0f
                     : key_axis(KeyRightStickUp, KeyRightStickDown, reading.RightThumbstickY));
     }
@@ -310,6 +333,7 @@ private:
     GamepadSlots<winrt::Windows::Gaming::Input::Gamepad> previous_devices;
     int max_players = 4;
     std::array<StickMotion, 4> stick_motions;
+    std::array<ViewGesture, 4> view_gestures;
     HomeComboState home_combo;
     HomeComboAction home_combo_action{};
     HomeButtonEdge home_edge;

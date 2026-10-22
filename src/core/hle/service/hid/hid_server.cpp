@@ -423,6 +423,7 @@ Result IHidServer::StartSixAxisSensor(Core::HID::SixAxisSensorHandle sixaxis_han
               sixaxis_handle.npad_type, sixaxis_handle.npad_id, sixaxis_handle.device_index,
               aruid.pid);
 
+    // SixAxis tracks this handle independently and publishes demand to the input frontend.
     R_RETURN(GetResourceManager()->GetSixAxis()->SetSixAxisEnabled(sixaxis_handle, true));
 }
 

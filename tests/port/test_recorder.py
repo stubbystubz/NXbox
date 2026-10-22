@@ -53,12 +53,11 @@ int main(int, char** argv) {
     assert(!shortcut.Update(false, false, false) && !shortcut.consume_stick);
     assert(!shortcut.Update(false, true, false));
     assert(!shortcut.Update(true, true, false)); // View requires a fresh right-stick click.
-    EdenXbox::StickMotion motion;
-    const auto now = EdenXbox::StickMotion::Clock::now();
-    const auto tilted = motion.Update(true, 1, 0, now);
-    assert(tilted.accel[0] > 0);
+    EdenXbox::ViewGesture motion;
+    const auto now = EdenXbox::ViewGesture::Clock::now();
+    motion.Update(true, 1, 0, now);
     motion.CancelTap();
-    assert(!motion.Update(false, 0, 0, now + std::chrono::milliseconds(100)).minus_pressed);
+    assert(!motion.Update(false, 0, 0, now + std::chrono::milliseconds(100)));
     Ring ring;
     const int a = ring.Acquire(), b = ring.Acquire(), c = ring.Acquire();
     assert(a >= 0 && b >= 0 && c >= 0 && a != b && b != c && a != c);

@@ -14,94 +14,93 @@ struct StickMotionSample {
     std::array<float, 3> accel{0.0f, 0.0f, -1.0f};
     std::array<float, 3> gyro{};
     std::uint64_t delta_timestamp{16667};
-    bool minus_pressed{};
-    bool suppress_right_stick{};
+    bool suppress_sticks{};
 };
 
-// Portable sensor/gesture state. Angles are radians; Eden consumes g and turns/second.
+// Portable synthesis in g and turns/second, matching HID's SDL sensor axes.
 class StickMotion {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr float kPi = 3.14159265358979323846f;
     static constexpr float kMaxTilt = kPi / 3.0f;
-    static constexpr float kReleaseSeconds = 0.15f;
+    static constexpr float kAimTurnsPerSecond = 0.5f;
+    static constexpr float kTiltTurnsPerSecond = 1.0f;
     static constexpr float kDeadzone = 0.15f;
 
-    // Frontend chords consume View without interrupting the current tilt gesture.
-    void CancelTap() {
-        cancelled = true;
-    }
-
-    StickMotionSample Update(bool view, float x, float y, Clock::time_point now,
-                             bool blocked = false) {
-        const float elapsed = initialized ? std::max(0.0f, Seconds(now - last)) : 1.0f / 60.0f;
-        // MotionInput ignores intervals above 100 ms. Bound the simulated step after a stall.
+    StickMotionSample Update(bool sensor_enabled, bool modifier, float left_x, float left_y,
+                             float right_x, float right_y, Clock::time_point now) {
+        const float elapsed =
+            initialized ? std::chrono::duration<float>(now - last).count() : 1.0f / 60.0f;
         const float dt = std::clamp(elapsed, 0.000001f, 0.1f);
         initialized = true;
         last = now;
         StickMotionSample sample;
         sample.delta_timestamp = static_cast<std::uint64_t>(dt * 1000000.0f);
-        sample.suppress_right_stick = view;
-        if (view && !was_view) {
-            pressed_at = now;
-            moved = false;
-            cancelled = false;
+        sample.suppress_sticks = sensor_enabled && modifier;
+        if (!sample.suppress_sticks) {
+            tilt_roll = tilt_pitch = aim_pitch = 0.0f;
+            return sample;
         }
-        if (view) {
-            moved = moved || std::abs(x) > kDeadzone || std::abs(y) > kDeadzone;
-            cancelled = cancelled || blocked;
+        const float old_roll = tilt_roll;
+        const float old_pitch = tilt_pitch;
+        const float step = kTiltTurnsPerSecond * 2.0f * kPi * dt;
+        tilt_roll += std::clamp(Axis(left_x) * kMaxTilt - tilt_roll, -step, step);
+        tilt_pitch += std::clamp(Axis(left_y) * kMaxTilt - tilt_pitch, -step, step);
+        const float pitch_rate = Axis(right_y) * kAimTurnsPerSecond;
+        const float yaw_rate = -Axis(right_x) * kAimTurnsPerSecond;
+        aim_pitch = std::remainder(aim_pitch + pitch_rate * 2.0f * kPi * dt, 2.0f * kPi);
+        const float pitch = tilt_pitch + aim_pitch;
+        // Gravity in controller space: R_forward(roll) * R_right(pitch).
+        sample.accel = {std::sin(tilt_roll), -std::cos(tilt_roll) * std::sin(pitch),
+                        -std::cos(tilt_roll) * std::cos(pitch)};
+        const float roll_rate = (tilt_roll - old_roll) / (dt * 2.0f * kPi);
+        // Yaw is about world up, expressed in controller space using gravity.
+        sample.gyro = {pitch_rate + (tilt_pitch - old_pitch) / (dt * 2.0f * kPi),
+                       roll_rate * std::cos(pitch), -roll_rate * std::sin(pitch)};
+        for (std::size_t axis = 0; axis < sample.gyro.size(); ++axis) {
+            sample.gyro[axis] -= sample.accel[axis] * yaw_rate;
         }
-        if (!view && was_view) {
-            sample.minus_pressed =
-                !moved && !cancelled && !blocked && Seconds(now - pressed_at) < 0.25f;
-        }
-
-        const float old_roll = roll;
-        const float old_pitch = pitch;
-        const bool active = view && !blocked;
-        if (active) {
-            // Limit sensor speed as well as angle: a full stick reversal must not exceed
-            // MotionInput's gyro range and lose rotation through clipping.
-            const float step = 4.0f * kPi * dt;
-            roll += std::clamp(Axis(x) * kMaxTilt - roll, -step, step);
-            pitch += std::clamp(Axis(y) * kMaxTilt - pitch, -step, step);
-        } else {
-            if (was_active) {
-                released_at = now;
-                release_roll = roll;
-                release_pitch = pitch;
-            }
-            const float t = std::clamp(Seconds(now - released_at) / kReleaseSeconds, 0.0f, 1.0f);
-            const float remaining = 1.0f - t * t * (3.0f - 2.0f * t);
-            roll = release_roll * remaining;
-            pitch = release_pitch * remaining;
-        }
-        // Same axes/signs as SDL's sensor conversion: pitch about right, roll about forward.
-        // R = R_forward(roll) * R_right(pitch); gravity is transformed into controller space.
-        sample.accel = {std::sin(roll), -std::cos(roll) * std::sin(pitch),
-                        -std::cos(roll) * std::cos(pitch)};
-        const float mid_pitch = (old_pitch + pitch) * 0.5f;
-        const float roll_rate = (roll - old_roll) / (dt * 2.0f * kPi);
-        sample.gyro = {(pitch - old_pitch) / (dt * 2.0f * kPi), roll_rate * std::cos(mid_pitch),
-                       -roll_rate * std::sin(mid_pitch)};
-        was_view = view;
-        was_active = active;
         return sample;
     }
 
 private:
-    static float Seconds(Clock::duration duration) {
-        return std::chrono::duration<float>(duration).count();
-    }
     static float Axis(float value) {
         const float magnitude =
             std::clamp((std::abs(value) - kDeadzone) / (1.0f - kDeadzone), 0.0f, 1.0f);
         return std::copysign(magnitude, value);
     }
 
-    Clock::time_point last{}, pressed_at{}, released_at{};
-    float roll{}, pitch{}, release_roll{}, release_pitch{};
-    bool initialized{}, was_view{}, was_active{}, moved{}, cancelled{};
+    Clock::time_point last{};
+    float tilt_roll{}, tilt_pitch{}, aim_pitch{};
+    bool initialized{};
+};
+
+// Keep View tap/recording/HOME behavior independent of synthetic motion.
+class ViewGesture {
+public:
+    using Clock = std::chrono::steady_clock;
+    void CancelTap() {
+        cancelled = true;
+    }
+    bool Update(bool view, float x, float y, Clock::time_point now, bool blocked = false) {
+        if (view && !was_view) {
+            pressed_at = now;
+            moved = cancelled = false;
+        }
+        if (view) {
+            moved = moved || std::abs(x) > StickMotion::kDeadzone ||
+                    std::abs(y) > StickMotion::kDeadzone;
+            cancelled = cancelled || blocked;
+        }
+        const bool tapped = !view && was_view && !moved && !cancelled && !blocked &&
+                            std::chrono::duration<float>(now - pressed_at).count() < 0.25f;
+        was_view = view;
+        return tapped;
+    }
+
+private:
+    Clock::time_point pressed_at{};
+    bool was_view{}, moved{}, cancelled{};
 };
 
 } // namespace EdenXbox

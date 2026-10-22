@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <set>
+#include <utility>
+
 #include "common/common_types.h"
 #include "hid_core/hid_types.h"
 #include "hid_core/resources/controller_base.h"
@@ -61,6 +64,7 @@ private:
     static constexpr std::size_t NPAD_COUNT = 10;
 
     struct SixaxisParameters {
+        std::set<std::pair<Core::HID::NpadStyleIndex, Core::HID::DeviceIndex>> active_handles;
         bool is_fusion_enabled{true};
         bool unaltered_passthrough{false};
         Core::HID::SixAxisSensorFusionParameters fusion{};
@@ -75,7 +79,6 @@ private:
 
         // Motion parameters
         bool sixaxis_at_rest{true};
-        bool sixaxis_sensor_enabled{true};
         SixaxisParameters sixaxis_fullkey{};
         SixaxisParameters sixaxis_handheld{};
         SixaxisParameters sixaxis_dual_left{};
