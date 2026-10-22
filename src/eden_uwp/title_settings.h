@@ -88,6 +88,88 @@ inline std::filesystem::path File(const std::filesystem::path& local, std::strin
     return local / "settings" / (normalized + ".txt");
 }
 
+// 3 denotes auto; 1 remains the legacy on/2x spelling.
+inline std::optional<unsigned> ParseFrameGeneration(std::string_view value) {
+    if (value == "off" || value == "0")
+        return 0;
+    if (value == "1" || value == "2" || value == "2x")
+        return 2;
+    if (value == "4" || value == "4x")
+        return 4;
+    if (value == "auto" || value == "3")
+        return 3;
+    return std::nullopt;
+}
+inline std::optional<unsigned> ReadFrameGeneration(std::istream& in) {
+    std::optional<unsigned> result;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = ParseLine(line);
+        if (entry && (entry->label == "frame_gen" || entry->label == "frame_generation"))
+            if (const auto mode = ParseFrameGeneration(entry->value))
+                result = mode;
+    }
+    return result;
+}
+struct FrameGenerationDefault {
+    std::string_view title;
+    unsigned mode;
+};
+// Series X, 60 Hz: Odyssey ~24 real fps, uneven 2x; MK8D 28-29 real,
+// 2x measured even 16.68 ms gaps. Auto reselects for the active output.
+inline constexpr std::array<FrameGenerationDefault, 2> kFrameGenerationDefaults{
+    {{"0100000000010000", 3}, {"0100152000022000", 2}}};
+inline unsigned DefaultFrameGeneration(std::string_view title) {
+    for (const auto& entry : kFrameGenerationDefaults)
+        if (entry.title == title)
+            return entry.mode;
+    return 0;
+}
+inline unsigned ResolveFrameGeneration(std::string_view title, std::optional<unsigned> global,
+                                       std::optional<unsigned> per_title) {
+    return per_title.value_or(global.value_or(DefaultFrameGeneration(title)));
+}
+inline unsigned EffectiveFrameGeneration(const std::filesystem::path& local,
+                                         std::string_view title) {
+    std::ifstream global(local / "eden_settings.txt");
+    std::ifstream game(File(local, title));
+    return ResolveFrameGeneration(title, ReadFrameGeneration(global), ReadFrameGeneration(game));
+}
+// nullopt restores inheritance. Preserve every unrelated setting and comment.
+inline bool SaveFrameGeneration(const std::filesystem::path& file, std::optional<unsigned> mode) {
+    if (file.empty() || (mode && *mode != 0 && *mode != 2 && *mode != 3 && *mode != 4))
+        return false;
+    std::error_code error;
+    const bool exists = std::filesystem::exists(file, error);
+    if (error)
+        return false;
+    std::ifstream in(file);
+    if (exists && !in)
+        return false;
+    std::string content;
+    for (std::string line; std::getline(in, line);) {
+        const auto entry = ParseLine(line);
+        if (!entry || (entry->label != "frame_gen" && entry->label != "frame_generation"))
+            content += line + '\n';
+    }
+    if (in.bad())
+        return false;
+    in.close();
+    std::filesystem::create_directories(file.parent_path(), error);
+    if (error)
+        return false;
+    std::ofstream out(file, std::ios::trunc);
+    out << content;
+    if (mode)
+        out << "frame_generation="
+            << (*mode == 3   ? "auto"
+                : *mode == 4 ? "4"
+                : *mode == 2 ? "1"
+                             : "0")
+            << '\n';
+    out.close();
+    return !out.fail();
+}
+
 // Replace all resolution entries while retaining comments and other settings verbatim.
 inline std::string WithResolution(const std::string& content, int value) {
     std::istringstream in(content);

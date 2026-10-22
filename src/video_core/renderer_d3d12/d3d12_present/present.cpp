@@ -496,6 +496,8 @@ struct FpsCounter::Impl {
                 static_cast<unsigned>(std::clamp(std::round(displayed_sample.fps), 0.0, 9999.0));
             std::snprintf(text.data(), text.size(), "%u FPS / %u FPS", displayed, fps);
         }
+        if (const auto target = frame_generation_target.load(std::memory_order_relaxed))
+            std::snprintf(text.data(), text.size(), "%u FG / %u FPS", target, fps);
         FpsConstants constants;
         constants.length = static_cast<unsigned>(std::char_traits<char>::length(text.data()));
         for (unsigned i = 0; i < constants.length; ++i)

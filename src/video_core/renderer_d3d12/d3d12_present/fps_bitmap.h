@@ -27,6 +27,8 @@ constexpr std::uint32_t FpsGlyph(char character) {
         return 0x6996996;
     case '9':
         return 0x688E996;
+    case 'G':
+        return 0xE997196;
     case 'F':
         return 0x111711F;
     case 'P':

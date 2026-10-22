@@ -961,6 +961,9 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                 winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
             const auto title = fmt::format("{:016X}", title_id);
             ApplyEdenSettingsFile(TitleSettings::File(local_state, title));
+            _putenv_s("NXBOX_FRAME_GEN_SETTING",
+                      std::to_string(TitleSettings::EffectiveFrameGeneration(local_state, title))
+                          .c_str());
             const char* jit_cache = std::getenv("NXBOX_JIT_CACHE");
             if (jit_cache && std::string_view{jit_cache} == "1") {
                 try {

@@ -461,3 +461,8 @@
 
     {Text::MaxPlayersTitle, L"Jogadores locais"},
     {Text::MaxPlayersHint, L"Cada controle conectado vira um jogador, até 4."},
+
+    {Text::FrameGenerationAuto, L"Auto (fixo)"}, {Text::FrameGenerationDefault, L"Padrão"},
+    {Text::FrameGenerationTargetHint,
+     L"Padrão usa a escolha global e depois a predefinição do jogo. Auto fixa uma cadência "
+     L"uniforme. 40 FG exige saída em 120 Hz."},

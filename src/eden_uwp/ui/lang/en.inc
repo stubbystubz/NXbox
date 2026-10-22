@@ -440,3 +440,8 @@
 
     {Text::MaxPlayersTitle, L"Local players"},
     {Text::MaxPlayersHint, L"Each connected controller becomes a player, up to 4."},
+
+    {Text::FrameGenerationAuto, L"Auto (locked)"}, {Text::FrameGenerationDefault, L"Default"},
+    {Text::FrameGenerationTargetHint,
+     L"Default inherits the global choice, then the game preset. Auto locks an even display rate. "
+     L"40 FG requires 120 Hz output."},

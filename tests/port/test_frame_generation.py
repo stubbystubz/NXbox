@@ -165,6 +165,7 @@ struct Generator {
         ResourcePtr readback = std::make_shared<Resource>();
         u64 tick{}, sample_tick{}, sample_id{};
         unsigned cells{}, generation_mode{2};
+        double game_seconds{1.0 / 30};
         bool pending{};
     };
     std::array<Slot, 3> slots;
@@ -285,6 +286,7 @@ int main() {
         for marker in (
             "        if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {",
             "        if (frame_generation_enabled)\n            Common::FpsOverlay::Presented();",
+            "        if (frame_generation_enabled) {",
         ):
             if marker.endswith("{"):
                 start = source.index(marker)
@@ -301,6 +303,12 @@ int main() {
         start = source.index("        unsigned pacing_interval = 1;")
         end = source.index("        // Each swapchain buffer", start)
         source = source[:start] + source[end:]
+        source = re.sub(
+            r"if \(frame_generation_mode == 3 && !frame_generation_failed &&\s*"
+            r"target_policy.current.output\)\s*return swapchain->Present\(target_interval, 0\);\s*",
+            "",
+            source,
+        )
         source = source.replace(
             """[&] {
                     if (frame_pacing_enabled)
@@ -321,7 +329,7 @@ int main() {
         )
         self.assertEqual(
             hashlib.sha256(re.sub(r"\s+", "", draw).encode()).hexdigest(),
-            "557f607200e274663f207b672f06194f934ad7cb381fa4ffd4a3cf882a1e1f27",
+            "4dd24b445073d6cd89310ba79e3d98bc240ebaedf059a0068845a3ffde5c9d0e",
         )
 
     def test_failure_cannot_replace_real_swapchain_image(self):
@@ -461,6 +469,7 @@ struct Presenter {
     Context context;
     std::array<ResourcePtr, 2> buffers;
     std::array<unsigned, 2> present_ticks{7, 8};
+    unsigned target_interval{1};
     Swapchain* swapchain;
     Generator* frame_generator;
 // BODY

@@ -134,7 +134,8 @@ constexpr int kActionPlay = 0;
 constexpr int kActionMods = 1;
 constexpr int kActionDetails = 2;
 constexpr int kActionResolution = 3;
-constexpr int kActionCount = 4;
+constexpr int kActionFrameGeneration = 4;
+constexpr int kActionCount = 5;
 
 constexpr std::size_t Idx(int index) {
     return static_cast<std::size_t>(index);
@@ -236,7 +237,10 @@ public:
         shader_preload_ = RendererSettings::ReadShaderPreload(local_state_);
         async_shaders_ = RendererSettings::ReadAsyncShaders(local_state_);
         upscaler_mode_ = RendererSettings::ReadUpscaler(local_state_);
-        frame_generation_ = RendererSettings::ReadFrameGenerationMode(local_state_);
+        {
+            std::ifstream global(local_state_ / "eden_settings.txt");
+            frame_generation_ = TitleSettings::ReadFrameGeneration(global).value_or(5);
+        }
         frame_pacing_ = RendererSettings::ReadFramePacing(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
         button_layout_ = RendererSettings::ReadButtonLayout(local_state_);
@@ -608,6 +612,27 @@ private:
             // Never start a game or another download while replacing the running package.
             return;
         }
+        if (resolution_open_ && frame_generation_sheet_) {
+            if (input_.Pressed(Button::B)) {
+                resolution_open_ = false;
+                input_.ConsumeUntilRelease();
+            }
+            if (input_.Pressed(Button::Left) || input_.Pressed(Button::Up))
+                resolution_choice_ = std::max(0, resolution_choice_ - 1);
+            if (input_.Pressed(Button::Right) || input_.Pressed(Button::Down))
+                resolution_choice_ = std::min(4, resolution_choice_ + 1);
+            if (input_.Pressed(Button::A)) {
+                const std::array<std::optional<unsigned>, 5> modes{std::nullopt, 0, 2, 4, 3};
+                resolution_save_failed_ = !TitleSettings::SaveFrameGeneration(
+                    TitleSettings::File(local_state_, Game(selected_).title_id),
+                    modes[Idx(resolution_choice_)]);
+                if (!resolution_save_failed_) {
+                    resolution_open_ = false;
+                    input_.ConsumeUntilRelease();
+                }
+            }
+            return;
+        }
         if (resolution_open_) {
             if (input_.Pressed(Button::B)) {
                 resolution_open_ = false;
@@ -848,6 +873,19 @@ private:
             } else if (action_ == kActionResolution) {
                 resolution_global_ = false;
                 OpenResolution();
+            } else if (action_ == kActionFrameGeneration) {
+                std::ifstream title(TitleSettings::File(local_state_, Game(selected_).title_id));
+                const auto mode = TitleSettings::ReadFrameGeneration(title);
+                resolution_choice_ = !mode        ? 0
+                                     : *mode == 0 ? 1
+                                     : *mode == 2 ? 2
+                                     : *mode == 4 ? 3
+                                                  : 4;
+                resolution_global_ = false;
+                frame_generation_sheet_ = true;
+                resolution_save_failed_ = false;
+                resolution_open_ = true;
+                input_.ConsumeUntilRelease();
             }
             break;
         case Layer::Nav:
@@ -873,6 +911,7 @@ private:
     }
 
     void OpenResolution() {
+        frame_generation_sheet_ = false;
         if (!resolution_global_ && !HasGame()) {
             return;
         }
@@ -1014,8 +1053,14 @@ private:
             return;
         }
         if (SelectedSetting() == Setting::FrameGeneration) {
-            const unsigned next = frame_generation_ == 0 ? 2 : frame_generation_ == 2 ? 4 : 0;
-            if (RendererSettings::SaveFrameGenerationMode(local_state_, next))
+            const unsigned next = frame_generation_ == 0   ? 2
+                                  : frame_generation_ == 2 ? 4
+                                  : frame_generation_ == 4 ? 3
+                                  : frame_generation_ == 3 ? 5
+                                                           : 0;
+            if (TitleSettings::SaveFrameGeneration(local_state_ / "eden_settings.txt",
+                                                   next == 5 ? std::nullopt
+                                                             : std::optional<unsigned>(next)))
                 frame_generation_ = next;
             else
                 Toast(Tr(Text::ResolutionSaveFailed), now);
@@ -1549,7 +1594,7 @@ private:
     void DrawActions() {
         const std::array<const wchar_t*, kActionCount> labels = {
             Tr(Text::ActionPlay), Tr(Text::ActionMods), Tr(Text::ActionDetails),
-            Tr(Text::ResolutionTitle)};
+            Tr(Text::ResolutionTitle), Tr(Text::FrameGenerationTitle)};
         float x = kMargin;
         for (int i = 0; i < kActionCount; ++i) {
             const bool primary = i == kActionPlay;
@@ -1902,9 +1947,12 @@ private:
                     upscaler_mode_ == "fsr1" ? Text::UpscalerFsr : Text::UpscalerBilinear),
               Theme::kTextSecondary, Tr(Text::UpscalerHint)},
              {Tr(Text::FrameGenerationTitle),
-              Tr(frame_generation_ == 4 ? Text::FrameGeneration4x :
-                 frame_generation_ == 2 ? Text::FrameGeneration2x : Text::FrameGenerationOff), Theme::kTextSecondary,
-              Tr(Text::FrameGenerationHint)},
+              Tr(frame_generation_ == 5   ? Text::FrameGenerationDefault
+                 : frame_generation_ == 3 ? Text::FrameGenerationAuto
+                 : frame_generation_ == 4 ? Text::FrameGeneration4x
+                 : frame_generation_ == 2 ? Text::FrameGeneration2x
+                                          : Text::FrameGenerationOff),
+              Theme::kTextSecondary, Tr(Text::FrameGenerationHint)},
              {Tr(Text::FramePacingTitle), Tr(frame_pacing_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::FramePacingHint)},
              {Tr(Text::ShowFps), Tr(show_fps_ ? Text::NextendoOn : Text::NextendoOff),
@@ -2104,6 +2152,33 @@ private:
         DrawSheet(renderer_, sheet);
         const float left = sheet.left + kSheetPadding;
         const float right = sheet.right - kSheetPadding;
+        if (frame_generation_sheet_) {
+            renderer_.DrawString(Tr(Text::FrameGenerationTitle), Font::Heading,
+                                 RectF(left, sheet.top + 40.0f, right, sheet.top + 110.0f),
+                                 Theme::kText);
+            renderer_.DrawString(Game(selected_).name, Font::Meta,
+                                 RectF(left, sheet.top + 115.0f, right, sheet.top + 155.0f),
+                                 Theme::kTextSecondary);
+            const std::array<Text, 5> labels{Text::FrameGenerationDefault, Text::FrameGenerationOff,
+                                             Text::FrameGeneration2x, Text::FrameGeneration4x,
+                                             Text::FrameGenerationAuto};
+            float x = left;
+            for (int i = 0; i < 5; ++i) {
+                const std::wstring label = Tr(labels[Idx(i)]);
+                const float width = PillWidth(renderer_, label, false);
+                DrawChoicePill(
+                    renderer_,
+                    RectF(x, sheet.top + 200.0f, x + width, sheet.top + 200.0f + kPillHeight),
+                    label, false, resolution_choice_ == i);
+                x += width + kPillGap;
+            }
+            renderer_.DrawString(Tr(resolution_save_failed_ ? Text::ResolutionSaveFailed
+                                                            : Text::FrameGenerationTargetHint),
+                                 Font::Body,
+                                 RectF(left, sheet.top + 300.0f, right, sheet.top + 440.0f),
+                                 Theme::kTextSecondary);
+            return;
+        }
         renderer_.DrawString(Tr(Text::ResolutionTitle), Font::Heading,
                              RectF(left, sheet.top + 40.0f, right, sheet.top + 110.0f),
                              Theme::kText);
@@ -2201,6 +2276,7 @@ private:
     std::vector<LibraryDeleteFile> delete_files_;
     std::future<std::vector<LibraryDeleteFile>> delete_candidates_;
     std::future<bool> delete_result_;
+    bool frame_generation_sheet_ = false;
     bool resolution_open_ = false;
     bool resolution_save_failed_ = false;
     int resolution_choice_ = 0;
