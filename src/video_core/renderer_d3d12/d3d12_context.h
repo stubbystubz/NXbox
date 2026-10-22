@@ -597,6 +597,9 @@ public:
                                D3D12_RESOURCE_STATES state);
     void ValidateViewFormat(const ResourcePtr& resource, DXGI_FORMAT format,
                             const char* call) const;
+    // Optional capture resources must fail instead of draining the render queue on pressure.
+    ResourcePtr CreateResourceNoWait(const D3D12_RESOURCE_DESC& desc, D3D12_HEAP_TYPE heap,
+                                     D3D12_RESOURCE_STATES state);
     ResourcePtr CreateBuffer(u64 size, D3D12_HEAP_TYPE heap);
     ID3D12Device* Device() const {
         return device.Get();

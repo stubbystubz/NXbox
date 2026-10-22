@@ -302,6 +302,14 @@ int main() {
                 }""",
             "[&] { return swapchain->Present(1, 0); }",
         )
+        # An inactive recorder emits no GPU commands. Remove the separate recorder
+        # integration boundary before comparing the frozen pre-framegen sequence.
+        recorder = """        if (!recorder)
+            recorder = std::make_unique<Present::Recorder>(context);
+        recorder->Capture(buffers[index], Rtv(index), !layers.empty());
+"""
+        self.assertEqual(source.count(recorder), 1)
+        source = source.replace(recorder, "")
         source = source.replace("        RecordPresentation();", "")
         source = source.replace("UINT index =", "const UINT index =")
         normalized = re.sub(r"\s+", "", source)
@@ -449,7 +457,15 @@ struct RasterizerD3D12 { unsigned notifications{}; void NotifyFencesSubmitted() 
 struct Generator { ResourcePtr real; ResourcePtr Current() { return real; } };
 void Check(int value, const char*, void*) { assert(value == 0); }
 namespace Common::FpsOverlay { unsigned displayed{}; void Presented() { ++displayed; } }
+struct Recorder {
+    std::vector<int> captures;
+    void Capture(const ResourcePtr& source, unsigned, bool game) {
+        assert(game); captures.push_back(source->pixel);
+    }
+};
 struct Presenter {
+    Recorder* recorder{};
+    unsigned Rtv(unsigned index) { return index; }
     void RecordPresentation() {}
     Context context;
     std::array<ResourcePtr, 2> buffers;
@@ -468,6 +484,8 @@ int main() {
     generator.real->handle.value = generator.real.get();
     presenter.swapchain = &swapchain;
     presenter.frame_generator = &generator;
+    Recorder recorder;
+    presenter.recorder = &recorder;
     auto generated = std::make_shared<Resource>(Resource{15});
     generated->handle.value = generated.get();
     RasterizerD3D12 rasterizer;
@@ -478,6 +496,7 @@ int main() {
     assert(presenter.present_ticks[0] == 1);
     assert(presenter.context.acknowledged == 1 && rasterizer.notifications == 1);
     assert(Common::FpsOverlay::displayed == 1);
+    assert((recorder.captures == std::vector<int>{15}));
     assert(presenter.buffers[1]->pixel == 20);
     swapchain.Present(1, 0);
     assert((swapchain.displayed == std::vector<int>{15, 20}));

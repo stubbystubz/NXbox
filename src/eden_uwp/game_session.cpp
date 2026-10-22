@@ -76,6 +76,7 @@
 #include "eden_uwp/gamepad.h"
 #include "eden_uwp/home_ui_settings.h"
 #include "eden_uwp/fps_settings.h"
+#include "eden_uwp/recorder_policy.h"
 #include "eden_uwp/http_vfs_file.h"
 #include "eden_uwp/mesa_window.h"
 #include "eden_uwp/renderer_settings.h"
@@ -954,12 +955,17 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
         // metadata loader before reserving guest memory and constructing the game renderer.
         const auto file = Core::GetGameFileFromPath(system.GetFilesystem(), path);
         const auto loader = Loader::GetLoader(system, file);
+        Recording::Configure(
+            std::filesystem::path(winrt::to_string(
+                winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path())),
+            "0000000000000000");
         u64 title_id = 0;
         if (loader && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
             title_id) {
             const auto local_state = std::filesystem::path(winrt::to_string(
                 winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
             const auto title = fmt::format("{:016X}", title_id);
+            Recording::Configure(local_state, title);
             ApplyEdenSettingsFile(TitleSettings::File(local_state, title));
             const char* jit_cache = std::getenv("NXBOX_JIT_CACHE");
             if (jit_cache && std::string_view{jit_cache} == "1") {
@@ -1301,6 +1307,14 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                 void(system.Pause());
                 paused = true;
                 lifecycle.paused_ack.store(true, std::memory_order_release);
+                Recording::stop_requested.store(true);
+                const auto recorder_deadline =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                while (Recording::pending.load() &&
+                       std::chrono::steady_clock::now() < recorder_deadline)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                if (Recording::pending.load())
+                    Diagnostic("RECORDER suspend finalization still pending");
                 Diagnostic("GAME_SUSPENDED");
                 // Leaving through Home suspends the app: share the shaders met this session.
                 UploadSharedShaderCache(system.GetApplicationProcessProgramID());

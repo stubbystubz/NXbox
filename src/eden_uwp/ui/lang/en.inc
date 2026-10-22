@@ -436,3 +436,11 @@
 
     {Text::MaxPlayersTitle, L"Local players"},
     {Text::MaxPlayersHint, L"Each connected controller becomes a player, up to 4."},
+
+    {Text::RecordVideo, L"Record video"},
+    {Text::RecordVideoHint, L"Next game · View + right stick click: start/stop · Video only · 120 s · Old clips auto-delete."},
+    {Text::RecordManual, L"Manual · 720p / 30 fps"},
+    {Text::Record72030, L"720p / 30 fps"},
+    {Text::Record72060, L"720p / 60 fps"},
+    {Text::Record108030, L"1080p / 30 fps"},
+    {Text::Record108060, L"1080p / 60 fps"},
