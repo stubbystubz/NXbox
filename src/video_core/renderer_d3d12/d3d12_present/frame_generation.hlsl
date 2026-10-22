@@ -4,6 +4,7 @@ cbuffer Parameters : register(b0) {
     uint2 size;
     uint2 blocks;
     uint2 output_size;
+    float interpolation;
 };
 Texture2D<float4> previous_frame : register(t0);
 Texture2D<float4> current_frame : register(t1);
@@ -91,8 +92,8 @@ int2 Search(int2 p, bool reverse) {
         return;
     float2 uv = (float2(id.xy) + 0.5) / float2(output_size);
     float4 v = motion.SampleLevel(linear_sampler, uv, 0);
-    float2 forward_uv = uv - v.xy * 4 / float2(size);
-    float2 backward_uv = uv - v.zw * 4 / float2(size);
+    float2 forward_uv = uv - v.xy * (8 * interpolation) / float2(size);
+    float2 backward_uv = uv - v.zw * (8 * (1 - interpolation)) / float2(size);
     float2 f = motion.SampleLevel(linear_sampler, forward_uv, 0).xy;
     float2 b = motion.SampleLevel(linear_sampler, backward_uv, 0).zw;
     // Forward/backward consistency at corresponding endpoints rejects occlusions.
@@ -100,10 +101,10 @@ int2 Search(int2 p, bool reverse) {
     bool reliable = length(v.xy + opposite) <= 1.5 && length(f + b) <= 1.5 &&
                     all(forward_uv >= 0) && all(forward_uv <= 1) && all(backward_uv >= 0) &&
                     all(backward_uv <= 1);
-    float2 a_uv = reliable ? uv - f * 4 / float2(size) : uv;
-    float2 b_uv = reliable ? uv - b * 4 / float2(size) : uv;
-    generated[id.xy] = 0.5 * (previous_frame.SampleLevel(linear_sampler, a_uv, 0) +
-                              current_frame.SampleLevel(linear_sampler, b_uv, 0));
+    float2 a_uv = reliable ? uv - f * (8 * interpolation) / float2(size) : uv;
+    float2 b_uv = reliable ? uv - b * (8 * (1 - interpolation)) / float2(size) : uv;
+    generated[id.xy] = lerp(previous_frame.SampleLevel(linear_sampler, a_uv, 0),
+                            current_frame.SampleLevel(linear_sampler, b_uv, 0), interpolation);
 }
 
 // Only needed when the guest image is cheaper to retain than the output image.

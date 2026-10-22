@@ -235,8 +235,8 @@ public:
         renderer_backend_ = RendererSettings::Read(local_state_);
         shader_preload_ = RendererSettings::ReadShaderPreload(local_state_);
         async_shaders_ = RendererSettings::ReadAsyncShaders(local_state_);
-        fsr_ = RendererSettings::ReadFsr(local_state_);
-        frame_generation_ = RendererSettings::ReadFrameGeneration(local_state_);
+        upscaler_mode_ = RendererSettings::ReadUpscaler(local_state_);
+        frame_generation_ = RendererSettings::ReadFrameGenerationMode(local_state_);
         frame_pacing_ = RendererSettings::ReadFramePacing(local_state_);
         xbox_button_icons_ = RendererSettings::ReadXboxButtonIcons(local_state_);
         button_layout_ = RendererSettings::ReadButtonLayout(local_state_);
@@ -1015,8 +1015,9 @@ private:
             return;
         }
         if (SelectedSetting() == Setting::FrameGeneration) {
-            if (RendererSettings::SaveFrameGeneration(local_state_, !frame_generation_))
-                frame_generation_ = !frame_generation_;
+            const unsigned next = frame_generation_ == 0 ? 2 : frame_generation_ == 2 ? 4 : 0;
+            if (RendererSettings::SaveFrameGenerationMode(local_state_, next))
+                frame_generation_ = next;
             else
                 Toast(Tr(Text::ResolutionSaveFailed), now);
             return;
@@ -1029,8 +1030,10 @@ private:
             return;
         }
         if (SelectedSetting() == Setting::Upscaler) {
-            if (RendererSettings::SaveFsr(local_state_, !fsr_))
-                fsr_ = !fsr_;
+            const std::string next = upscaler_mode_ == "bilinear" ? "fsr1" :
+                                     upscaler_mode_ == "fsr1" ? "temporal" : "bilinear";
+            if (RendererSettings::SaveUpscaler(local_state_, next))
+                upscaler_mode_ = next;
             else
                 Toast(Tr(Text::ResolutionSaveFailed), now);
             return;
@@ -1896,10 +1899,12 @@ private:
               Tr(Text::MaxPlayersHint)},
              {Tr(Text::ResolutionTitle), Tr(resolution_label), Theme::kTextSecondary,
               Tr(Text::ResolutionMemoryHint)},
-             {Tr(Text::UpscalerTitle), Tr(fsr_ ? Text::UpscalerFsr : Text::UpscalerBilinear),
+             {Tr(Text::UpscalerTitle), Tr(upscaler_mode_ == "temporal" ? Text::UpscalerTemporal :
+                    upscaler_mode_ == "fsr1" ? Text::UpscalerFsr : Text::UpscalerBilinear),
               Theme::kTextSecondary, Tr(Text::UpscalerHint)},
              {Tr(Text::FrameGenerationTitle),
-              Tr(frame_generation_ ? Text::NextendoOn : Text::NextendoOff), Theme::kTextSecondary,
+              Tr(frame_generation_ == 4 ? Text::FrameGeneration4x :
+                 frame_generation_ == 2 ? Text::FrameGeneration2x : Text::FrameGenerationOff), Theme::kTextSecondary,
               Tr(Text::FrameGenerationHint)},
              {Tr(Text::FramePacingTitle), Tr(frame_pacing_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::FramePacingHint)},
@@ -2178,11 +2183,11 @@ private:
     bool renderer_open_ = false;
     int renderer_choice_ = 0;
     bool resolution_global_ = false;
-    bool frame_generation_ = false;
+    unsigned frame_generation_ = 0;
     bool frame_pacing_ = false;
     bool shader_preload_ = true;
     bool async_shaders_ = true;
-    bool fsr_ = true;
+    std::string upscaler_mode_ = "fsr1";
     bool xbox_button_icons_ = true;
     int max_players_ = 4;
     ButtonLayout button_layout_ = ButtonLayout::Name;

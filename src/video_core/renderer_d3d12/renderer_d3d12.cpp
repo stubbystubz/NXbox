@@ -79,6 +79,7 @@ struct RendererD3D12::Impl {
     DXGI_FRAME_STATISTICS previous_statistics{};
     bool have_statistics{};
     bool frame_generation_enabled{};
+    unsigned frame_generation_mode{}, effective_frame_generation_mode{2};
     bool frame_generation_failed{};
     Present::FrameGenerationCadence frame_generation_cadence;
     std::chrono::steady_clock::time_point previous_game_frame{};
@@ -217,8 +218,9 @@ struct RendererD3D12::Impl {
         if (GetEnvironmentVariableA("NXBOX_FRAME_GEN_SETTING", frame_gen_setting,
                                     sizeof(frame_gen_setting)) != 1)
             frame_gen_setting[0] = 0;
-        frame_generation_enabled =
-            Present::FrameGenerationEnabled(std::string_view(frame_gen_setting) == "1", frame_gen);
+        frame_generation_mode = Present::FrameGenerationMode(
+            Present::FrameGenerationMode(0, frame_gen_setting), frame_gen);
+        frame_generation_enabled = frame_generation_mode != 0;
         Common::FpsOverlay::frame_generation.store(frame_generation_enabled);
         char pacing[16]{}, pacing_setting[16]{};
         if (GetEnvironmentVariableA("NXBOX_FRAME_PACING", pacing, sizeof(pacing)) != 1)
@@ -327,6 +329,7 @@ struct RendererD3D12::Impl {
                 upscaler = std::make_unique<Present::Presenter>(context);
                 Diagnostic("D3D12 FSR 1 EASU + RCAS ready");
             }
+            upscaler->SetCompositeLayerCount(static_cast<unsigned>(layers.size()));
             upscaler->BeginFrame(index, present_ticks[index]);
         } else if (index < BufferCount) {
             context.WaitSubmitted(present_ticks[index], "present");
@@ -542,6 +545,10 @@ struct RendererD3D12::Impl {
                     source_width = std::max(source_width, rotated ? layer.height : layer.width);
                     source_height = std::max(source_height, rotated ? layer.width : layer.height);
                 }
+                effective_frame_generation_mode =
+                    frame_generator->Configure(swapchain.Get(), frame_generation_mode);
+                frame_generator->UseMotion(layers.size() == 1 && upscaler ? upscaler->Motion()
+                                                                          : ResourcePtr{});
                 frame_generator->SetSourceExtent(source_width, source_height);
                 generated = frame_generator->Generate(buffers[index],
                                                       frame_generation_cadence.Observe(seconds));
@@ -554,8 +561,16 @@ struct RendererD3D12::Impl {
                     "D3D12 frame generation disabled for session: unknown initialization failure");
             }
             frame_generation_cadence.Completed(bool(generated));
-            if (generated)
-                PresentGenerated(generated, rasterizer, index);
+            if (generated) {
+                const Present::GeneratedFrameSchedule schedule{effective_frame_generation_mode};
+                for (unsigned i = 0; i < schedule.Count(); ++i) {
+                    const auto frame = i == 0 ? generated :
+                        frame_generator->Interpolate(schedule.Fraction(i));
+                    if (!frame)
+                        break; // The last generated present already restored the real image.
+                    PresentGenerated(frame, rasterizer, index);
+                }
+            }
             context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
         // Only the display target receives host diagnostics; Capture() never reaches this path.

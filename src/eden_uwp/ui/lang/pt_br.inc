@@ -445,11 +445,15 @@
 
     {Text::UpscalerTitle, L"Upscaler"}, {Text::UpscalerBilinear, L"Bilinear"},
     {Text::UpscalerFsr, L"FSR 1"},
+    {Text::UpscalerTemporal, L"Temporal (experimental)"},
     {Text::UpscalerHint,
      L"Ampliação no DirectX 12 para quadros menores. Vale na próxima execução."},
 
     {Text::FramePacingTitle, L"Ritmo de quadros estável"},
     {Text::FramePacingHint, L"Distribui os quadros em intervalos iguais quando o jogo não chega a 60 fps. Fica mais suave, sem mudar o desempenho."},
+    {Text::FrameGenerationOff, L"Desligada"},
+    {Text::FrameGeneration2x, L"2x"},
+    {Text::FrameGeneration4x, L"4x"},
     {Text::FrameGenerationTitle, L"Geração de quadros"},
     {Text::FrameGenerationHint,
      L"Cria quadros intermediários para ficar mais fluido. Pode causar pequenos defeitos na imagem "

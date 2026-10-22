@@ -1,16 +1,45 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string_view>
 
 namespace D3D12::Present {
+// 1 is the legacy spelling of 2x. Invalid overrides preserve the preference.
+inline unsigned FrameGenerationMode(unsigned preference, const char* environment) {
+    if (environment) {
+        const std::string_view value(environment);
+        if (value == "0")
+            return 0;
+        if (value == "1" || value == "2")
+            return 2;
+        if (value == "4")
+            return 4;
+    }
+    return preference == 4 ? 4 : preference ? 2 : 0;
+}
+inline unsigned DisplayFrameGenerationMode(unsigned requested, double refresh_hz) {
+    return requested == 4 && (!std::isfinite(refresh_hz) || refresh_hz < 119.0) ? 2 : requested;
+}
+struct GeneratedFrameSchedule {
+    unsigned multiplier{};
+    unsigned Count() const {
+        return multiplier > 1 ? multiplier - 1 : 0;
+    }
+    float Fraction(unsigned index) const {
+        return float(index + 1) / multiplier;
+    }
+    double Timestamp(double previous, double current, unsigned index) const {
+        return previous + (current - previous) * Fraction(index);
+    }
+};
 inline bool FrameGenerationEnabled(bool preference, const char* environment) {
-    if (environment && std::string_view(environment) == "0")
-        return false;
-    if (environment && std::string_view(environment) == "1")
-        return true;
-    return preference;
+    return FrameGenerationMode(preference ? 2 : 0, environment) != 0;
+}
+inline bool FrameGenerationBudgetMissed(double milliseconds, double game_seconds, unsigned mode) {
+    return mode > 1 && std::isfinite(milliseconds) && milliseconds > 0 &&
+           milliseconds > game_seconds * 1000 / mode;
 }
 struct HistoryExtent {
     unsigned width, height;

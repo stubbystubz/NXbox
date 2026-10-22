@@ -141,6 +141,7 @@ struct Resource {
 using ResourcePtr = std::shared_ptr<Resource>;
 enum State { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE };
+constexpr int D3D12_QUERY_TYPE_TIMESTAMP = 0;
 struct Context {
     u64 tick = 1, completed = 0;
     std::vector<u64> checked;
@@ -151,6 +152,8 @@ struct Context {
     void Transition(const ResourcePtr&, State) {}
     void GlobalUavBarrier() {}
     Context* Commands() { return this; }
+    void EndQuery(void*, int, unsigned) {}
+    void ResolveQueryData(void*, int, unsigned, unsigned, Resource*, unsigned) {}
     void CopyBufferRegion(Resource* dst, unsigned, Resource*, unsigned, unsigned) {
         std::memcpy(dst->mapped.data(), &sum, sizeof(sum));
     }
@@ -161,7 +164,7 @@ struct Generator {
     struct Slot {
         ResourcePtr readback = std::make_shared<Resource>();
         u64 tick{}, sample_tick{}, sample_id{};
-        unsigned cells{};
+        unsigned cells{}, generation_mode{2};
         bool pending{};
     };
     std::array<Slot, 3> slots;
@@ -169,14 +172,18 @@ struct Generator {
     u64 sample_id{}, completed_sample{};
     double latest_difference{};
     unsigned width = 8, height = 8, bx = 1, by = 1, output_width = 8, output_height = 8;
-    bool history{};
+    bool history{}, analyze_only{}, gpu_budget_missed{};
+    struct Heap { explicit operator bool() const { return false; } void* Get() { return nullptr; } } timing_heap;
+    unsigned mode{2};
+    Slot* active_slot{};
     ResourcePtr previous = std::make_shared<Resource>(), current = std::make_shared<Resource>(),
         real, output = std::make_shared<Resource>(), luma = std::make_shared<Resource>(),
         motion = std::make_shared<Resource>(), stats = std::make_shared<Resource>(),
-        zero = std::make_shared<Resource>();
+        zero = std::make_shared<Resource>(), external_motion;
     struct Tally { unsigned slow_or_fast{}, no_history{}, too_different{}, generated{}; } tally;
     double decision = -1;
     unsigned initialized{}, views{}, passes{};
+    void ReadGpuTime(const Slot&) {}
     void Initialize() { ++initialized; }
     void Allocate(unsigned, unsigned) {}
     void Views(Slot& slot) {
@@ -338,7 +345,7 @@ int main() {
         ).read_text()
         self.assertIn("if (impl->policy.failed)", source)
         self.assertIn("if (impl->policy.Fail())", source)
-        self.assertNotIn("swapchain", source)
+        self.assertNotIn("swapchain->Present(", source)
         self.assertNotIn("Copy(source,", source)
         presenter = PRESENT.read_text()
         branch = function(presenter, "    void PresentGenerated(")
