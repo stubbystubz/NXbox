@@ -71,6 +71,7 @@ struct Context {
 void TraceApiCall(Context*, const char*, void*, const void*, std::size_t) {}
 struct D3D12DescriptorAllocator {
     explicit D3D12DescriptorAllocator(bool ranges = true) : descriptor_ranges{ranges} {}
+    DescriptorCopyRanges<D3D12_CPU_DESCRIPTOR_HANDLE, 4096> draw_copy_sources;
     bool descriptor_fastpath = false;
     bool descriptor_ranges;
     bool persistent_null_descriptors = true;

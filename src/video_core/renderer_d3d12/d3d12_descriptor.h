@@ -39,6 +39,38 @@ struct DescriptorCopyRanges {
     std::uintptr_t last_heap{};
 };
 
+// A small front cache for immutable CPU descriptors. The owning map pins resources;
+// its generation must advance before clearing/recycling slots. Hashes only select
+// candidates: compare the entire semantic key, including all description bytes.
+template <class Key, class Handle, std::size_t Capacity = 64>
+class DescriptorLookupCache {
+public:
+    const Handle* Find(std::uint64_t generation, const Key& key) const {
+        const auto& entry = entries[Index(key)];
+        return entry.valid && entry.generation == generation && entry.key == key ? &entry.handle
+                                                                                 : nullptr;
+    }
+    void Store(std::uint64_t generation, const Key& key, Handle handle) {
+        entries[Index(key)] = {key, handle, generation, true};
+    }
+
+private:
+    static_assert(Capacity > 0);
+    static std::size_t Index(const Key& key) {
+        return ((key.resource >> 4) ^ (static_cast<std::size_t>(key.kind) << 3) ^
+                key.description[0] ^ (static_cast<std::size_t>(key.description[4]) << 1) ^
+                (static_cast<std::size_t>(key.description[16]) << 2)) %
+               Capacity;
+    }
+    struct Entry {
+        Key key{};
+        Handle handle{};
+        std::uint64_t generation{};
+        bool valid{};
+    };
+    std::array<Entry, Capacity> entries{};
+};
+
 // Fixed storage: descriptor copies never allocate while a draw is being recorded.
 // Flush before recycling any source descriptor; sources are CPU-only heap handles.
 template <class Handle, std::size_t Capacity = 32>
@@ -514,6 +546,7 @@ public:
         std::unordered_map<DescriptorKey, CachedDescriptor, DescriptorKeyHash> entries;
         u32 cursor{}, stride{}, capacity{};
         u64 generation{1};
+        DescriptorLookupCache<DescriptorKey, D3D12_CPU_DESCRIPTOR_HANDLE> lookup;
     };
     void InitCache(DescriptorCache& cache, D3D12_DESCRIPTOR_HEAP_TYPE type, u32 capacity);
     void RefreshCaches();
@@ -554,6 +587,10 @@ public:
         draw_table_cache;
     std::array<PreviousDrawTable, 2> previous_draw_tables;
     std::array<BoundHandleTableCache<DescriptorTable, 64, 128, 4>, 2> handle_table_cache;
+    // Only the producer uses this scratch; CopyDescriptors consumes it synchronously.
+    // Keep large arrays out of FinishDrawTable's stack, including on early hits.
+    DescriptorCopyRanges<D3D12_CPU_DESCRIPTOR_HANDLE, 4096> draw_copy_sources;
+    const bool descriptor_lookup_cache;
     const bool handle_table_reuse;
     const bool descriptor_table_cache;
     const bool descriptor_fastpath;
