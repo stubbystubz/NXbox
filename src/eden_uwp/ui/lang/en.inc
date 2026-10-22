@@ -443,4 +443,4 @@
     {Text::ConsoleLanguageTitle, L"Console language"},
     {Text::ConsoleLanguageAutomatic, L"Automatic (Xbox language)"},
     {Text::ConsoleLanguageHint,
-     L"Applies on next launch. Automatic uses eden_settings.txt when set, otherwise Xbox."},
+     L"Takes effect the next time a game starts. Automatic uses the default from Settings, or the Xbox language."},
