@@ -76,7 +76,19 @@ jobs:
           title="NXbox $major.$minor.$build Alpha"
           if [ -n "$fix" ] && [ "$fix" != 0 ]; then title="$title · fix $fix"; fi
           # NxbHelper is still a preview; gh prepends these notes to the generated changelog.
-          notice='### NxbHelper (preview)
+          notice='### What is new
+
+          - **Frame generation only where it looks right**: it now turns on only while the game runs at 28 fps or more on its own, and never adds frames past 60. Mario Kart 8 in a race: ~37 fps from the game, ~60 on the TV (Series X). Below that it stays off, because generating from under 30 looked bad
+          - **Lighter on the CPU**: the renderer reuses descriptor lookups on every draw. Mario Kart 8 ~32 → ~35 fps before frame generation
+          - **Tears of the Kingdom uses less memory**: 5.24 GB → 4.53 GB in the same scene, and it no longer closed during our 4-minute test
+          - **Pokémon Legends: Arceus**: the on-screen keyboard shows up correctly
+          - **Local multiplayer**: a second controller no longer also moves player 1. Not yet tested with two real controllers, tell us on Discord
+          - **Nextendo**: the local account stays available when Nextendo is on but signed out (saves load again, e.g. Sparking Zero). NXbox says when Nextendo is on without an account, and sets it up when a game starts outside the library
+          - **Library**: the hero art no longer covers the game actions
+
+          **Known issues:** black screen in Animal Crossing, black sky in Sparking Zero, the Wonder 1-2 seed, Nextendo online (error when entering online play).
+
+          ### NxbHelper (preview)
 
           The NxbHelper zip files are a companion app that prepares a USB drive or sends your own games to NXbox through Device Portal. It is still in development: it may not work and has not been fully tested. You do not need it to use NXbox.'
           gh release create "$GITHUB_REF_NAME" out/*.appx out/*.zip out/build-info.json -R NspxMiguel/NXbox --title "$title" --verify-tag --latest --notes "$notice" --generate-notes
