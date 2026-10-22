@@ -86,7 +86,6 @@ constexpr float kMetaGap = 22.0f; // between a run of the meta line and the dot 
 constexpr float kMetaDot = 5.0f;
 constexpr float kPillTop = 622.0f;
 constexpr float kArtSize = 520.0f;
-constexpr float kArtTop = kPillTop + kPillHeight - kArtSize; // its bottom lines up with the pills
 constexpr float kArtRadius = 32.0f;
 
 // The progress bar of a conversion, on the row of the hero pills.
@@ -1476,8 +1475,12 @@ private:
 
     void DrawHeroArt(Clock::time_point now) {
         const float blend = hero_blend_.Value(now);
-        const D2D1_RECT_F rect = RectF(kCanvasWidth - kMargin - kArtSize, kArtTop,
-                                       kCanvasWidth - kMargin, kArtTop + kArtSize);
+        // The art shrinks when the action pills need the room (longer labels, more actions);
+        // its bottom stays lined up with them.
+        const float size = std::min(kArtSize, kCanvasWidth - kMargin - ActionsRight() - kPillGap);
+        const float bottom = kPillTop + kPillHeight;
+        const D2D1_RECT_F rect =
+            RectF(kCanvasWidth - kMargin - size, bottom - size, kCanvasWidth - kMargin, bottom);
         const auto draw = [&](int art, float opacity) {
             if (art >= 0 && opacity > 0.001f) {
                 renderer_.DrawImage(EnsureVisual(art).image, rect, kArtRadius, opacity);
@@ -1607,12 +1610,24 @@ private:
         DrawActions();
     }
 
+    std::array<const wchar_t*, kActionCount> ActionLabels() const {
+        return {Tr(Text::ActionPlay),           Tr(Text::ActionMods),
+                Tr(Text::ActionDetails),        Tr(Text::ResolutionTitle),
+                Tr(Text::FrameGenerationTitle), Tr(Text::ConsoleLanguageTitle)};
+    }
+
+    float ActionsRight() const {
+        const auto labels = ActionLabels();
+        float x = kMargin;
+        for (int i = 0; i < kActionCount; ++i) {
+            x += PillWidth(renderer_, labels[Idx(i)], i == kActionPlay) + kPillGap;
+        }
+        return x - kPillGap;
+    }
+
     // The focused game's actions.
     void DrawActions() {
-        const std::array<const wchar_t*, kActionCount> labels = {
-            Tr(Text::ActionPlay),           Tr(Text::ActionMods),
-            Tr(Text::ActionDetails),        Tr(Text::ResolutionTitle),
-            Tr(Text::FrameGenerationTitle), Tr(Text::ConsoleLanguageTitle)};
+        const auto labels = ActionLabels();
         float x = kMargin;
         for (int i = 0; i < kActionCount; ++i) {
             const bool primary = i == kActionPlay;
