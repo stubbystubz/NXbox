@@ -16,6 +16,7 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#include "common/nxbox_memory.h"
 
 namespace D3D12 {
 // Preserve copy order while collapsing adjacent handles from a single CPU heap.
@@ -517,6 +518,7 @@ public:
 
   private:
     struct Ring {
+        NxboxMemory::Gauge payload_memory{NxboxMemory::Kind::DescriptorPayload};
         ComPtr<ID3D12DescriptorHeap> heap;
         RingAllocator math;
         u32 stride{};
@@ -541,6 +543,7 @@ public:
         ResourcePtr resource; // Prevent address reuse while the descriptor is cached.
     };
     struct DescriptorCache {
+        NxboxMemory::Gauge payload_memory{NxboxMemory::Kind::DescriptorPayload};
         ComPtr<ID3D12DescriptorHeap> heap;
         D3D12_CPU_DESCRIPTOR_HANDLE cpu{};
         std::unordered_map<DescriptorKey, CachedDescriptor, DescriptorKeyHash> entries;

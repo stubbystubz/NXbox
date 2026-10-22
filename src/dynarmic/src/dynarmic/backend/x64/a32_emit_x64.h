@@ -127,6 +127,9 @@ public:
     RegAlloc reg_alloc; //reusable reg alloc
     BlockRangeInformation<u32> block_ranges;
     std::array<FastDispatchEntry, fast_dispatch_table_size> fast_dispatch_table;
+#ifdef DYNARMIC_UWP_APPCONTAINER
+    NxboxMemory::Gauge dispatch_memory{NxboxMemory::Kind::JitDispatch, sizeof(fast_dispatch_table)};
+#endif
     ::Common::unordered_map<u64, FastmemPatchInfo> fastmem_patch_info;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> read_fallbacks;
     ::Common::unordered_map<std::tuple<bool, size_t, int, int>, void (*)()> write_fallbacks;

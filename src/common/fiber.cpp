@@ -9,6 +9,7 @@
 
 #include "common/assert.h"
 #include "common/fiber.h"
+#include "common/nxbox_memory.h"
 
 #include <boost/context/detail/fcontext.hpp>
 
@@ -31,6 +32,8 @@ struct Fiber::FiberImpl {
     std::array<u8, DEFAULT_STACK_SIZE> stack;
     std::array<u8, DEFAULT_STACK_SIZE> rewind_stack;
     u32 canary_2 = CANARY_VALUE;
+    NxboxMemory::Gauge stack_memory{NxboxMemory::Kind::FiberStacks,
+                                    sizeof(stack) + sizeof(rewind_stack)};
 
     boost::context::detail::fcontext_t context{};
     boost::context::detail::fcontext_t rewind_context{};
