@@ -168,10 +168,8 @@ struct Session : std::enable_shared_from_this<Session> {
                 owner->ready.notify_all();
             });
             try {
-                // Binding to the control connection's local IPv4 avoids advertising another NIC.
-                candidate
-                    .BindEndpointAsync(HostName(winrt::to_hstring(ip)), winrt::to_hstring(port))
-                    .get();
+                // Any interface, like the control port; PASV still advertises `ip`.
+                candidate.BindServiceNameAsync(winrt::to_hstring(port)).get();
             } catch (...) {
                 candidate.Close();
                 continue;
@@ -590,6 +588,7 @@ bool Server::Start(const fs::path& local_state) {
             const auto address = winrt::to_string(host.CanonicalName());
             if (host.Type() != HostNameType::Ipv4 || !PrivateIPv4(address))
                 continue;
+            Diagnostic("FTP candidate " + address);
             const auto info = host.IPInformation();
             if (info && info.NetworkAdapter() &&
                 info.NetworkAdapter().NetworkAdapterId() == lan_adapter) {
@@ -633,6 +632,8 @@ bool Server::Start(const fs::path& local_state) {
         listener.ConnectionReceived([weak, local_state, externals](const auto&, const auto& args) {
             const auto owner = weak.lock();
             const auto socket = args.Socket();
+            Diagnostic("FTP connection from " +
+                       winrt::to_string(socket.Information().RemoteAddress().CanonicalName()));
             if (!owner) {
                 socket.Close();
                 return;
@@ -661,9 +662,12 @@ bool Server::Start(const fs::path& local_state) {
             owner->session = session;
             std::thread([session] { session->Run(); }).detach();
         });
-        listener.BindEndpointAsync(HostName(winrt::to_hstring(state_->ip)), L"2121").get();
+        // Listen on every interface: bound to the LAN address alone the port stayed closed
+        // to the LAN on the console; state_->ip is only what the UI and PASV show.
+        listener.BindServiceNameAsync(L"2121").get();
         state_->listener = listener;
         state_->running = true;
+        Diagnostic("FTP listening on port 2121");
         return true;
     } catch (...) {
         Diagnostic("FTP start failed");
@@ -676,6 +680,7 @@ void Server::Stop() {
         std::lock_guard lock(state_->mutex);
         state_->running = false;
         if (state_->listener) {
+            Diagnostic("FTP stopped");
             state_->listener.Close();
             state_->listener = nullptr;
         }
