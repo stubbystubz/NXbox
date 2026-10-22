@@ -66,6 +66,7 @@
 #include "core/loader/loader.h"
 #include "core/perf_stats.h"
 #include "eden_uwp/accounts.h"
+#include "eden_uwp/nextendo_online.h"
 #include "eden_uwp/alloc_track.h"
 #include "eden_uwp/jit_dualmap_probe.h"
 #include "eden_uwp/applet_boot.h"
@@ -994,6 +995,9 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
                 winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
             const auto title = fmt::format("{:016X}", title_id);
             Recording::Configure(local_state, title);
+            // Games started without the library (per-game tiles, game.txt) never ran its
+            // Nextendo setup, so online play fell back to blocked Nintendo hosts.
+            NextendoOnline::Initialize(local_state);
             ApplyEdenSettingsFile(TitleSettings::File(local_state, title));
             ApplyConsoleLanguage(local_state, title);
             _putenv_s("NXBOX_FRAME_GEN_SETTING",
