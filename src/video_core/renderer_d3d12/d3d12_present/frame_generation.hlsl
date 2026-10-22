@@ -103,8 +103,9 @@ int2 Search(int2 p, bool reverse) {
                     all(backward_uv <= 1);
     float2 a_uv = reliable ? uv - f * (8 * interpolation) / float2(size) : uv;
     float2 b_uv = reliable ? uv - b * (8 * (1 - interpolation)) / float2(size) : uv;
-    generated[id.xy] = lerp(previous_frame.SampleLevel(linear_sampler, a_uv, 0),
-                            current_frame.SampleLevel(linear_sampler, b_uv, 0), interpolation);
+    generated[id.xy] =
+        lerp(previous_frame.SampleLevel(linear_sampler, a_uv, 0),
+             current_frame.SampleLevel(linear_sampler, b_uv, 0), saturate(interpolation));
 }
 
 // Only needed when the guest image is cheaper to retain than the output image.

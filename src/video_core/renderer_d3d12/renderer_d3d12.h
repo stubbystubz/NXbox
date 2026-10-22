@@ -16,6 +16,8 @@ public:
 
     bool ReportFailure(const std::exception& error) noexcept override;
     bool HasFailed() const override;
+    std::chrono::steady_clock::time_point PresentationDeadline() const override;
+    void PresentIdle() override;
     void Composite(std::span<const Tegra::FramebufferConfig> layers) override;
     std::vector<u8> GetAppletCaptureBuffer() override;
     VideoCore::RasterizerInterface* ReadRasterizer() override;

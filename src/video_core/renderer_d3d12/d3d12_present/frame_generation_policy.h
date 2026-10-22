@@ -30,7 +30,7 @@ struct GeneratedFrameSchedule {
         return multiplier > 1 ? multiplier - 1 : 0;
     }
     float Fraction(unsigned index) const {
-        return float(index + 1) / multiplier;
+        return static_cast<float>(index + 1) / static_cast<float>(multiplier);
     }
     double Timestamp(double previous, double current, unsigned index) const {
         return previous + (current - previous) * Fraction(index);

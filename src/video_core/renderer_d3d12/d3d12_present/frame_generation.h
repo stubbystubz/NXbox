@@ -12,6 +12,7 @@ public:
     // Configure once per real presentation; unknown refresh conservatively selects 2x.
     unsigned Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked = false);
     double RefreshHz() const;
+    // Fractions above one predict forward from the current real endpoint (up to two).
     ResourcePtr Interpolate(float fraction) noexcept;
     // Native-resolution analysis shared by temporal upscaling; no warp dispatch.
     bool Analyze(const ResourcePtr& source) noexcept;

@@ -476,6 +476,8 @@ public:
     void NoteWait(std::string_view site, u64 wall);
     void EndFrame(bool presented = true);
     Present::PresentGapSamples present_gaps, present_call_gaps;
+    double native_fps{};
+    bool frame_generation_gated{true};
     std::function<std::string()> guest_visibility;
     void BindRecordingThread(bool rebind = false);
     std::size_t Enter(Common::GpuProfile::Phase phase) override;

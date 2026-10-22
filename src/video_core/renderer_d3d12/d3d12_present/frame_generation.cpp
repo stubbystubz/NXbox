@@ -509,7 +509,7 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
 }
 ResourcePtr FrameGenerator::Interpolate(float fraction) noexcept {
     if (!impl->active_slot || impl->policy.failed || !std::isfinite(fraction) || fraction <= 0 ||
-        fraction >= 1 || impl->active_slot->query_pairs >= 4)
+        fraction > 2 || impl->active_slot->query_pairs >= 4)
         return {};
     try {
         impl->fraction = fraction;

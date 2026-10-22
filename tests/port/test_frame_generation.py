@@ -304,10 +304,11 @@ int main() {
         end = source.index("        // Each swapchain buffer", start)
         source = source[:start] + source[end:]
         source = re.sub(
-            r"if \(frame_generation_mode == 3 && !frame_generation_failed &&\s*"
-            r"target_policy.current.output\)\s*return swapchain->Present\(target_interval, 0\);\s*",
+            r"if \(frame_generation_enabled && !frame_generation_failed &&\s*"
+            r"effective_frame_generation_mode\)\s*\{.*?return result;\s*\}\s*",
             "",
             source,
+            flags=re.DOTALL,
         )
         source = source.replace(
             """[&] {

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
@@ -44,6 +45,18 @@ public:
 
     void PopWait(T& t, const std::stop_token stop_token) noexcept {
         Pop<PopMode::WaitWithStopToken>(t, stop_token);
+    }
+
+    template <class Clock, class Duration>
+    bool PopWaitUntil(T& value, std::stop_token stop_token,
+                      std::chrono::time_point<Clock, Duration> deadline) noexcept {
+        std::unique_lock lock{consumer.cv_mutex};
+        const bool ready = consumer.cv.wait_until(lock, stop_token, deadline, [this] {
+            return consumer.index.load(std::memory_order_relaxed) !=
+                   producer.index.load(std::memory_order_acquire);
+        });
+        lock.unlock();
+        return ready && !stop_token.stop_requested() && TryPop(value);
     }
 
     T PopWait() noexcept {

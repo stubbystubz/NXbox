@@ -796,6 +796,8 @@ void FrameProfile::EndFrame(bool presented) {
             present_gaps.count, present_gaps.Percentile(50), present_gaps.Percentile(95),
             present_call_gaps.count, present_call_gaps.Percentile(50),
             present_call_gaps.Percentile(95));
+        line +=
+            fmt::format(" native_fps={:.2f} gated={}", native_fps, frame_generation_gated ? 1 : 0);
         present_gaps.Clear();
         present_call_gaps.Clear();
         // Queue waits use the same exclusive clock, but must not rank as CPU work.
