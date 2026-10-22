@@ -893,6 +893,18 @@ class NextendoTests(unittest.TestCase):
         self.assertIn("Nextendo::GetIdentity(user_id.RawString()).pid ? 1 : 0", account)
         self.assertIn("rb.Push<u32>(license_kind);", account)
 
+    def test_signed_out_nextendo_keeps_the_local_account_available(self):
+        # With Nextendo on and nobody signed in, CheckAvailability failed and Sparking Zero said
+        # "no saved data" over an existing save. Only the id token may fail for a signed-out account.
+        account = (ROOT / "src/core/hle/service/acc/acc.cpp").read_text()
+        check = account[account.index("void CheckAvailability(HLERequestContext& ctx) {\n        // Nextendo"):]
+        check = check[: check.index("\n    }\n")]
+        self.assertNotIn("ResultUnknown", check)
+        account_id = account[account.index("    void GetAccountId(HLERequestContext& ctx) {\n        if (Nextendo"):]
+        account_id = account_id[: account_id.index("\n    }\n")]
+        self.assertIn("identity.pid) {", account_id)
+        self.assertNotIn("ResultUnknown", account_id)
+
     def test_nsd_fills_the_environment_placeholder(self):
         # MK8D asks nsd for g2b309e01-%.s.n.srv.nintendo.net. Returned unchanged, the name failed
         # DNS (EAI_AGAIN) and the game showed 0056-2306 before reaching the Nextendo NAT route.

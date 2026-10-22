@@ -893,11 +893,9 @@ private:
     }
 
     void CheckAvailability(HLERequestContext& ctx) {
-        if (Nextendo::IsEnabled() && !Nextendo::GetIdentity(user_id.RawString()).pid) {
-            IPC::ResponseBuilder rb{ctx, 2};
-            rb.Push(ResultUnknown);
-            return;
-        }
+        // Nextendo on without a signed-in account must still look like a usable local account:
+        // failing here made games (Sparking Zero) report "no saved data". Online modes fail later,
+        // at the id token.
         LOG_DEBUG(Service_ACC, "(STUBBED) called");
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
@@ -905,11 +903,12 @@ private:
 
     void GetAccountId(HLERequestContext& ctx) {
         if (Nextendo::IsEnabled()) {
-            const auto identity = Nextendo::GetIdentity(user_id.RawString());
-            IPC::ResponseBuilder rb{ctx, 4};
-            rb.Push(identity.pid ? ResultSuccess : ResultUnknown);
-            rb.PushRaw<u64>(identity.pid);
-            return;
+            if (const auto identity = Nextendo::GetIdentity(user_id.RawString()); identity.pid) {
+                IPC::ResponseBuilder rb{ctx, 4};
+                rb.Push(ResultSuccess);
+                rb.PushRaw<u64>(identity.pid);
+                return;
+            }
         }
         LOG_DEBUG(Service_ACC, "called");
 
