@@ -89,7 +89,11 @@ class DescriptorTableReuse(unittest.TestCase):
     def test_root_cbvs_feedback_and_null_slots_are_planned(self):
         self.assertIn("const u32 cbv_size = root_cbvs ? 0u : TableSize(totals.cbv)", self.draw)
         self.assertIn("view_plan.Reset({cbv_size, srv_size, uav_size})", self.draw)
-        self.assertRegex(self.draw, r"SrvDimension\(desc.type, desc.is_multisample\),\s*sampled\)")
+        self.assertRegex(
+            self.draw,
+            r"SrvDimension\(desc.type, desc.is_multisample\),\s*sampled,"
+            r"\s*trace_binding \? &resolved_srv : nullptr\)",
+        )
         for kind in ("Cbv", "Srv", "Uav", "Sampler"):
             self.assertIn("descriptors.WriteNull" + kind, self.draw)
         self.assertIn("table.first + slot", self.allocator)

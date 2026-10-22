@@ -80,7 +80,8 @@ struct D3D12DescriptorAllocator {
     }
     void WriteNullSrv(const DescriptorTable&, u32, D3D12_SRV_DIMENSION);
     bool WriteImageSrv(const DescriptorTable&, u32, const ImageView&,
-                       D3D12_SRV_DIMENSION, const ResourcePtr& = {});
+                       D3D12_SRV_DIMENSION, const ResourcePtr& = {},
+                       D3D12_SHADER_RESOURCE_VIEW_DESC* = nullptr);
 };
 __PRODUCTION__
 int main() {
@@ -98,6 +99,12 @@ int main() {
     assert(allocator.written.TextureCube.MostDetailedMip == 1);
     assert(allocator.written.TextureCube.MipLevels == 2);
     assert(allocator.written.Shader4ComponentMapping == 1234);
+    // Diagnostic output is the actual adapted binding, including widened cube faces.
+    D3D12_SHADER_RESOURCE_VIEW_DESC resolved{};
+    assert(allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURECUBE, {}, &resolved));
+    assert(resolved.ViewDimension == allocator.written.ViewDimension);
+    assert(resolved.TextureCube.MostDetailedMip == allocator.written.TextureCube.MostDetailedMip);
+    assert(resolved.Shader4ComponentMapping == allocator.written.Shader4ComponentMapping);
     resource.DepthOrArraySize = 12;
     assert(allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY));
     assert(allocator.written.TextureCubeArray.NumCubes == 2);
@@ -125,6 +132,9 @@ int main() {
     // A cube SRV cannot start at face 6: the unadapted array view stays bound, as before.
     assert(allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURECUBE));
     assert(allocator.written.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+    assert(allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURECUBE, {}, &resolved));
+    assert(resolved.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY);
+    assert(resolved.Texture2DArray.FirstArraySlice == 6);
     view.desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     resource.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     assert(allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURE3D));
@@ -176,6 +186,9 @@ int main() {
     assert(!allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURE3D));
     assert(!allocator.written_resource);
     assert(allocator.written.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D);
+    assert(!allocator.WriteImageSrv({}, 0, view, D3D12_SRV_DIMENSION_TEXTURE3D, {}, &resolved));
+    assert(resolved.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE3D);
+    assert(resolved.Format == 0); // Null: never report stale successful view fields.
 }
 """
 

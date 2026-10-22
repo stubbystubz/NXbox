@@ -1273,7 +1273,10 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         return;
     static const u64 draw_trace_frame = [] {
         u64 selected_frame = 0;
-        if (const char* value = std::getenv("NXBOX_D3D12_DRAW_TRACE_FRAME")) {
+        const char* value = std::getenv("NXBOX_D3D12_DRAW_TRACE_FRAME");
+        if (!value)
+            return LightingTraceFrame();
+        if (value) {
             const std::string_view text{value};
             const auto parsed =
                 std::from_chars(text.data(), text.data() + text.size(), selected_frame);
@@ -1283,7 +1286,19 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         return selected_frame;
     }();
     static const bool draw_trace_enabled = draw_trace_frame != 0;
-    const bool trace_vertex_bytes = draw_trace_enabled &&
+    static const bool lighting_trace_enabled =
+        std::getenv("NXBOX_D3D12_LIGHTING_TRACE_FRAME") && LightingTraceFrame() != 0;
+    const u32 lighting_attempt =
+        lighting_trace_enabled
+            ? lighting_trace.Begin(draw_trace_frame, texture_cache.CaptureFrame())
+            : 0;
+    if (lighting_attempt) {
+        Diagnostic(fmt::format("D3D12_LIGHTING_BEGIN frame={} attempt={} vs={:016x} ps={:016x}",
+                               draw_trace_frame, lighting_attempt,
+                               native_pipeline->VertexGuestHash(),
+                               native_pipeline->PixelGuestHash()));
+    }
+    const bool trace_vertex_bytes = draw_trace_enabled && !lighting_trace_enabled &&
                                     texture_cache.CaptureFrame() == draw_trace_frame &&
                                     draw_trace_lines < 3000 && vb_trace_draws < 64 &&
                                     !submitted.is_indexed && submitted.num_vertices <= 64;
@@ -1729,6 +1744,14 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                 if (buffer.resource && IsStorageBuffer(bindings, buffer.resource))
                     buffer = buffer_runtime.CopyUniform(buffer);
                 TraceUniformWord(stage, desc.index, buffer);
+                if (lighting_attempt && lighting_trace.Binding()) {
+                    Diagnostic(fmt::format(
+                        "D3D12_LIGHTING_CBV frame={} attempt={} stage={} slot={} cbuf={} "
+                        "guest={:x} bound={} offset={} bytes={}",
+                        draw_trace_frame, lighting_attempt, stage, cbv_i, desc.index,
+                        maxwell3d->state.shader_stages[stage].const_buffers[desc.index].address,
+                        buffer.resource != nullptr, buffer.offset, buffer.size));
+                }
                 if (root_cbvs) {
                     if (!buffer.resource || !buffer.size)
                         buffer = {zero_uniform_buffer, 0, 65536};
@@ -1791,9 +1814,12 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                         sampled = copy;
                     }
                 }
-                if (descriptors.WriteImageSrv(srv_table, srv_i, view,
-                                              SrvDimension(desc.type, desc.is_multisample),
-                                              sampled)) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC resolved_srv;
+                const bool trace_binding = lighting_attempt && lighting_trace.Binding();
+                const bool srv_bound = descriptors.WriteImageSrv(
+                    srv_table, srv_i, view, SrvDimension(desc.type, desc.is_multisample), sampled,
+                    trace_binding ? &resolved_srv : nullptr);
+                if (srv_bound) {
                     if (split_feedback) {
                         const auto resource_desc = sampled->handle->GetDesc();
                         const bool volume =
@@ -1827,6 +1853,66 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                         static_cast<int>(desc.type)));
                 }
                 const Sampler& sampler = texture_cache.GetSampler(*sampler_it++);
+                if (trace_binding) {
+                    const auto resource_desc =
+                        sampled ? sampled->Description() : D3D12_RESOURCE_DESC{};
+                    const auto smp = MakeSamplerDesc(sampler.Entry(), desc.is_depth);
+                    u32 first = 0, layers = 1, plane = 0;
+                    switch (resolved_srv.ViewDimension) {
+                    case D3D12_SRV_DIMENSION_TEXTURE1DARRAY:
+                        first = resolved_srv.Texture1DArray.FirstArraySlice;
+                        layers = resolved_srv.Texture1DArray.ArraySize;
+                        break;
+                    case D3D12_SRV_DIMENSION_TEXTURE2DARRAY:
+                        first = resolved_srv.Texture2DArray.FirstArraySlice;
+                        layers = resolved_srv.Texture2DArray.ArraySize;
+                        plane = resolved_srv.Texture2DArray.PlaneSlice;
+                        break;
+                    case D3D12_SRV_DIMENSION_TEXTURE2D:
+                        plane = resolved_srv.Texture2D.PlaneSlice;
+                        break;
+                    case D3D12_SRV_DIMENSION_TEXTURECUBE:
+                        layers = 6;
+                        break;
+                    case D3D12_SRV_DIMENSION_TEXTURECUBEARRAY:
+                        first = resolved_srv.TextureCubeArray.First2DArrayFace;
+                        layers = resolved_srv.TextureCubeArray.NumCubes * 6;
+                        break;
+                    case D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY:
+                        first = resolved_srv.Texture2DMSArray.FirstArraySlice;
+                        layers = resolved_srv.Texture2DMSArray.ArraySize;
+                        break;
+                    default:
+                        break;
+                    }
+                    Diagnostic(fmt::format(
+                        "D3D12_LIGHTING_SRV frame={} attempt={} stage={} slot={} tic={} gpu={:x} "
+                        "shader_type={} depth={} integer={} bound={} resource={:x} "
+                        "res_dim={} res_fmt={} res={}x{}x{} res_mips={} samples={} "
+                        "view_dim={} srv_dim={} srv_fmt={} mapping={:x} mip={} levels={} "
+                        "view_first={} view_layers={} srv_first={} srv_layers={} plane={} "
+                        "feedback={} "
+                        "filter={:x} address={},{},{} bias={} minlod={} maxlod={} cmp={} "
+                        "tsc_cmp={}",
+                        draw_trace_frame, lighting_attempt, stage, srv_i,
+                        (texture_views - 1)->index, view.GpuAddr(), static_cast<u32>(desc.type),
+                        desc.is_depth, desc.is_integer, srv_bound,
+                        sampled ? reinterpret_cast<std::uintptr_t>(sampled->handle.Get()) : 0,
+                        static_cast<u32>(resource_desc.Dimension),
+                        static_cast<u32>(resource_desc.Format), resource_desc.Width,
+                        resource_desc.Height, resource_desc.DepthOrArraySize,
+                        resource_desc.MipLevels, resource_desc.SampleDesc.Count,
+                        static_cast<u32>(view.Description().ViewDimension),
+                        static_cast<u32>(resolved_srv.ViewDimension),
+                        static_cast<u32>(resolved_srv.Format), resolved_srv.Shader4ComponentMapping,
+                        view.range.base.level, view.range.extent.levels, view.range.base.layer,
+                        view.range.extent.layers, first, layers, plane,
+                        sampled != view.ImageHandle(), static_cast<u32>(smp.Filter),
+                        static_cast<u32>(smp.AddressU), static_cast<u32>(smp.AddressV),
+                        static_cast<u32>(smp.AddressW), smp.MipLODBias, smp.MinLOD, smp.MaxLOD,
+                        static_cast<u32>(smp.ComparisonFunc),
+                        sampler.Entry().depth_compare_enabled.Value()));
+                }
                 if (!reuse_sampler_plan || validate_sampler_plan)
                     descriptors.WriteSampler(sampler_table, smp_i, sampler, desc.is_depth);
                 // Diagnostic: describe each distinct vertex-stage cube binding once.
@@ -2389,6 +2475,34 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
                              native_pipeline->PixelGuestHash()});
         }
         u64 trace_draw = 0;
+        if (lighting_attempt) {
+            Diagnostic(fmt::format(
+                "D3D12_LIGHTING_DRAW frame={} attempt={} draw={} stencil_ref={},{} "
+                "binding_limit={} attempt_limit={}",
+                draw_trace_frame, lighting_attempt, draw_trace_lines + 1, regs.stencil_front_ref,
+                regs.stencil_back_ref, lighting_trace.BindingLimitReached(),
+                lighting_attempt == LightingTraceBudget::MaxAttempts));
+            const auto trace_target = [&](const ImageView* view, const ResourcePtr& resource,
+                                          int slot) {
+                if (!view || !resource)
+                    return;
+                const auto& desc = resource->Description();
+                Diagnostic(fmt::format(
+                    "D3D12_LIGHTING_TARGET frame={} attempt={} slot={} gpu={:x} resource={:x} "
+                    "format={} size={}x{} view_mip={} view_first={} view_layers={} "
+                    "render_layers={} replacement={} write_mask={}",
+                    draw_trace_frame, lighting_attempt, slot, view->GpuAddr(),
+                    reinterpret_cast<std::uintptr_t>(resource->handle.Get()),
+                    slot < 0 ? formats.depth : formats.colors[slot], desc.Width, desc.Height,
+                    view->range.base.level, view->range.base.layer, view->range.extent.layers,
+                    render_area.layers, resource != view->ImageHandle(),
+                    slot < 0 ? 0u : native_pipeline->State().blend[slot].write_mask));
+            };
+            for (u32 slot = 0; slot < num_rts; ++slot)
+                trace_target(color_views[slot], color_resources[slot], static_cast<int>(slot));
+            if (has_depth)
+                trace_target(depth_view, depth_view->ImageHandle(), -1);
+        }
         if (draw_trace_enabled) {
             if (texture_cache.CaptureFrame() == draw_trace_frame && draw_trace_lines < 3000) {
                 trace_draw = ++draw_trace_lines;

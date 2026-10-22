@@ -937,7 +937,14 @@ void D3D12DescriptorAllocator::WriteTexelUav(const DescriptorTable& table, u32 s
 bool D3D12DescriptorAllocator::WriteImageSrv(const DescriptorTable& table, u32 slot,
                                              const ImageView& view,
                                              D3D12_SRV_DIMENSION fallback_dimension,
-                                             const ResourcePtr& replacement) {
+                                             const ResourcePtr& replacement,
+                                             D3D12_SHADER_RESOURCE_VIEW_DESC* resolved) {
+    // Diagnostic output only. A false return denotes a null binding; do not report the
+    // original guest descriptor as though it were the adapted descriptor we actually bind.
+    if (resolved) {
+        *resolved = {};
+        resolved->ViewDimension = fallback_dimension;
+    }
     const auto resource = replacement ? replacement : view.ImageHandle();
     if (!resource) {
         WriteNullSrv(table, slot, fallback_dimension);
@@ -1005,6 +1012,8 @@ bool D3D12DescriptorAllocator::WriteImageSrv(const DescriptorTable& table, u32 s
                 static_cast<int>(resource_desc.Format)));
         }
     }
+    if (resolved)
+        *resolved = desc;
     WriteCached(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, resource, 1, &desc, sizeof(desc), table,
                 slot);
     return true;

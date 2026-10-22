@@ -11,6 +11,7 @@
 #include "video_core/renderer_d3d12/d3d12_build_stats.h"
 #include "video_core/renderer_d3d12/d3d12_context.h"
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
+#include "video_core/renderer_d3d12/d3d12_lighting_trace.h"
 
 namespace D3D12 {
 namespace {
@@ -202,7 +203,7 @@ GraphicsPipeline::GraphicsPipeline(ID3D12Device* device, ComPtr<ID3D12RootSignat
     // Snapshot scalar state from the final descriptor, before any creation/cache return.
     // Advanced depth-stencil streams copy these same depth/stencil fields.
     static const bool trace_summary_enabled =
-        std::getenv("NXBOX_D3D12_DRAW_TRACE_FRAME") != nullptr;
+        std::getenv("NXBOX_D3D12_DRAW_TRACE_FRAME") != nullptr || LightingTraceFrame() != 0;
     if (trace_summary_enabled) {
         std::string trace_formats;
         for (UINT trace_slot = 0; trace_slot < desc.NumRenderTargets; ++trace_slot) {

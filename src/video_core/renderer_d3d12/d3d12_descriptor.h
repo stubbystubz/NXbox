@@ -440,9 +440,11 @@ public:
     void WriteStorageUav(const DescriptorTable& table, u32 slot, const BoundBuffer& buffer);
     void WriteTexelSrv(const DescriptorTable& table, u32 slot, const BoundBuffer& buffer);
     void WriteTexelUav(const DescriptorTable& table, u32 slot, const BoundBuffer& buffer);
-    // Returns false (and writes a null view) when the view has no backing image.
+    // Returns false for a null binding. Optional diagnostic output contains the adapted
+    // descriptor on success, or only the requested dimension on a null binding.
     bool WriteImageSrv(const DescriptorTable& table, u32 slot, const ImageView& view,
-                       D3D12_SRV_DIMENSION fallback_dimension, const ResourcePtr& replacement = {});
+                       D3D12_SRV_DIMENSION fallback_dimension, const ResourcePtr& replacement = {},
+                       D3D12_SHADER_RESOURCE_VIEW_DESC* resolved = nullptr);
     void WriteSampler(const DescriptorTable& table, u32 slot, const Sampler& sampler,
                       bool shader_compares);
 
