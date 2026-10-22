@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstring>
 #include <stdexcept>
-#include <thread>
 #include <dxgi1_4.h>
 #include <windows.h>
 #ifdef NXBOX_UWP
@@ -549,10 +548,10 @@ struct RendererD3D12::Impl {
         output_layout.width = width;
         output_layout.height = height;
         Draw(output_layout, layers, rasterizer, buffers[index], Rtv(index), index, pipelines);
+        if (frame_generation_enabled && frame_generation_failed && !layers.empty())
+            CountGeneration(Present::FrameGenerationEvent::Failure);
         if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {
-            vblank_schedule.RealReady();
-            pending_generated.reset();
-            idle_deadline.store(0);
+            DropGenerated(Present::FrameGenerationEvent::CancelReal);
             ResourcePtr generated;
             try {
                 if (!frame_generator)
@@ -589,16 +588,30 @@ struct RendererD3D12::Impl {
                                                                           : ResourcePtr{});
                 frame_generator->SetSourceExtent(source_width, source_height);
                 if (gated) {
+                    CountGeneration(Present::FrameGenerationEvent::Gated);
+                    CountGeneration(!native_frame_gate.Interval(refresh)
+                                        ? Present::FrameGenerationEvent::GateRefresh
+                                    : native_frame_gate.NativeFps() >= 50
+                                        ? Present::FrameGenerationEvent::GateFast
+                                        : Present::FrameGenerationEvent::GateFloor);
                     frame_generator->Reset();
                 } else {
-                    generated = frame_generator->Generate(buffers[index],
-                                                          1.0 / native_frame_gate.NativeFps());
+                    // Record the forward warp before submitting the real endpoint,
+                    // ahead of all commands belonging to the next guest frame.
+                    const float fraction =
+                        1.0f + static_cast<float>(native_frame_gate.NativeFps() / output_hz);
+                    generated = frame_generator->Generate(
+                        buffers[index], 1.0 / native_frame_gate.NativeFps(), fraction);
+                    CountGeneration(generated ? Present::FrameGenerationEvent::Candidate
+                                              : frame_generator->LastRejection());
                 }
             } catch (const std::exception&) {
                 frame_generation_failed = true;
+                CountGeneration(Present::FrameGenerationEvent::Failure);
                 Diagnostic("D3D12 frame generation disabled for session: initialization failed");
             } catch (...) {
                 frame_generation_failed = true;
+                CountGeneration(Present::FrameGenerationEvent::Failure);
                 Diagnostic(
                     "D3D12 frame generation disabled for session: unknown initialization failure");
             }
@@ -630,6 +643,7 @@ struct RendererD3D12::Impl {
         if (log_present)
             Diagnostic("D3D12 Present begin");
         HRESULT status;
+        const double real_present_started = PresentationTime();
         {
             const EdenXbox::ThreadProfile::Scope present_scope{
                 EdenXbox::ThreadProfile::Wait::Present};
@@ -637,10 +651,8 @@ struct RendererD3D12::Impl {
                 Common::MaxwellMethodProfile::PresentSwapchain, [&] {
                     if (frame_generation_enabled && !frame_generation_failed &&
                         effective_frame_generation_mode) {
-                        const auto slot = std::chrono::steady_clock::time_point{
-                            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                                std::chrono::duration<double>{vblank_schedule.NextSlot()})};
-                        std::this_thread::sleep_until(slot);
+                        // Positive-interval DXGI presents already serialize vblanks.
+                        // Sleeping another period here double-paces the producer.
                         const double submitted_at = PresentationTime();
                         CountPresentCall(false);
                         const auto result = swapchain->Present(target_interval, 0);
@@ -655,6 +667,9 @@ struct RendererD3D12::Impl {
                     return swapchain->Present(1, 0);
                 });
         }
+        if (frame_generation_enabled && context.Profile().Enabled())
+            context.Profile().frame_generation.real_present_ms +=
+                (PresentationTime() - real_present_started) * 1000.0;
         context.LogInfoQueue();
         Check(status, "Present", context.Device());
         RecordPresentation();
@@ -674,28 +689,52 @@ struct RendererD3D12::Impl {
         return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
             .count();
     }
+    void CountGeneration(Present::FrameGenerationEvent event) {
+        if (context.Profile().Enabled())
+            context.Profile().frame_generation.Count(event);
+    }
+    void DropGenerated(Present::FrameGenerationEvent reason) {
+        if (pending_generated)
+            CountGeneration(reason);
+        pending_generated.reset();
+        vblank_schedule.RealReady();
+        idle_deadline.store(0);
+    }
     void PresentIdle(RasterizerD3D12& rasterizer) {
-        if (!pending_generated || !effective_frame_generation_mode || frame_generation_failed ||
-            !vblank_schedule.Generate(PresentationTime(), real_ready.load()))
+        if (!pending_generated || !effective_frame_generation_mode || frame_generation_failed)
             return;
-        UINT index = swapchain->GetCurrentBackBufferIndex();
-        context.WaitSubmitted(present_ticks[index], "frame generation idle slot");
-        // Recheck after the fence wait: a real composite may now be queued.
-        if (real_ready.load())
-            return;
-        // The real endpoint has already won its slot. Predict forward from it;
-        // replaying the pair's midpoint here would visibly move time backwards.
-        const float fraction = 1.0f + static_cast<float>(native_frame_gate.NativeFps() / output_hz);
-        const auto predicted = frame_generator->Interpolate(fraction);
-        if (!predicted) {
-            pending_generated.reset();
-            idle_deadline.store(0);
+        if (real_ready.load()) {
+            DropGenerated(Present::FrameGenerationEvent::CancelReady);
             return;
         }
-        if (real_ready.load())
+        if (!vblank_schedule.Generate(PresentationTime(), real_ready.load()))
             return;
+        const double late = std::max(0.0, PresentationTime() - vblank_schedule.Deadline());
+        if (late >= 1.0 / output_hz)
+            CountGeneration(Present::FrameGenerationEvent::DeadlineMiss);
+        const double wait_started = PresentationTime();
+        UINT index = swapchain->GetCurrentBackBufferIndex();
+        context.WaitSubmitted(present_ticks[index], "frame generation idle slot");
+        if (context.Profile().Enabled()) {
+            context.Profile().frame_generation.fence_ms +=
+                (PresentationTime() - wait_started) * 1000.0;
+            context.Profile().frame_generation.late_ms += late * 1000.0;
+        }
+        if (real_ready.load()) {
+            DropGenerated(Present::FrameGenerationEvent::CancelFence);
+            return;
+        }
         const double submitted_at = PresentationTime();
-        PresentGenerated(predicted, rasterizer, index);
+        try {
+            PresentGenerated(pending_generated, rasterizer, index);
+        } catch (...) {
+            DropGenerated(Present::FrameGenerationEvent::Failure);
+            throw;
+        }
+        CountGeneration(Present::FrameGenerationEvent::Submitted);
+        if (context.Profile().Enabled())
+            context.Profile().frame_generation.generated_service_ms +=
+                (PresentationTime() - submitted_at) * 1000.0;
         vblank_schedule.Presented(submitted_at, output_hz, false);
         pending_generated.reset();
         idle_deadline.store(0);
@@ -837,7 +876,8 @@ std::chrono::steady_clock::time_point RendererD3D12::PresentationDeadline() cons
 }
 void RendererD3D12::PresentIdle() {
     if (!render_window.IsShown() || HasFailed()) {
-        impl->idle_deadline.store(0);
+        rasterizer.RunGpuPipeline(
+            [&] { impl->DropGenerated(Present::FrameGenerationEvent::CancelHidden); });
         return;
     }
     rasterizer.RunGpuPipeline([&] { impl->PresentIdle(rasterizer); });

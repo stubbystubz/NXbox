@@ -343,3 +343,116 @@ and 2, followed by restoration of the real endpoint into the next buffer. The
 frozen disabled GPU command sequence still passes; only diagnostic calls are
 normalized out. Changed C++ ranges use clang-format; Python uses cached Ruff.
 MSVC/UWP and physical display timing were not tested on this Mac.
+
+## p80e — Remove producer double pacing and prepare prediction early (2026-10-22)
+
+Only local source, host tests and the existing `r-mk8d-p80d` artifacts were used.
+No console, network, commit or push was performed.
+
+### What the artifacts actually establish
+
+Both `diag.txt` and `crash.txt` contain 88 native-policy messages: the initial
+closed gate plus 43 enable/disable cycles. Refresh remains 59.94 Hz during the
+race transitions; native estimates crossing below 28 close the gate. Each
+recovery resets history again. This is not the p80c refresh-estimator failure.
+
+`diag.txt:1462` reports 273 candidates / 300 Generate calls, with 27 history
+rejections. `diag.txt:1785` reports another 285 / 300, with 15 history rejections.
+Both have zero timing/difference rejections, `gpu_ms=0.374/0.379` and
+`budget_missed=false`. These cumulative 300-call tallies exclude gated real
+frames and cannot be treated as five-second per-real acceptance rates.
+
+Between those tally boundaries, five complete real-profile windows (ending at
+1549, 1598, 1643, 1692 and 1741) contribute 800 real calls. The partially
+intersected windows ending at 1501 and 1793 add at most 156 + 171. Therefore
+800–1127 real calls produced exactly 300 Generate calls: at least 62.5% never
+became candidates because generation was gated. Across the logged profiles,
+579 generated Present calls are recorded. The completed tallies account for
+558 accepted candidates, plus an unreported partial tally. There is no evidence
+that three quarters of *accepted* candidates are discarded.
+
+The dominant observed suppression is native-floor cycling. The source also
+contains a pacing feedback mechanism: the real path sleeps until the prior
+submission time plus a full output period, in addition to positive-interval
+DXGI pacing. Prediction is then dispatched only at the next period's idle
+service, behind next-real GPU traffic, despite an earlier midpoint warp already
+being recorded. These waits can delay real arrivals, close the native floor,
+and repeatedly invalidate history. The artifacts do not contain old cancel
+counters or separate Present durations, so they cannot uniquely quantify each
+wait's contribution. Queue depth, double-vblank consumption and late GPU
+execution cannot be independently measured from the old aggregate lines.
+
+### Change
+
+Real Present no longer sleeps for a software output period. Interval 1 at
+60/59.94 Hz and interval 2 at 120/119.88 Hz retain DXGI's vblank serialization.
+The scheduler reserves output periods across both real and synthetic calls;
+synthetic submission may start one period before its reserved slot. It carries
+reservations forward instead of restarting a full CPU timer at every late real
+submission. Idle candidates remain single-use and a newly ready real wins.
+DXGI's positive intervals cap scanout; one-slot submission lookahead means CPU
+submission timestamps are not themselves required to be a period apart.
+
+Generate accepts the forward fraction `1 + native_fps / output_hz` and records
+that warp before the real command-list submission. The idle path presents this
+prepared output, avoiding both the unused midpoint warp and a second full-output
+warp behind the next guest frame. Copy/Present and restoration ordering remain
+unchanged. No interval-zero present, extra output count, worker thread or queue
+ownership change was introduced. Native eligibility thresholds and wall-time
+measurement remain unchanged; an actual native rate below 28 still disables FG.
+
+### Five-second diagnostics
+
+`D3D12_FRAME_PROFILE` now includes:
+
+- `fg_candidates`, `fg_gated`, and gate subreasons `fg_gated_floor_recovery`,
+  `fg_gated_fast`, `fg_gated_refresh`;
+- `fg_rejected_timing`, `fg_rejected_history`, `fg_rejected_resources`,
+  `fg_rejected_difference`, `fg_rejected_gpu_budget`, `fg_rejected_failure`;
+- `fg_cancel_real_arrival`, `fg_cancel_real_fence`, `fg_cancel_real_ready`,
+  `fg_cancel_hidden`, and `fg_submitted`;
+- `fg_deadline_misses` for service beginning at least a full output period late;
+  this is an observation, not an additional terminal cancellation;
+- `fg_real_present_ms` for time in the real swapchain path, including gated
+  frames, `fg_generated_service_ms` for the generated copy/submit/Present/restore
+  service, `fg_fence_ms` for its initial backbuffer wait, and `fg_late_ms` for
+  accumulated service lateness.
+
+Each pending candidate is consumed or cancelled once. A swapchain/service
+exception consumes it as `fg_rejected_failure` and propagates to the existing
+renderer boundary. A candidate crossing a profile boundary can account for a
+one-frame difference between that window's accepted and terminal totals.
+Counters reset on all existing profile rollovers and recording-owner changes.
+The original 300-call rejection tallies remain available for comparison.
+
+### Host validation and limits
+
+The new strict-warning C++ driver executes production idle service, cancellation,
+event counting and the scheduler. At 59.94/60/119.88/120 Hz it verifies 300 real
+plus 300 generated submissions into 600 distinct simulated output slots, with
+nonzero real-return and generated-service costs and busy next-guest recording.
+The previous full-period idle deadline fails this test. It also covers real
+arrival, real readiness, readiness during a fence wait, hidden-window cancellation,
+late service, single terminal accounting, disabled profiling and window reset.
+Existing production generation drivers now check rejection classification and
+forward-fraction propagation, while the native-floor, 34/34.8/45 FPS slot,
+refresh-noise, disabled-path, buffer restoration and pipeline tests remain.
+
+Physical Xbox timing and MSVC/UWP compilation are unavailable on this Mac.
+Host warnings include shadow/conversion errors for the new drivers; they do not
+certify MSVC C4456/C4457/C4459/C4244. Sustained ~60 displayed FPS and removal of
+native-floor cycling require the next authorized console run with these counters.
+
+Validation: all 34 tests passed in the eight-module host suite:
+
+```sh
+PYTHONPATH=tests/port python3 -m unittest \
+  test_frame_generation_presentation test_frame_generation \
+  test_frame_generation_floor test_frame_generation_targets test_frame_pacing \
+  test_d3d12_gpu_thread_profile test_d3d12_draw_phases test_gpu_pipeline
+```
+
+After extending exception accounting coverage, the five presentation tests were
+rerun and passed. The frozen disabled-path hash is unchanged. Changed C++ ranges
+were formatted with clang-format and Python with the cached Ruff; no packages
+were downloaded. `git diff --check` passed.

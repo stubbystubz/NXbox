@@ -42,6 +42,7 @@ struct FrameGenerator::Impl {
     unsigned width{}, height{}, bx{}, by{};
     unsigned output_width{}, output_height{}, source_width{}, source_height{};
     bool history{}, analyze_only{};
+    FrameGenerationEvent last_rejection{FrameGenerationEvent::Failure};
     DXGI_FORMAT history_format{DXGI_FORMAT_R8G8B8A8_UNORM};
     // Why frames were or were not generated, logged every 300 real frames.
     struct Tally {
@@ -326,6 +327,7 @@ struct FrameGenerator::Impl {
     ResourcePtr Generate(const ResourcePtr& source, double seconds) {
         if (seconds > 0 && !policy.CanGenerate(true, seconds, 0)) {
             ResetHistory();
+            last_rejection = FrameGenerationEvent::Timing;
             Count(&Tally::slow_or_fast);
             return {}; // Fast games do not copy history or wait for GPU completion.
         }
@@ -339,12 +341,14 @@ struct FrameGenerator::Impl {
         }
         ReadDifferences();
         if (gpu_budget_missed) {
+            last_rejection = FrameGenerationEvent::GpuBudget;
             ResetHistory();
             Count(&Tally::slow_or_fast);
             return {};
         }
         auto* available = AcquireSlot();
         if (!available) {
+            last_rejection = FrameGenerationEvent::ResourcePressure;
             ResetHistory();
             Count(&Tally::no_history);
             return {}; // Backpressure skips the effect, never waits for a descriptor heap.
@@ -370,6 +374,8 @@ struct FrameGenerator::Impl {
         const bool had_history = history;
         history = true;
         if (!policy.CanGenerate(had_history, seconds, 0)) {
+            last_rejection =
+                had_history ? FrameGenerationEvent::Timing : FrameGenerationEvent::History;
             Count(had_history ? &Tally::slow_or_fast : &Tally::no_history);
             return {};
         }
@@ -392,6 +398,7 @@ struct FrameGenerator::Impl {
         slot.cells = bx * by;
         slot.pending = true;
         if (!policy.CanGenerate(true, seconds, difference)) {
+            last_rejection = FrameGenerationEvent::Difference;
             Count(&Tally::too_different, difference);
             return {};
         }
@@ -422,7 +429,12 @@ struct FrameGenerator::Impl {
 };
 FrameGenerator::FrameGenerator(Context& context) : impl{std::make_unique<Impl>(context)} {}
 FrameGenerator::~FrameGenerator() = default;
-ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds) noexcept {
+ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds,
+                                     float fraction) noexcept {
+    impl->last_rejection = FrameGenerationEvent::Failure;
+    if (!std::isfinite(fraction) || fraction <= 0 || fraction > 2)
+        return {};
+    impl->fraction = fraction;
     if (impl->policy.failed)
         return {};
     try {
@@ -440,6 +452,9 @@ ResourcePtr FrameGenerator::Generate(const ResourcePtr& source, double seconds) 
     // Root, heaps and PSOs stay alive until renderer teardown drains the queue.
     impl->ReleaseResources();
     return {};
+}
+FrameGenerationEvent FrameGenerator::LastRejection() const {
+    return impl->last_rejection;
 }
 bool FrameGenerator::Analyze(const ResourcePtr& source) noexcept {
     impl->analyze_only = true;

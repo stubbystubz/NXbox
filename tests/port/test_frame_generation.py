@@ -30,6 +30,7 @@ class FrameGenerationTests(unittest.TestCase):
 #include <limits>
 #include "eden_uwp/renderer_settings.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 int main(int, char** argv) {
     using namespace EdenXbox::RendererSettings;
     using namespace D3D12::Present;
@@ -127,6 +128,7 @@ int main(int, char** argv) {
 #include <memory>
 #include <vector>
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 using u64 = std::uint64_t;
 struct Resource {
     struct Desc { unsigned Width = 8, Height = 8; };
@@ -159,6 +161,7 @@ struct Context {
     }
 };
 struct Generator {
+    using FrameGenerationEvent = D3D12::Present::FrameGenerationEvent;
     Context context;
     D3D12::Present::FrameGenerationPolicy policy;
     struct Slot {
@@ -174,6 +177,7 @@ struct Generator {
     double latest_difference{};
     unsigned width = 8, height = 8, bx = 1, by = 1, output_width = 8, output_height = 8;
     bool history{}, analyze_only{}, gpu_budget_missed{};
+    D3D12::Present::FrameGenerationEvent last_rejection{};
     struct Heap { explicit operator bool() const { return false; } void* Get() { return nullptr; } } timing_heap;
     unsigned mode{2};
     Slot* active_slot{};
@@ -206,6 +210,7 @@ int main() {
     auto source = std::make_shared<Resource>();
     Generator g;
     assert(!g.Generate(source, 1.0 / 30)); // Seed history.
+    assert(g.last_rejection == Generator::FrameGenerationEvent::History);
     g.context.tick = 2;
     g.context.sum = 4095; // Current pair is a cut, but no completed sample yet.
     assert(g.Generate(source, 1.0 / 30));
@@ -216,6 +221,7 @@ int main() {
     g.context.sum = 0;
     assert(!g.Generate(source, 1.0 / 30)); // Reject using the previous pair.
     assert(g.decision == 1 && g.tally.too_different == 1);
+    assert(g.last_rejection == Generator::FrameGenerationEvent::Difference);
     g.context.tick = 4;
     assert(!g.Generate(source, 1.0 / 30)); // Newer zero is still in flight.
     assert(g.decision == 1);
@@ -245,6 +251,7 @@ int main() {
     assert(!busy.AcquireSlot());
     assert((busy.context.checked == std::vector<u64>{7, 9, 8}));
     assert(!busy.Generate(source, 1.0 / 30));
+    assert(busy.last_rejection == Generator::FrameGenerationEvent::ResourcePressure);
     assert(!busy.history && busy.tally.no_history == 1 && busy.views == 0);
     busy.context.completed = 7;
     assert(busy.AcquireSlot() == &busy.slots[0]);
@@ -260,9 +267,14 @@ int main() {
         Generator fast;
         fast.history = true;
         assert(!fast.Generate(source, seconds));
+        assert(fast.last_rejection == Generator::FrameGenerationEvent::Timing);
         assert(fast.initialized == 0 && fast.views == 0 && fast.passes == 0);
         assert(!fast.history && fast.tally.slow_or_fast == 1);
     }
+    Generator budget;
+    budget.gpu_budget_missed = true;
+    assert(!budget.Generate(source, 1.0 / 30));
+    assert(budget.last_rejection == Generator::FrameGenerationEvent::GpuBudget);
     Generator downsample;
     downsample.real = std::make_shared<Resource>();
     assert(!downsample.Generate(source, 1.0 / 30));
@@ -328,6 +340,18 @@ int main() {
         self.assertEqual(source.count(recorder), 1)
         source = source.replace(recorder, "")
         source = source.replace("        RecordPresentation();", "")
+        # New diagnostics contain no GPU commands; retain the original frozen hash.
+        for diagnostic in (
+            """        if (frame_generation_enabled && frame_generation_failed && !layers.empty())
+            CountGeneration(Present::FrameGenerationEvent::Failure);""",
+            "        const double real_present_started = PresentationTime();",
+            """        if (frame_generation_enabled && context.Profile().Enabled())
+            context.Profile().frame_generation.real_present_ms +=
+                (PresentationTime() - real_present_started) * 1000.0;""",
+        ):
+            self.assertEqual(source.count(diagnostic), 1)
+            source = source.replace(diagnostic, "")
+
         source = source.replace(
             "            context.Profile().display_statistics.Unavailable();", ""
         )
@@ -390,10 +414,12 @@ int main() {
         boundary = function(source, "ResourcePtr FrameGenerator::Generate(")
         driver = r"""
 #include <cassert>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 namespace D3D12::Present {
 using ResourcePtr = std::shared_ptr<int>;
 int diagnostics = 0;
@@ -401,6 +427,8 @@ void Diagnostic(std::string_view) noexcept { ++diagnostics; }
 struct FrameGenerator {
     struct Impl {
         FrameGenerationPolicy policy;
+        FrameGenerationEvent last_rejection{};
+        float fraction{};
         int calls{}, failure{}, released{};
         void ReleaseResources() noexcept { ++released; }
         ResourcePtr Generate(const ResourcePtr&, double) {
@@ -413,7 +441,7 @@ struct FrameGenerator {
         }
     };
     std::unique_ptr<Impl> impl = std::make_unique<Impl>();
-    ResourcePtr Generate(const ResourcePtr&, double) noexcept;
+    ResourcePtr Generate(const ResourcePtr&, double, float fraction = 0.5f) noexcept;
 };
 // BOUNDARY
 }
@@ -435,7 +463,10 @@ int main() {
     }
     FrameGenerator success;
     auto real = std::make_shared<int>(42);
-    assert(*success.Generate(real, 1.0 / 30) == 99);
+    assert(*success.Generate(real, 1.0 / 30, 1.5f) == 99);
+    assert(success.impl->fraction == 1.5f);
+    assert(!success.Generate(real, 1.0 / 30, 2.01f));
+    assert(success.impl->last_rejection == FrameGenerationEvent::Failure);
     assert(*real == 42);
 }
 """

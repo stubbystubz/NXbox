@@ -65,29 +65,29 @@ private:
     double previous{}, native_fps{}, recovery_since{};
     bool have_previous{}, qualified{}, recovering{};
 };
-// Shared by real and idle presentation. A synthetic candidate is single-use and
-// expires at the next real arrival. Deadlines never accumulate catch-up credit.
+// Reserve positive-interval DXGI presents, one output slot ahead of scanout.
+// Preparing/submitting at the scanout deadline is too late: guest work may already
+// occupy the GPU. DXGI owns the vblank wait; do not add a second CPU period.
+// Synthetic submission has one slot of lookahead and no catch-up credit.
 class FrameGenerationVblankSchedule {
 public:
     void RealReady() {
         generated_available = false;
     }
     void Presented(double timestamp, double output_hz, bool real, bool candidate = false) {
-        next_slot = timestamp + 1.0 / output_hz;
+        period = 1.0 / output_hz;
+        next_slot = std::fmax(timestamp, next_slot) + period;
         generated_available = real && candidate;
     }
     bool Generate(double timestamp, bool real_ready) const {
-        return generated_available && !real_ready && timestamp >= next_slot;
+        return generated_available && !real_ready && timestamp >= Deadline();
     }
     double Deadline() const {
-        return generated_available ? next_slot : 0;
-    }
-    double NextSlot() const {
-        return next_slot;
+        return generated_available ? next_slot - period : 0;
     }
 
 private:
-    double next_slot{};
+    double next_slot{}, period{};
     bool generated_available{};
 };
 } // namespace D3D12::Present

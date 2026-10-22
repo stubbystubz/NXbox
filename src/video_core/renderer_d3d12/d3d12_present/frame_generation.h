@@ -2,13 +2,16 @@
 #pragma once
 #include <dxgi1_4.h>
 #include "video_core/renderer_d3d12/d3d12_context.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
 namespace D3D12::Present {
 class FrameGenerator {
 public:
     explicit FrameGenerator(Context& context);
     ~FrameGenerator();
     // No swapchain writes. Returns null on warmup, cut, fast input or session failure.
-    ResourcePtr Generate(const ResourcePtr& current, double game_seconds) noexcept;
+    ResourcePtr Generate(const ResourcePtr& current, double game_seconds,
+                         float fraction = 0.5f) noexcept;
+    FrameGenerationEvent LastRejection() const;
     // Configure once per real presentation; unknown refresh conservatively selects 2x.
     unsigned Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked = false);
     double RefreshHz() const;

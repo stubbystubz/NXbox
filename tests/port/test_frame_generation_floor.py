@@ -229,12 +229,12 @@ int main() {
     }
     FrameGenerationVblankSchedule burst;
     burst.Presented(1, 60, true, true);
-    assert(!burst.Generate(1.01, false)); // No early/same-slot output.
+    assert(burst.Generate(1.0, false)); // Queue ahead; DXGI owns the vblank wait.
     assert(burst.Generate(1.02, false));
     burst.RealReady(); // Real burst at the deadline cancels the stale candidate.
     assert(!burst.Generate(1.02, false));
     burst.Presented(5, 60, true, true); // A stall gives no catch-up credit.
-    assert(!burst.Generate(5.001, false));
+    assert(burst.Generate(5.001, false)); // At most one queued synthetic after a stall.
 }
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -322,8 +322,15 @@ int main() {
         self.assertIn("saturate(interpolation)", shader)
         renderer = (ROOT / "src/video_core/renderer_d3d12/renderer_d3d12.cpp").read_text()
         idle = function(renderer, "    void PresentIdle(RasterizerD3D12& rasterizer)")
-        self.assertIn("1.0f + static_cast<float>(native_frame_gate.NativeFps() / output_hz)", idle)
-        self.assertIn("PresentGenerated(predicted, rasterizer, index)", idle)
+        present = function(renderer, "    void Present(const Layout::FramebufferLayout& layout,")
+        self.assertIn(
+            "1.0f + static_cast<float>(native_frame_gate.NativeFps() / output_hz)", present
+        )
+        self.assertNotIn("Interpolate(", idle)
+        self.assertLess(
+            present.index("frame_generator->Generate("), present.index("context.Submit(")
+        )
+        self.assertIn("PresentGenerated(pending_generated, rasterizer, index)", idle)
 
     def test_idle_wait_yields_to_commands_and_shutdown(self):
         driver = r"""
@@ -388,9 +395,9 @@ int main() {
         idle = function(renderer, "    void PresentIdle(RasterizerD3D12& rasterizer)")
         self.assertIn("vblank_schedule.Generate(PresentationTime(), real_ready.load())", idle)
         self.assertLess(idle.index("if (real_ready.load())"), idle.index("PresentGenerated("))
-        self.assertIn("vblank_schedule.RealReady()", present)
+        self.assertIn("DropGenerated(Present::FrameGenerationEvent::CancelReal)", present)
         self.assertIn("vblank_schedule.Presented(submitted_at, output_hz, true", present)
-        self.assertIn("sleep_until(slot)", present)
+        self.assertNotIn("sleep_until", present)
         self.assertIn("swapchain->Present(target_interval, 0)", generated)
         gpu_thread = (ROOT / "src/video_core/gpu_thread.cpp").read_text()
         self.assertIn("state.queue.PopWaitUntil(next, stop_token, deadline)", gpu_thread)

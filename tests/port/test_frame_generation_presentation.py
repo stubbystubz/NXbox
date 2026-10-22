@@ -66,6 +66,140 @@ int main() {
         with tempfile.TemporaryDirectory() as directory:
             compile_run(driver.replace("// PRELUDE", prelude), Path(directory), extra_flags=FLAGS)
 
+    def test_prepared_idle_candidate_queues_before_busy_guest_and_counts_cancels(self):
+        source = (ROOT / "src/video_core/renderer_d3d12/renderer_d3d12.cpp").read_text()
+        methods = "\n".join(
+            function(source, signature)
+            for signature in (
+                "    void CountGeneration(",
+                "    void DropGenerated(",
+                "    void PresentIdle(",
+            )
+        )
+        driver = r"""
+#include <algorithm>
+#include <atomic>
+#include <cassert>
+#include <cmath>
+#include <memory>
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_events.h"
+namespace D3D12 {
+using ResourcePtr = std::shared_ptr<int>;
+using UINT = unsigned;
+struct RasterizerD3D12 {};
+struct Profile {
+    Present::FrameGenerationEvents frame_generation;
+    bool enabled = true;
+    bool Enabled() const { return enabled; }
+};
+struct Context {
+    struct Profile profile;
+    std::atomic<bool>* ready{};
+    bool interrupt{};
+    struct Profile& Profile() { return profile; }
+    void WaitSubmitted(unsigned, const char*) {
+        if (interrupt) ready->store(true);
+    }
+};
+struct Swapchain { unsigned GetCurrentBackBufferIndex() const { return 0; } };
+struct Presenter {
+    Context context;
+    Swapchain chain;
+    Swapchain* swapchain = &chain;
+    ResourcePtr pending_generated;
+    unsigned effective_frame_generation_mode = 2;
+    bool frame_generation_failed{};
+    Present::FrameGenerationVblankSchedule vblank_schedule;
+    std::atomic<bool> real_ready{};
+    std::atomic<double> idle_deadline{};
+    unsigned present_ticks[1]{};
+    double output_hz{60}, now{}, last_scanout{};
+    unsigned generated{}, displayed{};
+    bool failure{};
+    Presenter() { context.ready = &real_ready; }
+    double PresentationTime() const { return now; }
+    void QueuePresent() {
+        // Positive interval = one 60 Hz slot, or two 120 Hz vblanks.
+        last_scanout = std::max(last_scanout + 1 / output_hz,
+                               std::ceil(now * output_hz) / output_hz);
+        ++displayed;
+    }
+    void PresentGenerated(const ResourcePtr& image, RasterizerD3D12&, unsigned&) {
+        assert(image && *image == 15); // Forward prediction, prepared before guest work.
+        if (failure) throw 1;
+        ++generated;
+        QueuePresent();
+        now += 0.0004; // GPU prediction/copy has a nonzero cost.
+    }
+    // METHODS
+};
+}
+int main() {
+    using namespace D3D12;
+    using E = Present::FrameGenerationEvent;
+    RasterizerD3D12 rasterizer;
+    for (double refresh : {59.94, 60., 119.88, 120.}) {
+        Presenter presenter;
+        presenter.output_hz = refresh > 100 ? refresh / 2 : refresh;
+        const double period = 1 / presenter.output_hz;
+        for (unsigned real = 0; real < 300; ++real) {
+            presenter.now = static_cast<double>(real) * period * 2;
+            presenter.DropGenerated(E::CancelReal);
+            presenter.QueuePresent();
+            presenter.pending_generated = std::make_shared<int>(15);
+            presenter.CountGeneration(E::Candidate);
+            presenter.vblank_schedule.Presented(presenter.now, presenter.output_hz, true, true);
+            presenter.now += 0.001; // Return from real Present, not an ideal zero-cost slot.
+            presenter.PresentIdle(rasterizer);
+            // The consumer is busy recording the next guest frame until its arrival.
+            // The old deadline (real + period) cannot run before this busy interval.
+            assert(!presenter.pending_generated);
+            presenter.now += period * 2 - 0.0014;
+        }
+        assert(presenter.generated == 300 && presenter.displayed == 600);
+        assert(std::abs(presenter.last_scanout - 600 * period) < 1e-8);
+        const auto& events = presenter.context.profile.frame_generation.counts;
+        assert(events[static_cast<std::size_t>(E::Submitted)] == 300);
+        assert(events[static_cast<std::size_t>(E::CancelReal)] == 0);
+        assert(events[static_cast<std::size_t>(E::DeadlineMiss)] == 0);
+    }
+    Presenter presenter;
+    auto prime = [&] {
+        presenter.real_ready = false;
+        presenter.context.interrupt = false;
+        presenter.now += 1;
+        presenter.pending_generated = std::make_shared<int>(15);
+        presenter.CountGeneration(E::Candidate);
+        presenter.vblank_schedule.Presented(presenter.now, 60, true, true);
+        presenter.now += 0.001;
+    };
+    prime(); presenter.DropGenerated(E::CancelReal);
+    presenter.DropGenerated(E::CancelReal); // A candidate has exactly one terminal reason.
+    prime(); presenter.real_ready = true; presenter.PresentIdle(rasterizer);
+    prime(); presenter.context.interrupt = true; presenter.PresentIdle(rasterizer);
+    prime(); presenter.DropGenerated(E::CancelHidden);
+    prime(); presenter.now += 0.1; presenter.PresentIdle(rasterizer);
+    prime(); presenter.failure = true;
+    try { presenter.PresentIdle(rasterizer); assert(false); } catch (int) {}
+    assert(!presenter.pending_generated && presenter.idle_deadline.load() == 0);
+    const auto& events = presenter.context.profile.frame_generation.counts;
+    for (E event : {E::CancelReal, E::CancelReady, E::CancelFence, E::CancelHidden,
+                   E::Submitted, E::DeadlineMiss, E::Failure})
+        assert(events[static_cast<std::size_t>(event)] == 1);
+    presenter.context.profile.frame_generation = {}; // Profile window rollover.
+    for (auto count : events) assert(count == 0);
+    presenter.context.profile.enabled = false;
+    prime(); presenter.DropGenerated(E::CancelReal);
+    for (auto count : events) assert(count == 0);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(driver.replace("// METHODS", methods), Path(directory), extra_flags=FLAGS)
+        profile = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
+        self.assertEqual(profile.count("frame_generation = {};"), 3)
+        self.assertIn("Present::FrameGenerationEvents::Names[event]", profile)
+
     def test_dxgi_windows_stale_samples_failures_wrap_and_reset(self):
         driver = r"""
 #include <cassert>
