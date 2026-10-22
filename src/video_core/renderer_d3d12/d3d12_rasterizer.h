@@ -19,6 +19,7 @@
 #include "video_core/renderer_d3d12/d3d12_draw_resource_index.h"
 #include "video_core/renderer_d3d12/d3d12_fence_manager.h"
 #include "video_core/renderer_d3d12/d3d12_index_converter.h"
+#include "video_core/renderer_d3d12/d3d12_lighting_trace.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_iface.h"
 #include "video_core/renderer_d3d12/d3d12_query_cache.h"
 #include "video_core/renderer_d3d12/d3d12_render_area.h"
@@ -262,6 +263,7 @@ private:
     std::vector<FeedbackTexture> attachment_pool;
     u64 feedback_draw{};
     u32 draw_trace_lines{};
+    LightingTraceBudget lighting_trace;
     u32 cbuf_trace_lines{};
     u32 vb_trace_draws{};
     u32 glyph_trace_draws{};
