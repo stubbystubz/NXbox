@@ -724,6 +724,7 @@ struct RendererD3D12::Impl {
         auto& profile = context.Profile();
         if (!profile.Enabled())
             return;
+        ++profile.output_presents;
         // CPU return times are deliberately separate from observed display times.
         const auto now = std::chrono::steady_clock::now();
         if (previous_present_return.time_since_epoch().count())

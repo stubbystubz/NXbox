@@ -471,7 +471,7 @@ void FrameProfile::BindRecordingThread(bool rebind) {
         counts.fill(0);
         transitions.clear();
         waits.clear();
-        frames = fence_wall = 0;
+        frames = fence_wall = output_presents = 0;
     }
     if (enabled && !owner.load()) {
         initial_cpu = ProfileCpuTime();
@@ -595,7 +595,7 @@ void FrameProfile::EndFrame(bool presented) {
         }
         timing.cpu.fill(0);
         counts.fill(0);
-        frames = fence_wall = 0;
+        frames = fence_wall = output_presents = 0;
     }
     BindRecordingThread();
     Switch(timing.active);
@@ -798,6 +798,9 @@ void FrameProfile::EndFrame(bool presented) {
             present_call_gaps.Percentile(95));
         line +=
             fmt::format(" native_fps={:.2f} gated={}", native_fps, frame_generation_gated ? 1 : 0);
+        line += fmt::format(" output_fps={:.2f} output_presents={}",
+                            static_cast<double>(output_presents) * 10000000.0 / elapsed,
+                            output_presents);
         present_gaps.Clear();
         present_call_gaps.Clear();
         // Queue waits use the same exclusive clock, but must not rank as CPU work.
@@ -947,7 +950,7 @@ void FrameProfile::EndFrame(bool presented) {
     counts.fill(0);
     transitions.clear();
     waits.clear();
-    frames = fence_wall = 0;
+    frames = fence_wall = output_presents = 0;
     initial_cpu = ProfileCpuTime();
     start_wall = ProfileWallTime();
     timing.Reset(start_wall);

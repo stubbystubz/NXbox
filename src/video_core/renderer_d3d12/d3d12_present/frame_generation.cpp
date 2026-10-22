@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include "d3d12_present_shader_source.h"
+#include "video_core/renderer_d3d12/d3d12_present/display_refresh.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_generation_policy.h"
 #include "video_core/renderer_d3d12/d3d12_shader.h"
@@ -32,8 +33,8 @@ struct FrameGenerator::Impl {
     unsigned mode{2};
     float fraction{0.5f};
     double refresh_hz{};
-    DXGI_FRAME_STATISTICS refresh_sample{};
-    bool have_refresh_sample{}, logged_refresh{};
+    DisplayRefreshEstimate refresh_estimate;
+    bool logged_refresh{};
     u64 sample_id{}, completed_sample{};
     double latest_difference{};
     std::array<ComPtr<ID3D12PipelineState>, 4> pipelines;
@@ -468,27 +469,25 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
     if (specified_refresh)
         impl->refresh_hz =
             double(desc.BufferDesc.RefreshRate.Numerator) / desc.BufferDesc.RefreshRate.Denominator;
-    // Flip-model composition often reports 0/0 in GetDesc. Refresh counters measure
-    // the actual containing output rather than selecting a merely supported mode.
+    // A specified output mode is authoritative. For flip-model 0/0, use a
+    // sustained counter window rather than a quotient between adjacent frames.
     DXGI_FRAME_STATISTICS sample{};
-    if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
+    if (specified_refresh) {
+        impl->refresh_estimate.Reset();
+    } else if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
         LARGE_INTEGER frequency{};
         QueryPerformanceFrequency(&frequency);
-        const auto ticks = sample.SyncQPCTime.QuadPart - impl->refresh_sample.SyncQPCTime.QuadPart;
-        if (impl->have_refresh_sample && ticks > 0 && frequency.QuadPart > 0 &&
-            sample.SyncRefreshCount > impl->refresh_sample.SyncRefreshCount) {
-            const double hz =
-                double(sample.SyncRefreshCount - impl->refresh_sample.SyncRefreshCount) *
-                frequency.QuadPart / ticks;
-            if (hz >= 23 && hz <= 250)
-                impl->refresh_hz = hz;
+        if (frequency.QuadPart > 0) {
+            impl->refresh_estimate.Observe(sample.SyncRefreshCount,
+                                           static_cast<double>(sample.SyncQPCTime.QuadPart) /
+                                               static_cast<double>(frequency.QuadPart));
+        } else {
+            impl->refresh_estimate.Reset();
         }
-        impl->refresh_sample = sample;
-        impl->have_refresh_sample = true;
+        impl->refresh_hz = impl->refresh_estimate.Hertz();
     } else {
-        impl->have_refresh_sample = false;
-        if (!specified_refresh)
-            impl->refresh_hz = 0;
+        impl->refresh_estimate.Reset();
+        impl->refresh_hz = 0;
     }
     const unsigned mode =
         locked ? requested : DisplayFrameGenerationMode(requested, impl->refresh_hz);

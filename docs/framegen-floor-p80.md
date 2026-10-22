@@ -164,3 +164,63 @@ and with `4x` / `auto`: interval 2 and the single-candidate limit must still app
 Acceptance evidence still needed: scene/environment, native on/off/recovery lines,
 actual generated counts, GPU budget, display gaps, and visual inspection. Host
 simulation does not substitute for those measurements.
+
+## p80c — Console refresh-estimate flap (2026-10-22)
+
+Local follow-up to the committed p80b baseline; no commit, push, network or console
+access. Evidence is the existing `compat-2026-10-18/r-mk8d-p80` artifact directory.
+
+The 24 native-policy lines in `crash.txt` include 12 transitions at 33–38 FPS.
+These are **display eligibility changes**, not lost native qualification:
+
+| crash.txt lines | Native FPS | Estimated refresh Hz | Result |
+| --- | --- | --- | --- |
+| 1276–1279 | 33.48 / 33.43 / 33.25 / 33.21 | 39.95 / 59.93 / 60.48 / 59.97 | off/on/off/on |
+| 1320–1327 | 33.79 / 33.60 / 33.54 / 33.53 | 29.96 / 59.73 / 60.66 / 59.91 | off/on/off/on |
+| 1697–1700 | 38.66 / 38.42 / 37.99 / 38.14 | 29.97 / 59.89 / 60.43 / 59.94 | off/on/off/on |
+
+The first group is between heartbeat `tick_ms=113900640` and `113901640`
+(UTC 100 ns ticks `134371682028703912` and `134371682038704017`). The last group
+is between `113943640` and `113944640`. Individual policy lines have no timestamps;
+these surrounding crash heartbeats bound each four-transition burst to one second.
+The matching `diag.txt` groups are lines 1322–1325, 1362–1369 and 1740–1743.
+
+A >1 s native gap resets `native_fps` to zero and requires a measurement second
+plus a recovery second. It cannot explain these immediate recoveries at 33 FPS.
+`gated` is not inverted: it is exactly `effective_frame_generation_mode == 0`.
+Generated output calls `RecordPresentation`, never `ObserveNativeFrame`; native
+measurement uses wall time and deliberately includes presentation waits.
+
+`FrameGenerator::Configure` overwrote refresh on every adjacent pair of
+`SyncRefreshCount` / `SyncQPCTime` statistics. The resulting half-rate, two-thirds
+rate and overshoot estimates crossed the strict supported-refresh predicate.
+The logs expose the quotient, not the raw DXGI counters; count/QPC sampling skew
+is the mechanism reproduced by the host test, not a raw-counter capture claim.
+
+`DisplayRefreshEstimate` now measures counter deltas across two-second windows.
+Near 60/120 estimates (within 1 Hz, allowing boundary-counter quantization) use
+59.94/119.88 for conservative scheduling. A changed estimate needs two agreeing
+windows; a single bad window does not switch modes. A specified swapchain mode
+is authoritative. Disjoint/unavailable DXGI statistics clear the estimator and
+require a fresh window. Sustained unsupported modes still disable generation.
+Native gating, including the 28 floor, 29 recovery and pause reset, is unchanged.
+
+The profile now reports `output_fps` and `output_presents`: successful real plus
+synthetic swapchain presents divided by the actual profile window's wall seconds.
+Counting precedes the optional DXGI statistics query, so unsupported display-gap
+statistics do not suppress this metric. This measures submitted output, not
+unique scanouts. Counts reset with the existing profile window/thread ownership.
+
+The regression drives production native gating and refresh estimation for 200 s
+at 33 FPS, injecting a single 1.2 s hitch plus count/QPC skew. It asserts exactly
+one off/recovery episode, continuous eligibility elsewhere, recovery at 33 FPS,
+and output scheduling <=60 at 59.94/60/119.88/120 Hz. The old adjacent estimator
+rejects more than 100 samples in each stream. Additional checks cover isolated
+bad windows, sustained 30/120/144 Hz changes, resets and invalid timestamps.
+All host drivers use shadow/conversion warnings as errors. MSVC/UWP execution
+is unavailable on this Mac; no console validation is claimed.
+
+Validation completed: all 29 tests passed in the seven-module host suite listed
+above, including the new hitch/refresh and output-profile integration tests.
+`git diff --check` passed. Changed C++ lines were formatted with clang-format;
+the Python test was formatted with the locally cached Ruff (no download).

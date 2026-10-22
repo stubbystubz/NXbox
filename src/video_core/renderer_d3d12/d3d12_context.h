@@ -477,6 +477,7 @@ public:
     void EndFrame(bool presented = true);
     Present::PresentGapSamples present_gaps, present_call_gaps;
     double native_fps{};
+    u64 output_presents{};
     bool frame_generation_gated{true};
     std::function<std::string()> guest_visibility;
     void BindRecordingThread(bool rebind = false);

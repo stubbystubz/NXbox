@@ -84,6 +84,95 @@ int main() {
                 extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
             )
 
+    def test_steady_33_with_hitch_and_noisy_display_statistics(self):
+        driver = r"""
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include "video_core/renderer_d3d12/d3d12_present/display_refresh.h"
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h"
+int main() {
+    using namespace D3D12::Present;
+    for (double refresh : {59.94, 60., 119.88, 120.}) {
+        DisplayRefreshEstimate display;
+        NativeFrameGenerationGate gate;
+        double now = 10000;
+        unsigned outages = 0, recoveries = 0, short_window_rejections = 0;
+        bool enabled = false, warmed = false;
+        std::uint32_t previous_count = 0;
+        double previous_qpc = 0;
+        for (unsigned frame = 0; frame < 6600; ++frame) {
+            now += frame == 3300 ? 1.2 : 1.0 / 33.0;
+            gate.ObservePresent(now);
+            // Statistics count/QPC occasionally refer to adjacent vblanks.
+            // Reproduce the half-rate and above-60 quotients in the console log.
+            const auto vblank = static_cast<std::uint32_t>(std::floor(now * refresh));
+            const auto count = vblank - (frame % 99 == 70 ? 1u : 0u);
+            const double qpc = static_cast<double>(vblank) / refresh +
+                               (frame % 37 == 20 ? 0.0002 : 0.0);
+            if (previous_qpc > 0 && qpc > previous_qpc && count > previous_count) {
+                const double adjacent_hz = static_cast<double>(count - previous_count) /
+                                           (qpc - previous_qpc);
+                if (!gate.Interval(adjacent_hz)) ++short_window_rejections;
+            }
+            previous_count = count;
+            previous_qpc = qpc;
+            display.Observe(count, qpc);
+            const bool next_enabled = gate.Multiplier(display.Hertz()) != 0;
+            if (frame == 200) {
+                assert(next_enabled);
+                warmed = true;
+            }
+            if (warmed) {
+                if (enabled && !next_enabled) ++outages;
+                if (!enabled && next_enabled && frame > 200) ++recoveries;
+                if (frame < 3300 || frame > 3370) assert(next_enabled);
+                assert(display.Hertz() / gate.Interval(display.Hertz()) <= 60);
+            }
+            enabled = next_enabled;
+        }
+        assert(short_window_rejections > 100); // Old estimator repeatedly flaps.
+        assert(outages == 1 && recoveries == 1); // Exactly one hitch/recovery episode.
+        assert(enabled && std::abs(gate.NativeFps() - 33) < 1e-7);
+    }
+    // A genuine display change still gates; one outlying window does not.
+    DisplayRefreshEstimate display;
+    display.Observe(0, 0);
+    display.Observe(120, 2);
+    assert(display.Hertz() == 59.94);
+    display.Observe(180, 4);
+    assert(display.Hertz() == 59.94);
+    display.Observe(300, 6);
+    assert(display.Hertz() == 59.94);
+    display.Observe(360, 8);
+    display.Observe(420, 10);
+    NativeFrameGenerationGate gate;
+    assert(display.Hertz() == 30 && !gate.Interval(display.Hertz()));
+    display.Observe(660, 12);
+    display.Observe(900, 14);
+    assert(display.Hertz() == 119.88 && gate.Interval(display.Hertz()) == 2);
+    display.Reset(); // DXGI disjoint/unavailable: no stale estimate.
+    assert(display.Hertz() == 0);
+    display.Observe(0, 20);
+    display.Observe(288, 22);
+    assert(display.Hertz() == 144 && !gate.Interval(display.Hertz()));
+    display.Observe(1, 1); // Counter/time restart: require a fresh window.
+    display.Observe(121, 3);
+    assert(display.Hertz() == 144);
+    display.Observe(241, 5);
+    assert(display.Hertz() == 59.94);
+    display.Observe(0, std::numeric_limits<double>::quiet_NaN());
+    assert(display.Hertz() == 0);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(
+                driver,
+                Path(directory),
+                extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
+            )
+
     def test_real_priority_slots_cap_output_and_do_not_manufacture_native_rate(self):
         driver = r"""
 #include <cassert>
@@ -312,3 +401,27 @@ int main() {
         self.assertIn("logged_native_mode != effective_frame_generation_mode", present)
         profile = (ROOT / "src/video_core/renderer_d3d12/d3d12_context.cpp").read_text()
         self.assertIn('" native_fps={:.2f} gated={}"', profile)
+
+    def test_refresh_estimator_and_output_profile_use_production_paths(self):
+        base = ROOT / "src/video_core/renderer_d3d12"
+        source = (base / "d3d12_present/frame_generation.cpp").read_text()
+        configure = function(source, "unsigned FrameGenerator::Configure(")
+        self.assertIn("if (specified_refresh)", configure)
+        self.assertIn("impl->refresh_estimate.Observe(", configure)
+        self.assertIn("impl->refresh_hz = impl->refresh_estimate.Hertz()", configure)
+        self.assertNotIn("impl->refresh_sample", configure)
+        renderer = (base / "renderer_d3d12.cpp").read_text()
+        record = function(renderer, "    void RecordPresentation()")
+        self.assertEqual(record.count("++profile.output_presents"), 1)
+        self.assertLess(
+            record.index("++profile.output_presents"), record.index("GetFrameStatistics")
+        )
+        for signature in (
+            "    void Present(const Layout::FramebufferLayout& layout,",
+            "    void PresentGenerated(",
+        ):
+            self.assertEqual(function(renderer, signature).count("RecordPresentation();"), 1)
+        profile = (base / "d3d12_context.cpp").read_text()
+        self.assertIn('" output_fps={:.2f} output_presents={}"', profile)
+        self.assertIn("static_cast<double>(output_presents) * 10000000.0 / elapsed", profile)
+        self.assertIn("frames = fence_wall = output_presents = 0;", profile)
