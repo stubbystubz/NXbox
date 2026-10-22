@@ -13,11 +13,14 @@ Generated frames never enter it, and presentation waits are not subtracted.
 The gate starts closed. It opens once a complete two-second window has a robust
 native rate >=28 FPS. Once open, it closes only when the robust rate over a
 complete three-second window falls below 27 FPS. Each robust rate is the reciprocal
-of the median real-to-real interval whose ending timestamp is in that window;
-for an even number of intervals, the two central intervals are averaged. This
-rejects isolated hitch intervals and half-second dips without making a genuinely
-24 FPS game eligible. The 27–28 band preserves the current qualification state.
-Boundary comparisons allow small floating-point rounding error.
+of the arithmetic mean of real-to-real intervals whose ending timestamp is in
+that window, after removing the shortest and longest 10% of samples (rounded
+down). This preserves both modes of alternating short/long vblank intervals,
+while rejecting isolated hitches without making a sustained 24 FPS game eligible.
+A failing complete three-second window takes precedence over two-second recovery,
+even while closed; the two windows cannot issue contradictory consecutive
+decisions. The 27–28 band preserves qualification. Boundary comparisons allow
+small floating-point rounding error.
 
 The separate `NativeFps()` value remains the one-second wall-time average used by
 diagnostics, prediction timing and the >=50 FPS pass-through ceiling. It does not
@@ -30,9 +33,9 @@ overrides) share the same rule. There is no title-specific exemption.
 
 | Native FPS | Behavior after qualification |
 | --- | --- |
-| Three-second median rate below 27 | Close the floor gate |
+| Three-second trimmed rate below 27 | Close the floor gate |
 | Robust rate 27 to below 28 | Retain current qualification |
-| Two-second median rate >=28, one-second average below 50 | Qualify; at most one synthetic candidate per real frame |
+| Two-second trimmed rate >=28, no failing three-second window, one-second average below 50 | Qualify; at most one synthetic candidate per real frame |
 | 50 or above | Native pass-through, no generation |
 
 This fixes the earlier p80 restriction to native FPS <=30. Mario Kart 8 Deluxe's
@@ -499,3 +502,106 @@ Validation: all 35 tests passed in the eight-module host suite listed in p80e,
 including pipeline sanitizer checks and the frozen disabled path. The new C++
 driver and changed production header were formatted with clang-format; Python
 was formatted with cached Ruff. `git diff --check` passed.
+
+
+## p80g — Bimodal native cadence and contradictory windows (2026-10-22)
+
+### Root cause
+
+The supplied local `r-mk8d-p80f/crash.txt` contains 571 native-gate state records
+(including startup), versus 72 in p80e. The consecutive 29.7 FPS examples retain
+`refresh_hz=59.94 interval=1`, ruling out refresh qualification for those changes.
+There is one presenter-wide `NativeFrameGenerationGate`, observed once at the
+start of each nonempty real `Present`. `PresentGenerated` only records output;
+it neither observes native arrivals nor selects the gate. `FrameGenerator::Reset`
+clears image history, not this native gate. There is no gate per swapchain buffer.
+The speculative profile write using `Multiplier(60)` did not mutate qualification
+or drive these state diagnostics; it has nevertheless been removed so the profile
+uses the actual selected output policy.
+
+The root cause is within `ObservePresent`. A median of individual intervals is
+unstable for bimodal vblank arrivals: ~16.7/50.7 ms intervals deliver 29.7 native
+FPS on average, but a median can select either mode when window sample parity
+changes. Additionally, the qualified branch closed using three seconds, while
+the unqualified branch reopened using two seconds. A three-second failure and a
+two-second recovery could remain true simultaneously, so consecutive real calls
+alternated the same object's qualification. A long window does not prevent this.
+The existing uniformly spaced/jittered tests never exercised this cadence.
+Raw real-to-real timestamps are not present in these logs; the bimodal host input
+is a deterministic reproducer, not a claimed reconstruction of every console call.
+
+The gate now uses a symmetric 10% trimmed interval mean and gives the long-window
+failure priority regardless of current qualification. The floor thresholds,
+window lengths, native wall-time reporting, >=50 cutoff and refresh limits remain.
+`ObserveNativeFrame` uses the existing `PresentationTime` steady clock, allowing
+the host driver to control time without replacing the observation logic.
+
+### Native throughput and pacing comparison
+
+Both local crash logs contain 35 `D3D12_FRAME_PROFILE` records. The table uses
+records 12–34 (zero-based), the same 23 full gameplay windows after the introduction,
+about 115 s per run. Per-frame fields are sums divided by `real_present_calls`
+(3465 in p80e, 2864 in p80f), rather than comparing raw five-second totals with
+different frame counts. Window durations are reconstructed as
+`output_presents / output_fps`, so derived rates inherit the printed rate rounding.
+Actual thread CPU uses `gpu_thread_cpu_pct` times those durations. The individual
+`*_cpu_ms` phase counters are **wall-time** buckets (`FrameProfile::Switch`),
+including blocking work; their names do not imply exclusive processor execution.
+
+| Measurement | p80e | p80f |
+| --- | ---: | ---: |
+| Real presents / elapsed seconds | 30.11 FPS | 24.89 FPS |
+| Median window real-present rate | 30.59 FPS | 24.99 FPS |
+| Median sampled `native_fps` | 29.21 | 24.63 |
+| Actual GPU-thread CPU ms / real | 24.544 | 24.436 |
+| `maxwell3d_methods_cpu_ms` / real | 6.895 | 14.542 |
+| `dma_pusher_cpu_ms` / real | 3.071 | 3.093 |
+| `macro_execution_cpu_ms` / real | 0.937 | 0.915 |
+| `texture_cache_update_cpu_ms` / real | 2.191 | 2.108 |
+| `draw_setup_cpu_ms` / real | 0.685 | 0.693 |
+| `descriptor_writes_cpu_ms` / real | 0.528 | 0.568 |
+| `pipeline_lookup_cpu_ms` / real | 1.222 | 1.247 |
+| `submit_cpu_ms` / real | 0.543 | 0.542 |
+| `fence_wait_cpu_ms` / real | 0.464 | 0.574 |
+| `fg_real_present_ms` / real | 0.189 | 0.198 |
+| `fg_generated_service_ms` / real | 0.249 | 0.604 |
+| Generated submissions / real | 0.185 | 0.466 |
+| History rejections / real | 0.0098 | 0.0971 |
+
+Native throughput did regress by about 17.4%, but actual CPU per real frame did
+not increase. Real Present time remains about 0.2 ms/frame: these logs do not
+support a restored double CPU/vblank pacing wait. The p80e-to-p80f diff changes
+only the native gate, its tests and documentation; the p80e scheduler and real
+Present path are identical. The extra wall time is mainly in the Maxwell bucket.
+Every gate transition calls `D3D12::Diagnostic`, which calls
+`EdenXbox::Diagnostic` and synchronously `FlushFileBuffers` on the recording
+thread. Thus the log storm introduces blocking I/O outside the measured real
+Present call, as well as repeated image-history resets. This is consistent with
+the larger wall bucket and history rejection rate, but aggregate profiles cannot
+isolate the exact time spent logging. No pacing change was made in p80g, and no
+new console FPS claim is made.
+
+### Host regression
+
+`test_real_generated_real_policy_at_steady_and_bimodal_29_7_fps` extracts the
+production real-present policy selection/log/reset block, `ObserveNativeFrame`
+and complete `PresentGenerated` method into GPU/DXGI doubles. It drives real →
+generated → real for 200 s at 29.7 FPS, with both uniform and alternating native
+intervals, at 59.94/60/119.88/120 Hz and across alternating swapchain buffers.
+It checks exactly one startup opening, zero later transitions, no generated
+mutation of native history/profile/qualification, and no repeated history resets.
+The p80f policy fails this driver after the clock is injected through the same
+steady-clock helper. No gate formula is copied into the test.
+
+A separate regression starts with 15 FPS and recovers to 30 FPS. It verifies that
+the passing short window cannot reopen against the still-failing long window,
+then confirms qualification once both are compatible. Existing sustained-low,
+hitch, pause, refresh, cap, real-priority and disabled-path tests remain in use.
+
+Validation: 37 tests passed in the eight-module host suite listed in p80e,
+including pipeline sanitizer checks. The new drivers use `-Wall -Wextra -Wshadow
+-Wconversion -Werror`; integer differences and sizes are explicitly converted.
+C++ changes were formatted with clang-format and Python with cached Ruff;
+`git diff --check` passed. MSVC/UWP is not installed on this Mac, so native MSVC
+C4456/C4457/C4459/C4244 validation remains unavailable. No network, console,
+commit or push was used.

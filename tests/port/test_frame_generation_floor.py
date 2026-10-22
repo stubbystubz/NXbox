@@ -84,6 +84,40 @@ int main() {
                 extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
             )
 
+    def test_short_recovery_window_cannot_override_long_window_failure(self):
+        driver = r"""
+#include <cassert>
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h"
+int main() {
+    D3D12::Present::NativeFrameGenerationGate gate;
+    double now = 0;
+    gate.ObservePresent(now);
+    for (unsigned frame = 0; frame < 60; ++frame) {
+        now += 1.0 / 15;
+        gate.ObservePresent(now);
+        assert(!gate.Multiplier(60));
+    }
+    for (unsigned frame = 0; frame < 60; ++frame) {
+        now += 1.0 / 30;
+        gate.ObservePresent(now);
+        // The recent two seconds recover first, while the full three-second
+        // rate still fails. Reopening here would close again on the next real.
+        assert(!gate.Multiplier(60));
+    }
+    for (unsigned frame = 0; frame < 40; ++frame) {
+        now += 1.0 / 30;
+        gate.ObservePresent(now);
+    }
+    assert(gate.Multiplier(60) == 2);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(
+                driver,
+                Path(directory),
+                extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
+            )
+
     def test_jittery_native_floor_for_200_seconds_and_sustained_low_rate(self):
         driver = r"""
 

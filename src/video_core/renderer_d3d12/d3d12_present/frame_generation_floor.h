@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <deque>
+#include <numeric>
 #include <vector>
 
 namespace D3D12::Present {
@@ -31,11 +32,14 @@ public:
             ++recent;
         const double duration = timestamp - *recent;
         native_fps = duration > 0 ? static_cast<double>(presents.end() - recent - 1) / duration : 0;
-        if (qualified) {
-            if (timestamp - presents.front() >= 3.0 - Epsilon && MedianRate(3.0) < 27.0 - Epsilon)
-                qualified = false;
-        } else if (timestamp - presents.front() >= 2.0 - Epsilon &&
-                   MedianRate(2.0) >= 28.0 - Epsilon) {
+        // Closing has priority even while unqualified: the shorter recovery
+        // window must not reopen against a still-failing three-second window.
+        const bool below_floor =
+            timestamp - presents.front() >= 3.0 - Epsilon && TrimmedRate(3.0) < 27.0 - Epsilon;
+        if (below_floor) {
+            qualified = false;
+        } else if (!qualified && timestamp - presents.front() >= 2.0 - Epsilon &&
+                   TrimmedRate(2.0) >= 28.0 - Epsilon) {
             qualified = true;
         }
     }
@@ -53,7 +57,7 @@ public:
     }
 
 private:
-    double MedianRate(double window) const {
+    double TrimmedRate(double window) const {
         std::vector<double> intervals;
         for (auto endpoint = presents.begin() + 1; endpoint != presents.end(); ++endpoint) {
             if (presents.back() - *endpoint < window)
@@ -61,13 +65,15 @@ private:
         }
         if (intervals.empty())
             return 0;
-        const auto middle = intervals.begin() +
-                            static_cast<std::vector<double>::difference_type>(intervals.size() / 2);
-        std::nth_element(intervals.begin(), middle, intervals.end());
-        const double median = intervals.size() % 2 != 0
-                                  ? *middle
-                                  : (*middle + *std::max_element(intervals.begin(), middle)) / 2;
-        return 1.0 / median;
+        // Vblank-quantized arrivals can alternate short/long intervals at a
+        // stable native rate. A median jumps between those modes when sample
+        // parity changes. Average the middle 80% instead, preserving both modes
+        // while rejecting isolated hitches and short bursts symmetrically.
+        std::sort(intervals.begin(), intervals.end());
+        const auto trim = static_cast<std::vector<double>::difference_type>(intervals.size() / 10);
+        const auto begin = intervals.begin() + trim;
+        const auto end = intervals.end() - trim;
+        return static_cast<double>(end - begin) / std::accumulate(begin, end, 0.0);
     }
     void Reset() {
         presents.clear();

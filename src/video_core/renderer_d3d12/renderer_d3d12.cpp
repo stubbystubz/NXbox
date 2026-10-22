@@ -740,14 +740,10 @@ struct RendererD3D12::Impl {
         idle_deadline.store(0);
     }
     void ObserveNativeFrame() {
-        const double timestamp =
-            std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-                .count();
+        const double timestamp = PresentationTime();
         native_frame_gate.ObservePresent(timestamp);
         auto& profile = context.Profile();
         profile.native_fps = native_frame_gate.NativeFps();
-        profile.frame_generation_gated = !frame_generation_enabled || frame_generation_failed ||
-                                         !native_frame_gate.Multiplier(60);
     }
     HRESULT PresentPaced(unsigned interval) {
         bool accepted_pacing = false;

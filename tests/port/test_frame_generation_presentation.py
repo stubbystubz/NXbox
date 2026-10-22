@@ -13,6 +13,18 @@ FLAGS = ["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"]
 
 
 class FrameGenerationPresentationTests(unittest.TestCase):
+    def test_real_generated_real_policy_at_steady_and_bimodal_29_7_fps(self):
+        source = (ROOT / "src/video_core/renderer_d3d12/renderer_d3d12.cpp").read_text()
+        present = function(source, "    void Present(const Layout::FramebufferLayout& layout,")
+        policy_start = present.index("                effective_frame_generation_mode =")
+        policy_end = present.index("                frame_generator->UseMotion", policy_start)
+        driver = (ROOT / "tests/port/fixtures/frame_generation_presenter.cpp").read_text()
+        driver = driver.replace("// POLICY", present[policy_start:policy_end])
+        driver = driver.replace("// OBSERVATION", function(source, "    void ObserveNativeFrame()"))
+        driver = driver.replace("// GENERATED", function(source, "    void PresentGenerated("))
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(driver, Path(directory), extra_flags=FLAGS)
+
     def test_busy_queue_services_deadline_and_ready_real_wins(self):
         source = (ROOT / "src/video_core/gpu_thread.cpp").read_text()
         start = source.index("            // Service a due output slot")
