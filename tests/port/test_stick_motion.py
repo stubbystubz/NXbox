@@ -11,6 +11,7 @@ DRIVER = r"""
 #include <cassert>
 #include <cmath>
 #include "eden_uwp/stick_motion.h"
+#include "hid_core/resources/six_axis/motion_diagnostics.h"
 using namespace EdenXbox;
 using namespace std::chrono_literals;
 bool near(float a, float b) { return std::abs(a - b) < .0001f; }
@@ -63,6 +64,103 @@ int main() {
     sample = pitch.Update(true, true, 0, 1, 0, 0, t + 200ms);
     assert(near(std::atan2(-sample.accel[1], -sample.accel[2]), StickMotion::kMaxTilt));
     assert(sample.gyro[0] > 0);
+
+    // The exact production button result is routed to SetButton(LStick).
+    StickMotion tap;
+    int rising_edges = 0;
+    bool previous_button = false;
+    const auto route = [&](const StickMotionSample& routed) {
+        if (routed.guest_l3 && !previous_button) ++rising_edges;
+        previous_button = routed.guest_l3;
+    };
+    for (int millis = 0; millis <= 400; ++millis) {
+        const auto routed = tap.Update(true, millis < 249, .15f, -.15f, .15f, -.15f,
+                                       t + std::chrono::milliseconds(millis));
+        if (millis < 249) assert(!routed.guest_l3 && !routed.suppress_sticks);
+        route(routed);
+    }
+    assert(rising_edges == 1 && !previous_button && tap.TapCount() == 1);
+
+    StickMotion hold;
+    for (int millis = 0; millis <= 400; ++millis) {
+        const auto routed = hold.Update(true, millis < 300, 0, 0,
+                                        millis >= 10 && millis < 100 ? 1.0f : 0.0f,
+                                        0, t + std::chrono::milliseconds(millis));
+        assert(!routed.guest_l3);
+        if (millis >= 10 && millis < 100) {
+            assert(routed.suppress_sticks && std::abs(routed.gyro[2]) > 0);
+        }
+        if (millis >= 100 && millis < 300) assert(routed.suppress_sticks);
+    }
+    assert(hold.TapCount() == 0);
+    // Either stick/axis latches motion, even before the timer expires.
+    for (int axis = 0; axis < 4; ++axis) {
+        StickMotion moved;
+        moved.Update(true, true, 0, 0, 0, 0, t);
+        std::array<float, 4> sticks{};
+        sticks[static_cast<std::size_t>(axis)] = -.16f;
+        assert(moved.Update(true, true, sticks[0], sticks[1], sticks[2], sticks[3],
+                            t + 1ms).suppress_sticks);
+        assert(!moved.Update(true, false, 0, 0, 0, 0, t + 2ms).guest_l3);
+    }
+    StickMotion timed;
+    assert(!timed.Update(true, true, 0, 0, 0, 0, t).guest_l3);
+    assert(!timed.Update(true, true, 0, 0, 0, 0, t + 249ms).suppress_sticks);
+    assert(timed.Update(true, true, 0, 0, 0, 0, t + 250ms).suppress_sticks);
+    assert(!timed.Update(true, false, 0, 0, 0, 0, t + 251ms).guest_l3);
+    StickMotion boundary;
+    boundary.Update(true, true, 0, 0, 0, 0, t);
+    assert(!boundary.Update(true, false, 0, 0, 0, 0, t + 250ms).guest_l3);
+
+    StickMotion passthrough;
+    for (int millis = 0; millis < 500; ++millis) {
+        const bool button = millis < 400;
+        const auto routed = passthrough.Update(false, button, 1, 1, 1, 1,
+                                               t + std::chrono::milliseconds(millis));
+        assert(routed.guest_l3 == button && !routed.suppress_sticks);
+        rest(routed);
+    }
+    assert(passthrough.TapCount() == 0);
+    assert(passthrough.Update(false, true, 0, 0, 0, 0, t + 1s, true).guest_l3);
+    StickMotion blocked;
+    blocked.Update(true, true, 0, 0, 0, 0, t);
+    blocked.Update(true, true, 0, 0, 0, 0, t + 10ms, true);
+    assert(!blocked.Update(true, false, 0, 0, 0, 0, t + 20ms).guest_l3);
+    StickMotion activation;
+    assert(activation.Update(false, true, 0, 0, 0, 0, t).guest_l3);
+    assert(!activation.Update(true, true, 0, 0, 0, 0, t + 1ms).guest_l3);
+    assert(!activation.Update(true, false, 0, 0, 0, 0, t + 2ms).guest_l3);
+    StickMotion stopping;
+    stopping.Update(true, true, 0, 0, 1, 0, t);
+    assert(stopping.Update(false, true, 0, 0, 1, 0, t + 1ms).guest_l3);
+    assert(!stopping.Update(false, false, 0, 0, 0, 0, t + 2ms).guest_l3);
+    // A new motion hold cancels a previous tap pulse, including on its release.
+    StickMotion rapid;
+    rapid.Update(true, true, 0, 0, 0, 0, t);
+    assert(rapid.Update(true, false, 0, 0, 0, 0, t + 1ms).guest_l3);
+    assert(!rapid.Update(true, true, 0, 0, 1, 0, t + 2ms).guest_l3);
+    assert(!rapid.Update(true, false, 0, 0, 0, 0, t + 3ms).guest_l3);
+
+    // Diagnostics use post-filter gyro and actual guest attitude, with one-second peaks.
+    using Service::HID::MotionDiagnostics;
+    MotionDiagnostics diagnostic;
+    const std::array<float, 9> identity{1,0,0, 0,1,0, 0,0,1};
+    const std::array<float, 9> quarter_turn{0,-1,0, 1,0,0, 0,0,1};
+    assert(!diagnostic.Update({0,0,0}, identity, true, t));
+    assert(!diagnostic.Update({.5f,-.25f,0}, quarter_turn, true, t + 10ms));
+    assert(near(diagnostic.gyro_rad_s[0], StickMotion::kPi));
+    assert(near(diagnostic.attitude_delta_rad, StickMotion::kPi / 2));
+    assert(!diagnostic.Update({0,0,0}, quarter_turn, true, t + 999ms));
+    assert(diagnostic.Update({0,0,0}, quarter_turn, true, t + 1s));
+    assert(near(diagnostic.max_abs_gyro_rad_s[0], StickMotion::kPi));
+    assert(near(diagnostic.max_abs_gyro_rad_s[1], StickMotion::kPi / 2));
+    assert(near(diagnostic.max_attitude_delta_rad, StickMotion::kPi / 2));
+    diagnostic.NextWindow(t + 1s);
+    assert(!diagnostic.Update({1,1,1}, identity, false, t + 1100ms));
+    assert(near(diagnostic.max_abs_gyro_rad_s[0], 0));
+    assert(near(diagnostic.attitude_delta_rad, 0));
+    assert(diagnostic.Update({0,0,0}, identity, true, t + 2s));
+    assert(near(diagnostic.max_attitude_delta_rad, 0));
 
     ViewGesture view;
     view.Update(true, .1f, -.1f, t);

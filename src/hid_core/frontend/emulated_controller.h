@@ -185,6 +185,17 @@ public:
         return six_axis_sensor_requested.load(std::memory_order_acquire);
     }
 
+    void SetSyntheticMotionGesture(bool modifier, u64 taps) {
+        synthetic_motion_modifier.store(modifier, std::memory_order_relaxed);
+        synthetic_motion_taps.store(taps, std::memory_order_relaxed);
+    }
+    bool IsSyntheticMotionModifierActive() const {
+        return synthetic_motion_modifier.load(std::memory_order_relaxed);
+    }
+    u64 GetSyntheticMotionTapCount() const {
+        return synthetic_motion_taps.load(std::memory_order_relaxed);
+    }
+
     /**
      * Contains all input data (buttons, joysticks, vibration, and motion) within this controller.
      * @param npad_id_type npad id type for this specific controller
@@ -491,6 +502,8 @@ public:
 
 private:
     std::atomic<bool> six_axis_sensor_requested{false};
+    std::atomic<bool> synthetic_motion_modifier{false};
+    std::atomic<u64> synthetic_motion_taps{0};
     /// creates input devices from params
     void LoadDevices();
 

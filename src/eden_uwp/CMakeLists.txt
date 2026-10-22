@@ -142,7 +142,7 @@ target_compile_definitions(eden-uwp PRIVATE NXBOX_UWP=1 YUZU_UWP_APPCONTAINER=1)
 # C++/WinRT needs C++20 + exceptions.
 target_compile_features(eden-uwp PRIVATE cxx_std_20)
 if (MSVC)
-    target_compile_options(eden-uwp PRIVATE /EHsc)
+    target_compile_options(eden-uwp PRIVATE /EHsc /we4456 /we4457 /we4459 /we4244)
     # AppContainer executable: required for a sideloadable UWP package.
     target_link_options(eden-uwp PRIVATE /APPCONTAINER)
     # Mesa's D3D12 shader compilation runs on Eden's GPU thread during present and needs more than

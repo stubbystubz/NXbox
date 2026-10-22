@@ -155,6 +155,13 @@ public:
             PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot),
                        sensor_requested && allowed && present &&
                            Settings::values.motion_enabled.GetValue());
+            controller.SetSyntheticMotionGesture(stick_motions[slot].IsModifierActive(),
+                                                 stick_motions[slot].TapCount());
+            if (slot == 0) {
+                hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)
+                    ->SetSyntheticMotionGesture(stick_motions[slot].IsModifierActive(),
+                                                stick_motions[slot].TapCount());
+            }
         }
         previous_devices = devices;
     }
@@ -193,12 +200,11 @@ public:
         const bool modifier =
             (reading.Buttons & GamepadButtons::LeftThumbstick) != GamepadButtons::None ||
             (keys & (1u << Settings::NativeButton::LStick)) != 0;
-        const auto motion =
-            stick_motions[slot].Update(sensor_requested && !suppress_guest && !combo_blocked,
-                                       modifier, static_cast<float>(reading.LeftThumbstickX),
-                                       static_cast<float>(reading.LeftThumbstickY),
-                                       static_cast<float>(reading.RightThumbstickX),
-                                       static_cast<float>(reading.RightThumbstickY), now);
+        const auto motion = stick_motions[slot].Update(
+            sensor_requested, modifier, static_cast<float>(reading.LeftThumbstickX),
+            static_cast<float>(reading.LeftThumbstickY),
+            static_cast<float>(reading.RightThumbstickX),
+            static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -236,8 +242,9 @@ public:
                       (scripted_keys & (1u << i)) != 0;
             if (i == Settings::NativeButton::Minus)
                 pressed = minus_pressed;
-            if ((i == Settings::NativeButton::LStick && motion.suppress_sticks) ||
-                (i == Settings::NativeButton::RStick && primary && record_shortcut.consume_stick))
+            if (i == Settings::NativeButton::LStick)
+                pressed = motion.guest_l3;
+            if (i == Settings::NativeButton::RStick && primary && record_shortcut.consume_stick)
                 pressed = false;
             if (combo_blocked &&
                 (i == Settings::NativeButton::Minus || i == Settings::NativeButton::Plus)) {

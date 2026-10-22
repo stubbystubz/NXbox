@@ -15,6 +15,7 @@ struct StickMotionSample {
     std::array<float, 3> gyro{};
     std::uint64_t delta_timestamp{16667};
     bool suppress_sticks{};
+    bool guest_l3{};
 };
 
 // Portable synthesis in g and turns/second, matching HID's SDL sensor axes.
@@ -28,7 +29,8 @@ public:
     static constexpr float kDeadzone = 0.15f;
 
     StickMotionSample Update(bool sensor_enabled, bool modifier, float left_x, float left_y,
-                             float right_x, float right_y, Clock::time_point now) {
+                             float right_x, float right_y, Clock::time_point now,
+                             bool blocked = false) {
         const float elapsed =
             initialized ? std::chrono::duration<float>(now - last).count() : 1.0f / 60.0f;
         const float dt = std::clamp(elapsed, 0.000001f, 0.1f);
@@ -36,7 +38,44 @@ public:
         last = now;
         StickMotionSample sample;
         sample.delta_timestamp = static_cast<std::uint64_t>(dt * 1000000.0f);
-        sample.suppress_sticks = sensor_enabled && modifier;
+        const bool moved = std::abs(left_x) > kDeadzone || std::abs(left_y) > kDeadzone ||
+                           std::abs(right_x) > kDeadzone || std::abs(right_y) > kDeadzone;
+        if (!sensor_enabled) {
+            pending = motion_hold = cancelled = false;
+            pulse_until = now;
+            sample.guest_l3 = modifier;
+        } else if (blocked) {
+            cancelled = modifier;
+            pending = motion_hold = false;
+            pulse_until = now;
+        } else {
+            if (modifier && !was_l3) {
+                pressed_at = now;
+                pulse_until = now;
+                pending = true;
+                motion_hold = false;
+            }
+            // A held button crossing into sensor mode cannot become a tap on release.
+            if (modifier && !pending && !motion_hold)
+                cancelled = true;
+            if (pending && modifier &&
+                (moved || now - pressed_at >= std::chrono::milliseconds(250))) {
+                pending = false;
+                motion_hold = true;
+            }
+            if (!modifier && was_l3) {
+                if (pending && !cancelled && !moved &&
+                    now - pressed_at < std::chrono::milliseconds(250)) {
+                    pulse_until = now + std::chrono::milliseconds(40);
+                    ++tap_count;
+                }
+                pending = motion_hold = cancelled = false;
+            }
+            sample.guest_l3 = now < pulse_until && !modifier;
+        }
+        was_l3 = modifier;
+        modifier_active = sensor_enabled && modifier && motion_hold && !blocked && !cancelled;
+        sample.suppress_sticks = modifier_active;
         if (!sample.suppress_sticks) {
             tilt_roll = tilt_pitch = aim_pitch = 0.0f;
             return sample;
@@ -63,7 +102,18 @@ public:
         return sample;
     }
 
+    bool IsModifierActive() const {
+        return modifier_active;
+    }
+    std::uint64_t TapCount() const {
+        return tap_count;
+    }
+
 private:
+    Clock::time_point pressed_at{}, pulse_until{};
+    std::uint64_t tap_count{};
+    bool was_l3{}, pending{}, motion_hold{}, cancelled{}, modifier_active{};
+
     static float Axis(float value) {
         const float magnitude =
             std::clamp((std::abs(value) - kDeadzone) / (1.0f - kDeadzone), 0.0f, 1.0f);
