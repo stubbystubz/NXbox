@@ -1,4 +1,4 @@
-# p80b — Native floor and real-priority 60 Hz frame generation
+# p80 — Native floor and real-priority 60 Hz frame generation
 
 Local, uncommitted follow-up in `w-p80`, 2026-10-22. No commit, push, network,
 deployment, or console access was performed.
@@ -7,24 +7,32 @@ deployment, or console access was performed.
 
 `src/video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h` measures
 real, nonempty guest presentation arrivals using steady-clock wall timestamps.
-The rolling window retains about one second and its preceding boundary endpoint.
+The history retains about three seconds and its preceding boundary endpoint.
 Generated frames never enter it, and presentation waits are not subtracted.
 
-The gate starts closed. After a full measurement window, native FPS must remain
-at least 29 for another second to qualify. Below 28 it closes immediately when
-the rolling estimate crosses the threshold. An enabled gate survives the 28–29
-dead band; an inactive gate cannot recover there. Pauses over one second, invalid
-timestamps, and backwards clocks reset qualification. Boundary comparisons allow
-small floating-point rounding error.
+The gate starts closed. It opens once a complete two-second window has a robust
+native rate >=28 FPS. Once open, it closes only when the robust rate over a
+complete three-second window falls below 27 FPS. Each robust rate is the reciprocal
+of the median real-to-real interval whose ending timestamp is in that window;
+for an even number of intervals, the two central intervals are averaged. This
+rejects isolated hitch intervals and half-second dips without making a genuinely
+24 FPS game eligible. The 27–28 band preserves the current qualification state.
+Boundary comparisons allow small floating-point rounding error.
+
+The separate `NativeFps()` value remains the one-second wall-time average used by
+diagnostics, prediction timing and the >=50 FPS pass-through ceiling. It does not
+decide the lower floor. A single hitch up to three seconds does not reset history;
+a gap greater than three seconds (loading/suspension), invalid timestamps or
+backwards clocks clears history and requires a fresh two-second qualification.
 
 All enabled preferences (`2x`, legacy `4x`, `auto`, title presets, and environment
 overrides) share the same rule. There is no title-specific exemption.
 
 | Native FPS | Behavior after qualification |
 | --- | --- |
-| Below 28 | No generated frames |
-| 28–29 | Generation may remain enabled; cannot recover from off |
-| 29 to below 50 | At most one synthetic candidate per real frame; fill empty output slots |
+| Three-second median rate below 27 | Close the floor gate |
+| Robust rate 27 to below 28 | Retain current qualification |
+| Two-second median rate >=28, one-second average below 50 | Qualify; at most one synthetic candidate per real frame |
 | 50 or above | Native pass-through, no generation |
 
 This fixes the earlier p80 restriction to native FPS <=30. Mario Kart 8 Deluxe's
@@ -104,7 +112,7 @@ clang++ -std=c++20 -pthread -Wall -Wextra -Wshadow -Wconversion -Werror
 
 Coverage includes:
 
-- startup, exact 28/29 thresholds, dead-band retention and sustained recovery;
+- startup, exact 27/28 thresholds, dead-band retention and recovery windows;
 - native 27/55 FPS producing no generated frames, with 50 FPS also passing through;
 - native 30/34/34.8/45 FPS filling all 600 simulated slots, capped at 60, with at
   most one generated frame per real frame and real frames winning coincident slots;
@@ -154,9 +162,9 @@ NXBOX_FRAME_PACING=0
 ```
 
 Check native 30 and the reported ~34.8 FPS band, plus 45 FPS if available: generated
-frames should fill empty slots and observed output must not exceed 60. Below 28,
-generation must stop after the rolling estimate crosses the floor; recovery needs
-a full window followed by a sustained second >=29. At >=50, including 55, expect
+frames should fill empty slots and observed output must not exceed 60. Generation
+must stop when the three-second median native rate falls below 27; recovery needs
+a complete two-second window with median rate >=28. Short dips must not close it. At >=50, including 55, expect
 no generation. Check bursts and real-frame priority, motion direction, occlusions,
 scene cuts and absence of backwards motion or color overshoot. Repeat at 120 Hz
 and with `4x` / `auto`: interval 2 and the single-candidate limit must still apply.
@@ -456,3 +464,38 @@ After extending exception accounting coverage, the five presentation tests were
 rerun and passed. The frozen disabled-path hash is unchanged. Changed C++ ranges
 were formatted with clang-format and Python with the cached Ruff; no packages
 were downloaded. `git diff --check` passed.
+
+## p80f — Robust native floor (2026-10-22)
+
+The owner's p80e report records 58.6–59.4 displayed FPS while open, but 72 policy
+transitions in 200 seconds as native delivery fluctuates around 28–31 FPS. Most
+windows contain only 17–31 generated presents. This follow-up changes the lower
+gate measurement to the 3 s / <27 close and 2 s / >=28 reopen policy described
+above. The earlier p80b–p80e sections document historical behavior; their 28/29
+thresholds and >1 s pause resets are superseded by this section.
+
+The production gate retains only real timestamps. Medians use real interval
+samples rather than generated output or a capacity estimate with waits removed.
+The one-second reported rate, >=50 cutoff, supported refresh modes, single
+synthetic candidate, output cap, real priority and presentation path are unchanged.
+The pause reset now requires a gap >3 s so a lone 1.2 s hitch survives as well.
+
+The strict-warning host regression runs 200 s at jittery 28–31 FPS, with a 26 FPS
+half-second dip every seven seconds and a single 0.5 s hitch. At each supported
+refresh (59.94/60/119.88/120 Hz), it asserts exactly one transition (startup), no
+closures after qualification and identical state/rate with or without synthetic
+observations. A sustained switch to 24 FPS closes within 3.1 s; a fresh 24 FPS
+stream stays closed throughout 200 s, even when synthetic samples are injected.
+Other tests cover exact 27/28 boundaries, incomplete startup windows, dead-band
+retention, >3 s suspension reset, invalid clocks and a 1.2 s hitch amid noisy
+display statistics (now zero floor outages).
+
+No network, console access, commit or push was used. The p80e measurements above
+are from the supplied report; this change does not claim new console evidence.
+MSVC/UWP is unavailable on this Mac. Host C++ drivers compile with shadow and
+conversion warnings as errors; this does not certify MSVC C4456/C4457/C4459/C4244.
+
+Validation: all 35 tests passed in the eight-module host suite listed in p80e,
+including pipeline sanitizer checks and the frozen disabled path. The new C++
+driver and changed production header were formatted with clang-format; Python
+was formatted with cached Ruff. `git diff --check` passed.

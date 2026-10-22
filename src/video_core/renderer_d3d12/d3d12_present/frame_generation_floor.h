@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <deque>
+#include <vector>
 
 namespace D3D12::Present {
 // Wall timestamps of real guest presents only. Do not subtract presentation waits:
@@ -15,30 +17,26 @@ public:
             Reset();
             return;
         }
-        if (have_previous && timestamp - previous > 1.0)
-            Reset(); // Loading/suspension must requalify from a fresh window.
+        if (have_previous && timestamp - previous > 3.0)
+            Reset(); // Loading/suspension beyond the floor window must requalify.
         previous = timestamp;
         have_previous = true;
         presents.push_back(timestamp);
-        // Retain the sample just before the one-second boundary. Each interval
-        // has two real endpoints; generated presents can never enter this deque.
-        while (presents.size() > 2 && timestamp - presents[1] >= 1.0)
+        // Keep the endpoint preceding the three-second boundary. Generated
+        // presents never enter this history or either floor measurement.
+        while (presents.size() > 2 && timestamp - presents[1] >= 3.0)
             presents.pop_front();
-        const double duration = timestamp - presents.front();
-        native_fps = duration > 0 ? static_cast<double>(presents.size() - 1) / duration : 0;
-        if (duration < 1.0 - Epsilon || native_fps < 28.0 - Epsilon) {
-            qualified = false;
-            recovering = false;
-        } else if (!qualified) {
-            if (native_fps < 29.0 - Epsilon) {
-                recovering = false;
-            } else if (!recovering) {
-                recovering = true;
-                recovery_since = timestamp;
-            } else if (timestamp - recovery_since >= 1.0 - Epsilon) {
-                qualified = true;
-                recovering = false;
-            }
+        auto recent = presents.begin();
+        while (recent + 1 != presents.end() && timestamp - *(recent + 1) >= 1.0)
+            ++recent;
+        const double duration = timestamp - *recent;
+        native_fps = duration > 0 ? static_cast<double>(presents.end() - recent - 1) / duration : 0;
+        if (qualified) {
+            if (timestamp - presents.front() >= 3.0 - Epsilon && MedianRate(3.0) < 27.0 - Epsilon)
+                qualified = false;
+        } else if (timestamp - presents.front() >= 2.0 - Epsilon &&
+                   MedianRate(2.0) >= 28.0 - Epsilon) {
+            qualified = true;
         }
     }
     double NativeFps() const {
@@ -55,15 +53,31 @@ public:
     }
 
 private:
+    double MedianRate(double window) const {
+        std::vector<double> intervals;
+        for (auto endpoint = presents.begin() + 1; endpoint != presents.end(); ++endpoint) {
+            if (presents.back() - *endpoint < window)
+                intervals.push_back(*endpoint - *(endpoint - 1));
+        }
+        if (intervals.empty())
+            return 0;
+        const auto middle = intervals.begin() +
+                            static_cast<std::vector<double>::difference_type>(intervals.size() / 2);
+        std::nth_element(intervals.begin(), middle, intervals.end());
+        const double median = intervals.size() % 2 != 0
+                                  ? *middle
+                                  : (*middle + *std::max_element(intervals.begin(), middle)) / 2;
+        return 1.0 / median;
+    }
     void Reset() {
         presents.clear();
         native_fps = 0;
-        have_previous = qualified = recovering = false;
+        have_previous = qualified = false;
     }
     static constexpr double Epsilon = 1e-8;
     std::deque<double> presents;
-    double previous{}, native_fps{}, recovery_since{};
-    bool have_previous{}, qualified{}, recovering{};
+    double previous{}, native_fps{};
+    bool have_previous{}, qualified{};
 };
 // Reserve positive-interval DXGI presents, one output slot ahead of scanout.
 // Preparing/submitting at the scanout deadline is too late: guest work may already

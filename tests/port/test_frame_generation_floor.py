@@ -44,12 +44,12 @@ int main() {
         // Multiplier is a candidate limit; actual output is slot-limited.
         assert(schedule.Count() <= 1);
     }
-    run(28, 40); assert(gate.Multiplier(60) == 2); // Exact off threshold stays on.
-    run(28.5, 40); assert(gate.Multiplier(60) == 2); // Stay on in dead band.
-    run(27, 40); assert(!gate.Multiplier(60));
-    run(28.5, 70); assert(!gate.Multiplier(60)); // Cannot recover below 29.
-    run(30, 30); assert(!gate.Multiplier(60)); // Recovery not held a full second yet.
-    run(29, 65); assert(gate.Multiplier(60) == 2); // Exact recovery threshold qualifies.
+    run(28, 100); assert(gate.Multiplier(60) == 2); // Recovery threshold stays on.
+    run(27, 100); assert(gate.Multiplier(60) == 2); // Exact close threshold stays on.
+    run(26, 100); assert(!gate.Multiplier(60));
+    run(27.5, 100); assert(!gate.Multiplier(60)); // Cannot recover below 28.
+    run(28, 28); assert(!gate.Multiplier(60)); // Most of the recovery window is still slow.
+    run(28, 40); assert(gate.Multiplier(60) == 2); // Exact recovery threshold qualifies.
     for (double fps : {31., 34., 34.8, 40., 45., 49.9}) {
         run(fps, 150);
         assert(gate.Multiplier(60) == 2 && gate.Multiplier(120) == 2);
@@ -59,7 +59,7 @@ int main() {
         assert(!gate.Multiplier(60) && !gate.Multiplier(120));
     }
     run(30, 90); assert(gate.Multiplier(60) == 2);
-    now += 2; gate.ObservePresent(now); assert(!gate.Multiplier(60));
+    now += 4; gate.ObservePresent(now); assert(!gate.Multiplier(60));
     run(30, 29); assert(!gate.Multiplier(60)); // Pause invalidates the window.
     run(30, 65); assert(gate.Multiplier(60) == 2);
     gate.ObservePresent(std::numeric_limits<double>::quiet_NaN());
@@ -75,6 +75,76 @@ int main() {
     }
     assert(std::abs(low.NativeFps() - 25) < 1e-8);
     assert(!low.Multiplier(60)); // Generated output must never manufacture eligibility.
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            compile_run(
+                driver,
+                Path(directory),
+                extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
+            )
+
+    def test_jittery_native_floor_for_200_seconds_and_sustained_low_rate(self):
+        driver = r"""
+
+#include "video_core/renderer_d3d12/d3d12_present/frame_generation_floor.h"
+#include <cassert>
+#include <cmath>
+int main() {
+  using namespace D3D12::Present;
+  for (double refresh : {59.94, 60., 119.88, 120.}) {
+    NativeFrameGenerationGate gate, real_only;
+    double now = 0;
+    unsigned frame = 0, transitions = 0, dips = 0;
+    bool enabled = false, dipping = false;
+    gate.ObservePresent(now);
+    real_only.ObservePresent(now);
+    while (now < 200) {
+      // Each seven-second cycle contains half a second at 26 native FPS.
+      const bool next_dipping = std::fmod(now, 7.0) >= 6.5;
+      if (next_dipping && !dipping)
+        ++dips;
+      dipping = next_dipping;
+      const double fps =
+          dipping ? 26.0 : 28.0 + static_cast<double>((frame * 17u) % 31u) / 10;
+      const double interval = frame == 3000 ? 0.5 : 1.0 / fps;
+      // Even invalid generated timestamps must not affect real history.
+      gate.ObservePresent(-1, false);
+      gate.ObservePresent(now + interval / 2, false);
+      now += interval;
+      ++frame;
+      gate.ObservePresent(now);
+      real_only.ObservePresent(now);
+      assert(gate.NativeFps() == real_only.NativeFps());
+      assert(gate.Multiplier(refresh) == real_only.Multiplier(refresh));
+      const bool next_enabled = gate.Multiplier(refresh) != 0;
+      if (next_enabled != enabled)
+        ++transitions;
+      if (now < 2.0 - 1e-8)
+        assert(!next_enabled);
+      if (now >= 2.1)
+        assert(next_enabled);
+      enabled = next_enabled;
+    }
+    assert(dips >= 28 &&
+           transitions == 1); // Initial opening only; never closes.
+    // Genuine low performance must close an already qualified gate.
+    const double slowdown = now;
+    while (now - slowdown < 3.1) {
+      now += 1.0 / 24;
+      gate.ObservePresent(now);
+    }
+    assert(!gate.Multiplier(refresh));
+    // A fresh 24 FPS title cannot qualify, even with synthetic observations.
+    NativeFrameGenerationGate low;
+    for (unsigned sample = 0; sample <= 4800; ++sample) {
+      const double timestamp = static_cast<double>(sample) / 24;
+      low.ObservePresent(timestamp);
+      low.ObservePresent(timestamp + 1.0 / 48, false);
+      assert(!low.Multiplier(refresh));
+    }
+    assert(std::abs(low.NativeFps() - 24) < 1e-8);
+  }
 }
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -127,13 +197,13 @@ int main() {
             if (warmed) {
                 if (enabled && !next_enabled) ++outages;
                 if (!enabled && next_enabled && frame > 200) ++recoveries;
-                if (frame < 3300 || frame > 3370) assert(next_enabled);
+                assert(next_enabled);
                 assert(display.Hertz() / gate.Interval(display.Hertz()) <= 60);
             }
             enabled = next_enabled;
         }
         assert(short_window_rejections > 100); // Old estimator repeatedly flaps.
-        assert(outages == 1 && recoveries == 1); // Exactly one hitch/recovery episode.
+        assert(outages == 0 && recoveries == 0); // One hitch cannot close the robust floor.
         assert(enabled && std::abs(gate.NativeFps() - 33) < 1e-7);
     }
     // A genuine display change still gates; one outlying window does not.
