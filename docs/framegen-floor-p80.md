@@ -605,3 +605,131 @@ C++ changes were formatted with clang-format and Python with cached Ruff;
 `git diff --check` passed. MSVC/UWP is not installed on this Mac, so native MSVC
 C4456/C4457/C4459/C4244 validation remains unavailable. No network, console,
 commit or push was used.
+
+## p80h — Remove optional presenter synchronization (2026-10-22)
+
+Local change against `eca08797f` (p80g). No commit, push, network, deployment,
+console access, Apple account changes, build or simulator launch.
+
+### Artifact comparison
+
+`tools/nxbox/framegen_cost_report.py` reads the supplied artifacts locally. It
+selects zero-based profile records 12 through 33: the first 22 common active-race
+windows, after menus/loading and before the final window. These are p74 diag
+lines 1793–3929 (3,565 real frames) and p80g lines 779–1810 (2,930 real frames).
+Each total is divided by that run's **real** frame count, never output presents.
+The windows are matched by run position, not claimed to contain identical game
+frames: the slower run progresses differently under the same input script.
+
+| Field per real frame | p74 FG off | p80g FG on | Delta |
+| --- | ---: | ---: | ---: |
+| Thread CPU, approximate ms | 24.6376 | 24.9546 | +0.3170 |
+| Recorder CPU ms | 3.4011 | 3.0183 | -0.3828 |
+| `maxwell3d_methods_cpu_ms` | 5.3308 | 11.4298 | +6.0991 |
+| `texture_cache_update_cpu_ms` | 1.9827 | 2.5744 | +0.5917 |
+| `staging_collect_cpu_ms` | 0.0948 | 0.2315 | +0.1367 |
+| `between_draws_cpu_ms` | 0.0079 | 0.1218 | +0.1139 |
+| `fence_wait_wall_ms` | 0.1214 | 0.2730 | +0.1516 |
+| `submit_cpu_ms` | 0.5155 | 0.5424 | +0.0269 |
+| `draw_recording_cpu_ms` | 2.2155 | 2.2476 | +0.0321 |
+| `descriptor_setup_cpu_ms` | 3.2828 | 3.3022 | +0.0193 |
+| `barriers_cpu_ms` | 0.2677 | 0.2752 | +0.0075 |
+| `gpu_busy_ms` | 10.2730 | 10.4475 | +0.1745 |
+| `ExecuteCommandLists`, calls | 16.0435 | 16.7399 | +0.6965 |
+| `forced_submits_present`, calls | 1.0000 | 1.2993 | +0.2993 |
+| `fg_generated_service_ms` | — | 0.2607 | — |
+| `fg_real_present_ms` | — | 0.1928 | — |
+| `fg_fence_ms` | — | 0.0007 | — |
+
+The misleading `*_cpu_ms` phase names use QPC **wall time** in
+`FrameProfile::Switch`, unlike `gpu_thread_cpu_pct` and recorder CPU which use
+`GetThreadTimes`. The approximate thread CPU value above uses the nominal
+five-second profile period; exact elapsed timestamps are absent in p74's lines.
+Do not add these phase fields to thread CPU or call the +6.10 ms extra executed
+CPU. Unscoped presenter work can accrue to the surrounding phase.
+
+p74 contains 2,292 `THREAD_PROFILE` records, including `name=GPU`,
+`name=GPUFencingThread` and `host_wait=present/fence`; p80g contains **zero**.
+There is no defensible two-run delta for those THREAD fields. The shared
+`D3D12_FRAME_PROFILE.gpu_thread_cpu_pct` supplies the CPU comparison instead.
+
+Including the final window (`--count 23`) retains the conclusion:
+Maxwell wall +5.8467 ms/real frame, approximate thread CPU +0.2899 ms,
+texture-cache wall +0.5724 ms, GPU busy +0.2347 ms, fence wall +0.3080 ms.
+This avoids relying on exclusion of the last p80g fence/service spike.
+
+Reproduce (paths relative to the worktree):
+
+```sh
+python3 tools/nxbox/framegen_cost_report.py \
+  ../artifacts/compat-2026-10-18/r-mk8d-p74/diag.txt \
+  ../artifacts/compat-2026-10-18/r-mk8d-p80g/diag.txt
+```
+
+### Changes and attribution limits
+
+- `FrameGenerator::Configure` formerly called `GetDesc` and, for an unspecified
+  flip-model refresh, `GetFrameStatistics` on every real frame, including while
+  the native gate was closed. Cache the swapchain mode once; poll the existing
+  two-second refresh estimator at most every 250 ms. ResizeBuffers changes only
+  extent in this presenter. This removes per-real DXGI configuration queries;
+  their share of the observed wall-time increase is a hypothesis, not measured
+  by the old artifacts. Profiling's separate output-statistics queries remain.
+- `PresentIdle` polls `IsFree` and drops the optional candidate on a busy
+  backbuffer. It no longer waits for that buffer. Cancellation clears its
+  deadline, preventing repeated idle dispatch or catch-up credit.
+- `PresentGenerated` makes one positive-interval `DO_NOT_WAIT` attempt. A busy
+  DXGI queue drops the candidate. Unsupported flags disable generation for the
+  session with one diagnostic, with no blocking retry. Genuine errors retain
+  the renderer error boundary. Only successful attempts increment submitted
+  output and advance the schedule.
+- Remove the post-synthetic wait on the next backbuffer and the full-resolution
+  copy of `Current()` into it. The next real `Draw` already clears and composites
+  the whole target. The synthetic buffer's submit tick still protects subsequent
+  reuse, including when DXGI rejected the present. GPU submission acknowledgement
+  before DXGI remains necessary for recorder/queue ordering.
+- Add `fg_cancel_backpressure`, `fg_configure_ms` and `fg_prepare_ms`. The latter
+  two are wall totals; preparation includes configuration. These expose the
+  previously unmeasured real-frame preparation path for a future capture.
+- Make `Configure`'s mode-to-float conversion explicit. The strict host compiler
+  caught the old implicit conversion while compiling the extracted real method.
+
+The p80g native floor, trimming, hysteresis, real-only observations, refresh
+estimator algorithm, real priority and output interval selection are unchanged.
+The descriptor cache/poll cadence changes observation frequency, not thresholds.
+No display cadence or native performance result is fabricated. These local
+changes remove concrete avoidable work; **FG-on within approximately 1 FPS of
+FG-off remains unverified**, and the old aggregate profiles do not establish
+that the removed work explains the full loss. A subsequent controlled on/off
+capture must check preparation timing, acknowledgement/recorder costs, remaining
+cache wall-time changes, actual generated output and native FPS. An unsupported
+nonblocking present can disable FG; native parity in that fallback is not proof
+of parity while generation is actively displaying frames.
+
+### Host validation
+
+39 tests passed:
+
+```sh
+PYTHONPATH=tests/port python3 -m unittest \
+  test_frame_generation test_frame_generation_floor test_frame_generation_targets \
+  test_frame_generation_presentation test_frame_generation_cost test_frame_pacing \
+  test_d3d12_gpu_thread_profile test_d3d12_draw_phases test_gpu_pipeline
+```
+
+After adding explicit caller-level busy/unsupported cancellation cases and
+strict warnings to the generated-present driver, all 15 affected tests passed
+again (`test_frame_generation`, `test_frame_generation_presentation`,
+`test_frame_generation_cost`). Coverage executes production Configure, generated
+presentation and idle control flow with GPU/DXGI doubles: one descriptor query,
+4 Hz polling, specified 60/120/144 Hz, disjoint reset/recovery, busy backbuffers,
+DXGI busy/unsupported with one attempt, no phantom output, no real-buffer restore,
+no explicit optional fence waits, correct terminal counters/deadline cleanup,
+and unchanged real-only floor behavior. Existing disabled command hash and
+pipeline sanitizer/replay checks pass.
+
+Changed C++ ranges were formatted by clang-format; touched Python files by the
+locally cached Ruff. `git diff --check` passes. New production-method host drivers
+and the generated-present regression use `-Wall -Wextra -Wshadow -Wconversion
+-Werror`. MSVC/UWP and HLSL cannot be built here; these host checks do not certify
+MSVC C4456/C4457/C4459/C4244 or the physical console's DXGI behavior.

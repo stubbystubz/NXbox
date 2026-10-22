@@ -481,7 +481,7 @@ int main() {
     def test_presenter_uses_gate_for_every_mode_and_profiles_native_rate(self):
         renderer = (ROOT / "src/video_core/renderer_d3d12/renderer_d3d12.cpp").read_text()
         present = function(renderer, "    void Present(const Layout::FramebufferLayout& layout,")
-        generated = function(renderer, "    void PresentGenerated(")
+        generated = function(renderer, "    bool PresentGenerated(")
         observation = function(renderer, "    void ObserveNativeFrame()")
         self.assertEqual(present.count("ObserveNativeFrame();"), 1)
         self.assertIn("if (!layers.empty())\n            ObserveNativeFrame();", present)
@@ -502,7 +502,7 @@ int main() {
         self.assertIn("DropGenerated(Present::FrameGenerationEvent::CancelReal)", present)
         self.assertIn("vblank_schedule.Presented(submitted_at, output_hz, true", present)
         self.assertNotIn("sleep_until", present)
-        self.assertIn("swapchain->Present(target_interval, 0)", generated)
+        self.assertIn("swapchain->Present(target_interval, DXGI_PRESENT_DO_NOT_WAIT)", generated)
         gpu_thread = (ROOT / "src/video_core/gpu_thread.cpp").read_text()
         self.assertIn("state.queue.PopWaitUntil(next, stop_token, deadline)", gpu_thread)
         self.assertLess(
@@ -518,7 +518,7 @@ int main() {
         base = ROOT / "src/video_core/renderer_d3d12"
         source = (base / "d3d12_present/frame_generation.cpp").read_text()
         configure = function(source, "unsigned FrameGenerator::Configure(")
-        self.assertIn("if (specified_refresh)", configure)
+        self.assertIn("if (impl->specified_refresh_hz > 0)", configure)
         self.assertIn("impl->refresh_estimate.Observe(", configure)
         self.assertIn("impl->refresh_hz = impl->refresh_estimate.Hertz()", configure)
         self.assertNotIn("impl->refresh_sample", configure)
@@ -530,7 +530,7 @@ int main() {
         )
         for signature in (
             "    void Present(const Layout::FramebufferLayout& layout,",
-            "    void PresentGenerated(",
+            "    bool PresentGenerated(",
         ):
             self.assertEqual(function(renderer, signature).count("RecordPresentation();"), 1)
         profile = (base / "d3d12_context.cpp").read_text()

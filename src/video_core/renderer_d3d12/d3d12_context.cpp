@@ -808,9 +808,11 @@ void FrameProfile::EndFrame(bool presented) {
             line += fmt::format(" fg_{}={}", Present::FrameGenerationEvents::Names[event],
                                 frame_generation.counts[event]);
         line += fmt::format(" fg_real_present_ms={:.3f} fg_generated_service_ms={:.3f}"
-                            " fg_fence_ms={:.3f} fg_late_ms={:.3f}",
+                            " fg_fence_ms={:.3f} fg_late_ms={:.3f}"
+                            " fg_configure_ms={:.3f} fg_prepare_ms={:.3f}",
                             frame_generation.real_present_ms, frame_generation.generated_service_ms,
-                            frame_generation.fence_ms, frame_generation.late_ms);
+                            frame_generation.fence_ms, frame_generation.late_ms,
+                            frame_generation.configure_ms, frame_generation.prepare_ms);
         line += fmt::format(" output_fps={:.2f} output_presents={}",
                             static_cast<double>(output_presents) * 10000000.0 / elapsed,
                             output_presents);

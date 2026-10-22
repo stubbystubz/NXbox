@@ -551,6 +551,7 @@ struct RendererD3D12::Impl {
         if (frame_generation_enabled && frame_generation_failed && !layers.empty())
             CountGeneration(Present::FrameGenerationEvent::Failure);
         if (frame_generation_enabled && !frame_generation_failed && !layers.empty()) {
+            const double preparation_started = PresentationTime();
             DropGenerated(Present::FrameGenerationEvent::CancelReal);
             ResourcePtr generated;
             try {
@@ -564,7 +565,11 @@ struct RendererD3D12::Impl {
                 }
                 // Every preference (including legacy 4x/auto and env overrides) shares
                 // the native floor and the same 60 fps ceiling.
+                const double configure_started = PresentationTime();
                 frame_generator->Configure(swapchain.Get(), 2, true);
+                if (context.Profile().Enabled())
+                    context.Profile().frame_generation.configure_ms +=
+                        (PresentationTime() - configure_started) * 1000.0;
                 const double refresh = frame_generator->RefreshHz();
                 effective_frame_generation_mode = native_frame_gate.Multiplier(refresh);
                 target_interval = native_frame_gate.Interval(refresh);
@@ -617,6 +622,9 @@ struct RendererD3D12::Impl {
             }
             pending_generated = std::move(generated);
             context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (context.Profile().Enabled())
+                context.Profile().frame_generation.prepare_ms +=
+                    (PresentationTime() - preparation_started) * 1000.0;
         }
         // Only the display target receives host diagnostics; Capture() never reaches this path.
         if (!layers.empty()) {
@@ -714,7 +722,11 @@ struct RendererD3D12::Impl {
             CountGeneration(Present::FrameGenerationEvent::DeadlineMiss);
         const double wait_started = PresentationTime();
         UINT index = swapchain->GetCurrentBackBufferIndex();
-        context.WaitSubmitted(present_ticks[index], "frame generation idle slot");
+        // Optional output must never wait for a buffer needed by the real producer.
+        if (!context.IsFree(present_ticks[index])) {
+            DropGenerated(Present::FrameGenerationEvent::CancelBackpressure);
+            return;
+        }
         if (context.Profile().Enabled()) {
             context.Profile().frame_generation.fence_ms +=
                 (PresentationTime() - wait_started) * 1000.0;
@@ -725,16 +737,23 @@ struct RendererD3D12::Impl {
             return;
         }
         const double submitted_at = PresentationTime();
+        bool presented = false;
         try {
-            PresentGenerated(pending_generated, rasterizer, index);
+            presented = PresentGenerated(pending_generated, rasterizer, index);
         } catch (...) {
             DropGenerated(Present::FrameGenerationEvent::Failure);
             throw;
         }
-        CountGeneration(Present::FrameGenerationEvent::Submitted);
         if (context.Profile().Enabled())
             context.Profile().frame_generation.generated_service_ms +=
                 (PresentationTime() - submitted_at) * 1000.0;
+        if (!presented) {
+            DropGenerated(frame_generation_failed
+                              ? Present::FrameGenerationEvent::Failure
+                              : Present::FrameGenerationEvent::CancelBackpressure);
+            return;
+        }
+        CountGeneration(Present::FrameGenerationEvent::Submitted);
         vblank_schedule.Presented(submitted_at, output_hz, false);
         pending_generated.reset();
         idle_deadline.store(0);
@@ -805,8 +824,7 @@ struct RendererD3D12::Impl {
         previous_statistics = stats;
         have_statistics = true;
     }
-    void PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
-        // The complete real image is safe in Current(), before touching the swapchain.
+    bool PresentGenerated(const ResourcePtr& generated, RasterizerD3D12& rasterizer, UINT& index) {
         const auto copy = [&](const ResourcePtr& destination, const ResourcePtr& source) {
             context.Transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE);
             context.Transition(destination, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -822,12 +840,25 @@ struct RendererD3D12::Impl {
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
         CountPresentCall(true);
-        Check(swapchain->Present(target_interval, 0), "Present generated frame", context.Device());
+        // Keep the positive interval for scanout cadence, but never block the
+        // guest producer on an optional DXGI queue slot. Do not retry with a
+        // blocking Present when this platform rejects DO_NOT_WAIT.
+        const auto status = swapchain->Present(target_interval, DXGI_PRESENT_DO_NOT_WAIT);
+        if (status == DXGI_ERROR_WAS_STILL_DRAWING)
+            return false;
+        if (status == DXGI_ERROR_INVALID_CALL) {
+            frame_generation_failed = true;
+            Diagnostic(
+                "D3D12 frame generation disabled for session: nonblocking Present unsupported");
+            return false;
+        }
+        Check(status, "Present generated frame", context.Device());
         Common::FpsOverlay::Presented();
         RecordPresentation();
-        index = swapchain->GetCurrentBackBufferIndex();
-        context.WaitSubmitted(present_ticks[index], "frame generation real frame");
-        copy(buffers[index], frame_generator->Current());
+        // The next real Draw clears and composites its own buffer. Restoring the
+        // previous endpoint here adds a fence round trip and a full output copy
+        // that is overwritten before anyone can display it.
+        return true;
     }
 };
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& window,

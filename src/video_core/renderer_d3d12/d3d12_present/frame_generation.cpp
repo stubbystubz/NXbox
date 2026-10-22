@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstring>
 #include <fmt/format.h>
 #include "d3d12_present_shader_source.h"
@@ -33,6 +34,9 @@ struct FrameGenerator::Impl {
     unsigned mode{2};
     float fraction{0.5f};
     double refresh_hz{};
+    bool queried_refresh{};
+    double specified_refresh_hz{};
+    std::chrono::steady_clock::time_point next_refresh_poll{};
     DisplayRefreshEstimate refresh_estimate;
     bool logged_refresh{};
     u64 sample_id{}, completed_sample{};
@@ -477,32 +481,43 @@ double FrameGenerator::RefreshHz() const {
     return impl->refresh_hz;
 }
 unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requested, bool locked) {
-    DXGI_SWAP_CHAIN_DESC desc{};
-    const bool specified_refresh = SUCCEEDED(swapchain->GetDesc(&desc)) &&
-                                   desc.BufferDesc.RefreshRate.Denominator &&
-                                   desc.BufferDesc.RefreshRate.Numerator;
-    if (specified_refresh)
-        impl->refresh_hz =
-            double(desc.BufferDesc.RefreshRate.Numerator) / desc.BufferDesc.RefreshRate.Denominator;
+    // The swapchain mode is fixed for this presenter (ResizeBuffers only changes
+    // extent). Querying its descriptor on every guest present can synchronize
+    // with DXGI even when generation is gated off.
+    if (!impl->queried_refresh) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (SUCCEEDED(swapchain->GetDesc(&desc)) && desc.BufferDesc.RefreshRate.Denominator &&
+            desc.BufferDesc.RefreshRate.Numerator)
+            impl->specified_refresh_hz = double(desc.BufferDesc.RefreshRate.Numerator) /
+                                         desc.BufferDesc.RefreshRate.Denominator;
+        impl->queried_refresh = true;
+    }
     // A specified output mode is authoritative. For flip-model 0/0, use a
     // sustained counter window rather than a quotient between adjacent frames.
-    DXGI_FRAME_STATISTICS sample{};
-    if (specified_refresh) {
+    const auto now = std::chrono::steady_clock::now();
+    if (impl->specified_refresh_hz > 0) {
+        impl->refresh_hz = impl->specified_refresh_hz;
         impl->refresh_estimate.Reset();
-    } else if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
-        LARGE_INTEGER frequency{};
-        QueryPerformanceFrequency(&frequency);
-        if (frequency.QuadPart > 0) {
-            impl->refresh_estimate.Observe(sample.SyncRefreshCount,
-                                           static_cast<double>(sample.SyncQPCTime.QuadPart) /
-                                               static_cast<double>(frequency.QuadPart));
+    } else if (now >= impl->next_refresh_poll) {
+        // The estimator already requires two-second windows. Four polls per
+        // second retain counter-window accuracy without a DXGI query per frame.
+        impl->next_refresh_poll = now + std::chrono::milliseconds{250};
+        DXGI_FRAME_STATISTICS sample{};
+        if (SUCCEEDED(swapchain->GetFrameStatistics(&sample))) {
+            LARGE_INTEGER frequency{};
+            QueryPerformanceFrequency(&frequency);
+            if (frequency.QuadPart > 0) {
+                impl->refresh_estimate.Observe(sample.SyncRefreshCount,
+                                               static_cast<double>(sample.SyncQPCTime.QuadPart) /
+                                                   static_cast<double>(frequency.QuadPart));
+            } else {
+                impl->refresh_estimate.Reset();
+            }
+            impl->refresh_hz = impl->refresh_estimate.Hertz();
         } else {
             impl->refresh_estimate.Reset();
+            impl->refresh_hz = 0;
         }
-        impl->refresh_hz = impl->refresh_estimate.Hertz();
-    } else {
-        impl->refresh_estimate.Reset();
-        impl->refresh_hz = 0;
     }
     const unsigned mode =
         locked ? requested : DisplayFrameGenerationMode(requested, impl->refresh_hz);
@@ -518,7 +533,7 @@ unsigned FrameGenerator::Configure(IDXGISwapChain3* swapchain, unsigned requeste
     }
     impl->policy.locked = locked;
     impl->mode = mode;
-    impl->fraction = mode > 1 ? 1.f / mode : .5f;
+    impl->fraction = mode > 1 ? 1.f / static_cast<float>(mode) : .5f;
     return mode;
 }
 ResourcePtr FrameGenerator::Interpolate(float fraction) noexcept {

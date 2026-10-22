@@ -24,6 +24,7 @@ enum class FrameGenerationEvent : std::size_t {
     CancelHidden,
     Submitted,
     DeadlineMiss,
+    CancelBackpressure,
     Count
 };
 struct FrameGenerationEvents {
@@ -37,9 +38,10 @@ struct FrameGenerationEvents {
               "rejected_failure",     "cancel_real_arrival",
               "cancel_real_fence",    "cancel_real_ready",
               "cancel_hidden",        "submitted",
-              "deadline_misses"};
+              "deadline_misses",      "cancel_backpressure"};
     std::array<std::uint64_t, Names.size()> counts{};
     double real_present_ms{}, generated_service_ms{}, fence_ms{}, late_ms{};
+    double configure_ms{}, prepare_ms{};
     void Count(FrameGenerationEvent event) {
         ++counts[static_cast<std::size_t>(event)];
     }

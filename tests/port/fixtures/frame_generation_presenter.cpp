@@ -9,6 +9,8 @@
 #include <memory>
 #include <string_view>
 using UINT = unsigned;
+constexpr unsigned DXGI_PRESENT_DO_NOT_WAIT = 1;
+constexpr int DXGI_ERROR_WAS_STILL_DRAWING = -1, DXGI_ERROR_INVALID_CALL = -2;
 struct Resource {
   struct Handle {
     Resource *Get() { return nullptr; }
@@ -43,7 +45,7 @@ struct Context {
 struct Swapchain {
   unsigned index{};
   int Present(unsigned interval, unsigned flags) {
-    assert((interval == 1 || interval == 2) && flags == 0);
+    assert((interval == 1 || interval == 2) && flags <= 1);
     index ^= 1;
     return 0;
   }

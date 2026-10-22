@@ -21,7 +21,7 @@ class FrameGenerationPresentationTests(unittest.TestCase):
         driver = (ROOT / "tests/port/fixtures/frame_generation_presenter.cpp").read_text()
         driver = driver.replace("// POLICY", present[policy_start:policy_end])
         driver = driver.replace("// OBSERVATION", function(source, "    void ObserveNativeFrame()"))
-        driver = driver.replace("// GENERATED", function(source, "    void PresentGenerated("))
+        driver = driver.replace("// GENERATED", function(source, "    bool PresentGenerated("))
         with tempfile.TemporaryDirectory() as directory:
             compile_run(driver, Path(directory), extra_flags=FLAGS)
 
@@ -110,8 +110,10 @@ struct Context {
     std::atomic<bool>* ready{};
     bool interrupt{};
     struct Profile& Profile() { return profile; }
-    void WaitSubmitted(unsigned, const char*) {
+    bool available{true};
+    bool IsFree(unsigned) {
         if (interrupt) ready->store(true);
+        return available;
     }
 };
 struct Swapchain { unsigned GetCurrentBackBufferIndex() const { return 0; } };
@@ -128,7 +130,7 @@ struct Presenter {
     unsigned present_ticks[1]{};
     double output_hz{60}, now{}, last_scanout{};
     unsigned generated{}, displayed{};
-    bool failure{};
+    bool failure{}, busy{}, unsupported{};
     Presenter() { context.ready = &real_ready; }
     double PresentationTime() const { return now; }
     void QueuePresent() {
@@ -137,12 +139,15 @@ struct Presenter {
                                std::ceil(now * output_hz) / output_hz);
         ++displayed;
     }
-    void PresentGenerated(const ResourcePtr& image, RasterizerD3D12&, unsigned&) {
+    bool PresentGenerated(const ResourcePtr& image, RasterizerD3D12&, unsigned&) {
         assert(image && *image == 15); // Forward prediction, prepared before guest work.
         if (failure) throw 1;
+        if (unsupported) { frame_generation_failed = true; return false; }
+        if (busy) return false;
         ++generated;
         QueuePresent();
         now += 0.0004; // GPU prediction/copy has a nonzero cost.
+        return true;
     }
     // METHODS
 };
@@ -190,15 +195,26 @@ int main() {
     presenter.DropGenerated(E::CancelReal); // A candidate has exactly one terminal reason.
     prime(); presenter.real_ready = true; presenter.PresentIdle(rasterizer);
     prime(); presenter.context.interrupt = true; presenter.PresentIdle(rasterizer);
+    prime(); presenter.context.available = false; presenter.PresentIdle(rasterizer);
+    assert(!presenter.pending_generated && presenter.idle_deadline.load() == 0);
+    presenter.context.available = true;
+    prime(); presenter.busy = true; presenter.PresentIdle(rasterizer);
+    assert(!presenter.pending_generated && presenter.idle_deadline.load() == 0);
+    presenter.busy = false;
     prime(); presenter.DropGenerated(E::CancelHidden);
     prime(); presenter.now += 0.1; presenter.PresentIdle(rasterizer);
     prime(); presenter.failure = true;
     try { presenter.PresentIdle(rasterizer); assert(false); } catch (int) {}
     assert(!presenter.pending_generated && presenter.idle_deadline.load() == 0);
+    presenter.failure = false;
+    prime(); presenter.unsupported = true; presenter.PresentIdle(rasterizer);
+    assert(!presenter.pending_generated && presenter.idle_deadline.load() == 0);
     const auto& events = presenter.context.profile.frame_generation.counts;
     for (E event : {E::CancelReal, E::CancelReady, E::CancelFence, E::CancelHidden,
-                   E::Submitted, E::DeadlineMiss, E::Failure})
+                   E::Submitted, E::DeadlineMiss})
         assert(events[static_cast<std::size_t>(event)] == 1);
+    assert(events[static_cast<std::size_t>(E::Failure)] == 2);
+    assert(events[static_cast<std::size_t>(E::CancelBackpressure)] == 2);
     presenter.context.profile.frame_generation = {}; // Profile window rollover.
     for (auto count : events) assert(count == 0);
     presenter.context.profile.enabled = false;
@@ -301,7 +317,7 @@ int main() {
         renderer = (ROOT / "src/video_core/renderer_d3d12/renderer_d3d12.cpp").read_text()
         real = function(renderer, "    void Present(const Layout::FramebufferLayout& layout,")
         paced = function(renderer, "    HRESULT PresentPaced(")
-        generated = function(renderer, "    void PresentGenerated(")
+        generated = function(renderer, "    bool PresentGenerated(")
         self.assertEqual(real.count("CountPresentCall(false);"), 2)
         self.assertEqual(paced.count("CountPresentCall(false);"), 1)
         self.assertEqual(generated.count("CountPresentCall(true);"), 1)

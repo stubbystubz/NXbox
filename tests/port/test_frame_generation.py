@@ -394,15 +394,13 @@ int main() {
         self.assertNotIn("swapchain->Present(", source)
         self.assertNotIn("Copy(source,", source)
         presenter = PRESENT.read_text()
-        branch = function(presenter, "    void PresentGenerated(")
+        branch = function(presenter, "    bool PresentGenerated(")
         self.assertLess(
             branch.index("copy(buffers[index], generated)"),
             branch.index('"Present generated frame"'),
         )
-        self.assertLess(
-            branch.index('"Present generated frame"'),
-            branch.index("copy(buffers[index], frame_generator->Current())"),
-        )
+        self.assertNotIn("frame_generator->Current()", branch)
+        self.assertNotIn("WaitSubmitted", branch)
         self.assertIn(
             "context.Transition(buffers[index], D3D12_RESOURCE_STATE_RENDER_TARGET)", presenter
         )
@@ -478,7 +476,7 @@ int main() {
             )
 
     def test_production_generated_present_order_and_slot_reuse(self):
-        body = function(PRESENT.read_text(), "    void PresentGenerated(")
+        body = function(PRESENT.read_text(), "    bool PresentGenerated(")
         driver = r"""
 #include <array>
 #include <cassert>
@@ -486,6 +484,9 @@ int main() {
 #include <string_view>
 #include <vector>
 using UINT = unsigned;
+constexpr unsigned DXGI_PRESENT_DO_NOT_WAIT = 1;
+constexpr int DXGI_ERROR_WAS_STILL_DRAWING = -1, DXGI_ERROR_INVALID_CALL = -2;
+void Diagnostic(const char*) {}
 using ResourcePtr = std::shared_ptr<struct Resource>;
 struct Resource {
     int pixel;
@@ -513,8 +514,12 @@ struct Swapchain {
     unsigned index{};
     std::vector<int> displayed;
     unsigned expected_interval{1};
+    int response{};
+    unsigned calls{};
     int Present(unsigned sync, unsigned flags) {
-        assert(sync == expected_interval && flags == 0);
+        assert(sync == expected_interval && flags == DXGI_PRESENT_DO_NOT_WAIT);
+        ++calls;
+        if (response) return response;
         displayed.push_back((*buffers)[index]->pixel);
         index ^= 1;
         return 0;
@@ -540,6 +545,7 @@ struct Presenter {
     std::array<ResourcePtr, 2> buffers;
     std::array<unsigned, 2> present_ticks{7, 8};
     unsigned target_interval{1};
+    bool frame_generation_failed{};
     Swapchain* swapchain;
     Generator* frame_generator;
 // BODY
@@ -560,15 +566,16 @@ int main() {
     generated->handle.value = generated.get();
     RasterizerD3D12 rasterizer;
     UINT index = 0;
-    presenter.PresentGenerated(generated, rasterizer, index);
-    assert(index == 1);
-    assert(presenter.context.waited == 8);
+    assert(presenter.PresentGenerated(generated, rasterizer, index));
+    assert(index == 0); // Synthetic never touches the next real backbuffer.
+    assert(presenter.context.waited == 0);
     assert(presenter.present_ticks[0] == 1);
     assert(presenter.context.acknowledged == 1 && rasterizer.notifications == 1);
     assert(Common::FpsOverlay::displayed == 1);
     assert((recorder.captures == std::vector<int>{15}));
-    assert(presenter.buffers[1]->pixel == 20);
-    swapchain.Present(1, 0);
+    assert(presenter.buffers[1]->pixel == 0); // No redundant restore copy.
+    presenter.buffers[1]->pixel = 20; // Next real Draw clears/composites this buffer.
+    swapchain.Present(1, DXGI_PRESENT_DO_NOT_WAIT);
     assert((swapchain.displayed == std::vector<int>{15, 20}));
     // A 120 Hz display uses interval 2 for a distinct synthetic submission too.
     presenter.target_interval = swapchain.expected_interval = 2;
@@ -577,13 +584,26 @@ int main() {
     presenter.PresentGenerated(generated, rasterizer, index);
     assert((swapchain.displayed == std::vector<int>{15, 20, 35}));
     assert(Common::FpsOverlay::displayed == 2);
+    for (int response : {DXGI_ERROR_WAS_STILL_DRAWING, DXGI_ERROR_INVALID_CALL}) {
+        swapchain.response = response;
+        const unsigned before = swapchain.calls;
+        const auto shown = swapchain.displayed;
+        const unsigned next_buffer = swapchain.GetCurrentBackBufferIndex();
+        index = next_buffer;
+        assert(!presenter.PresentGenerated(generated, rasterizer, index));
+        assert(swapchain.calls == before + 1); // Never a blocking retry.
+        assert(swapchain.displayed == shown && index == next_buffer);
+        assert(Common::FpsOverlay::displayed == 2); // Failed attempt is not output.
+        assert(presenter.context.waited == 0);
+        assert(presenter.frame_generation_failed == (response == DXGI_ERROR_INVALID_CALL));
+    }
 }
 """
         with tempfile.TemporaryDirectory() as directory:
             compile_run(
                 driver.replace("// BODY", body),
                 Path(directory),
-                extra_flags=["-Wall", "-Wextra", "-Werror"],
+                extra_flags=["-Wall", "-Wextra", "-Wshadow", "-Wconversion", "-Werror"],
             )
 
     def test_shader_embedding_and_settings_wiring(self):
