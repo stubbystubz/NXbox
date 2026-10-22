@@ -96,7 +96,7 @@ struct FilesScreen::Impl {
     // Even failed operations can have changed part of a tree. Refresh and notify conservatively.
     void Mutate(std::function<void()> task) {
         const auto location = Here();
-        Start([this, location, task = std::move(task)] {
+        Start([location, task = std::move(task)] {
             Result result;
             result.changed = true;
             try {
