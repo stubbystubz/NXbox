@@ -83,6 +83,22 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer,
         };
         CommandDataContainer next;
         while (!stop_token.stop_requested()) {
+            // Service a due output slot even under continuous guest command traffic.
+            // Composite publishes real_ready before entering the recording consumer;
+            // PresentationDeadline/PresentIdle still let a ready real frame win.
+            if (renderer.PresentationDeadline() <= std::chrono::steady_clock::now()) {
+#ifdef HAS_D3D12
+                EdenXbox::RendererBoundary(
+                    "GPU due presentation: non-standard exception",
+                    [&] {
+                        if (initialized && !renderer.HasFailed())
+                            renderer.PresentIdle();
+                    },
+                    report);
+#else
+                renderer.PresentIdle();
+#endif
+            }
             bool have_command = true;
             {
                 const Common::GpuProfile::WaitScope wait{Common::GpuProfile::Wait::GpuQueueIdle};

@@ -25,6 +25,7 @@
 #include "video_core/renderer_d3d12/d3d12_flush_policy.h"
 #include "video_core/renderer_d3d12/d3d12_format_cast.h"
 #include "video_core/renderer_d3d12/d3d12_memory_budget.h"
+#include "video_core/renderer_d3d12/d3d12_present/display_statistics.h"
 #include "video_core/renderer_d3d12/d3d12_present/frame_pacing_policy.h"
 #include "video_core/renderer_d3d12/d3d12_recording_progress.h"
 
@@ -477,7 +478,8 @@ public:
     void EndFrame(bool presented = true);
     Present::PresentGapSamples present_gaps, present_call_gaps;
     double native_fps{};
-    u64 output_presents{};
+    u64 output_presents{}, real_present_calls{}, generated_present_calls{};
+    Present::DisplayStatistics display_statistics;
     bool frame_generation_gated{true};
     std::function<std::string()> guest_visibility;
     void BindRecordingThread(bool rebind = false);

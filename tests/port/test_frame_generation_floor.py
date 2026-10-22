@@ -395,7 +395,8 @@ int main() {
         gpu_thread = (ROOT / "src/video_core/gpu_thread.cpp").read_text()
         self.assertIn("state.queue.PopWaitUntil(next, stop_token, deadline)", gpu_thread)
         self.assertLess(
-            gpu_thread.index("state.queue.TryPop(next)"), gpu_thread.index("renderer.PresentIdle()")
+            gpu_thread.index("state.queue.TryPop(next)"),
+            gpu_thread.index("renderer.PresentIdle()", gpu_thread.index("if (!have_command)")),
         )
         self.assertIn("native_fps={:.2f} gated={} mode={}x target=60", present)
         self.assertIn("logged_native_mode != effective_frame_generation_mode", present)

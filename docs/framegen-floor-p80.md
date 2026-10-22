@@ -224,3 +224,122 @@ Validation completed: all 29 tests passed in the seven-module host suite listed
 above, including the new hitch/refresh and output-profile integration tests.
 `git diff --check` passed. Changed C++ lines were formatted with clang-format;
 the Python test was formatted with the locally cached Ruff (no download).
+
+## p80d — Candidate versus submitted presentation (2026-10-22)
+
+The committed p80 gate and p80c refresh estimator remain intact. This local change
+uses only repository code, host tests and the existing `r-mk8d-p80c/diag.txt`;
+no console, network, commit or push was used.
+
+### Evidence and path
+
+The existing artifact contains these profile windows (diag.txt line numbers):
+
+| Line | Frames | Native FPS | Gated | Output FPS | Output presents | Present submits |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1641 | 183 | 37.60 | 0 | 36.58 | 183 | 183 |
+| 1688 | 185 | 35.97 | 0 | 37.00 | 185 | 185 |
+| 1739 | 189 | 39.37 | 0 | 37.80 | 189 | 189 |
+| 1785 | 193 | 38.62 | 0 | 38.59 | 193 | 193 |
+
+`forced_submits_present` increments for both real and generated submissions.
+These windows have exactly one per real frame: they do not show the extra
+submission required by `PresentGenerated`. The CPU output counter already counts
+both paths; changing its multiplier would fabricate output.
+
+The production path is:
+
+1. `FrameGenerator::Impl::Generate` increments `Tally::generated` after policy
+   acceptance and prepares the initial warp. This is a candidate count, not a
+   presentation count. The renderer stores its resource in `pending_generated`.
+2. Real presentation submits the real backbuffer, calls
+   `swapchain->Present(target_interval, 0)`, then publishes the candidate deadline.
+3. GPU-thread deadline service invokes `RendererD3D12::PresentIdle`, synchronously
+   on the same rasterizer recording consumer used for draws. `Impl::PresentIdle`
+   checks candidate eligibility and real readiness, selects
+   `GetCurrentBackBufferIndex`, and waits for that buffer's previous submission.
+4. `FrameGenerator::Interpolate` records the forward warp and a UAV barrier,
+   retains its inputs/output and returns the generated resource. It does not
+   present. Failure or a newly ready real frame can still prevent submission.
+5. `PresentGenerated` transitions and copies that resource into the selected
+   swapchain buffer, transitions it to PRESENT, submits commands, acknowledges the
+   queue fence and calls `IDXGISwapChain3::Present(target_interval, 0)` exactly once.
+   At 60/59.94 Hz this is interval 1; at 120/119.88 Hz it is interval 2. No interval
+   zero, DO_NOT_WAIT or TEST flag is used for this generated presentation.
+6. Only after that call does it fetch the next backbuffer index and restore the
+   real endpoint into that next buffer. The restore is not another Present and
+   does not overwrite the generated buffer just submitted for presentation.
+
+Thus each *submitted* synthetic frame has a distinct swapchain copy, command
+submission and positive-interval Present. The code cannot prove a physical scanout
+for every accepted candidate, nor promise one for every interpolation dispatch.
+DXGI/compositor timing remains a runtime observation.
+
+### Dispatch correction
+
+Previously the GPU thread only serviced a generated deadline after a timed queue
+wait returned empty **and** `TryPop` found no command. Continuous SubmitList/Tick
+traffic could postpone idle generation indefinitely, until the next real frame
+cancelled the candidate. This code-level starvation mechanism is consistent with
+the artifact's equal real/output/submit counts; the old logs cannot uniquely
+attribute every missed candidate to it.
+
+The loop now also services an expired presentation deadline between commands,
+before dequeuing more guest traffic. An arbitrary guest command no longer vetoes
+a synthetic slot. A real composite already published through `real_ready` still
+wins, including the fence-wait and post-interpolation checks. Commands are never
+interrupted halfway through execution. A long command or busy GPU can still miss
+a slot; this change does not guarantee 60 FPS. The original timeout race check,
+single-use candidate, real arrival cancellation, native floor, output ceiling
+and refresh policy remain.
+
+### Profile fields
+
+Each actual renderer swapchain call increments `real_present_calls` or
+`generated_present_calls` **before** calling DXGI. Nonblocking pacing retries
+therefore count separately; a failing call still counts as an attempted call.
+`output_presents`/`output_fps` retain their existing successful-return accounting.
+
+Each successful `GetFrameStatistics` sample also feeds `DisplayStatistics`:
+
+- `dxgi_present_delta`: accumulated `PresentCount` deltas in the profile window;
+- `dxgi_present_refresh_delta`: accumulated `PresentRefreshCount` deltas;
+- `displayed_fps`: DXGI present delta divided by that window's wall duration;
+- `display_stats_samples`: number of advancing sample pairs;
+- `display_stats_errors`: unavailable/disjoint/reset observations;
+- `display_stats_valid`: at least one advancing pair and no errors in the window.
+
+`displayed_fps=-1` denotes unavailable/incomplete statistics. Duplicate samples
+add nothing. Normal UINT counter wrap is accepted; backward resets, impossible
+pairs and failed queries discard the baseline. Resize invalidates the baseline.
+Normal profile rollover clears totals but keeps the previous endpoint, avoiding
+one lost interval every window; ownership changes clear both. Sampling can lag
+the profile boundary by a refresh, so short-window submitted/displayed rates need
+not match exactly.
+
+DXGI `PresentCount` identifies the last displayed present, and IDs can skip.
+Consequently its delta is evidence of display-side progress, **not a count of
+individually verified unique scanouts**. Raw present/refresh deltas and validity
+are included so `displayed_fps` is never mistaken for that stronger guarantee.
+Physical scanout of every generated image still requires runtime evidence.
+
+### Host verification
+
+All 33 tests passed:
+
+```sh
+PYTHONPATH=tests/port python3 -m unittest \
+  test_frame_generation_presentation test_frame_generation \
+  test_frame_generation_floor test_frame_generation_targets test_frame_pacing \
+  test_d3d12_gpu_thread_profile test_d3d12_draw_phases test_gpu_pipeline
+```
+
+New drivers compile with `-Wall -Wextra -Wshadow -Wconversion -Werror`. They execute
+the production busy-queue deadline prelude, call-kind counter and DXGI accumulator;
+cover real readiness, candidate cancellation, stale statistics, 60/120 Hz deltas,
+profile rollover, unavailable queries, resets and UINT wrap. The production
+`PresentGenerated` mock verifies separate buffer content/Present at intervals 1
+and 2, followed by restoration of the real endpoint into the next buffer. The
+frozen disabled GPU command sequence still passes; only diagnostic calls are
+normalized out. Changed C++ ranges use clang-format; Python uses cached Ruff.
+MSVC/UWP and physical display timing were not tested on this Mac.

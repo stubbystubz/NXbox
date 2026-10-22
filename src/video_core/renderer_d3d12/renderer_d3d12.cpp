@@ -524,6 +524,8 @@ struct RendererD3D12::Impl {
         if (width != new_width || height != new_height) {
             context.Finish(FrameCount::ForcedSubmitLifecycle);
             present_ticks.fill(0);
+            context.Profile().display_statistics.Unavailable();
+            have_statistics = false;
             for (auto& buffer : buffers)
                 buffer.reset();
             Check(swapchain->ResizeBuffers(active_buffers, new_width, new_height,
@@ -640,6 +642,7 @@ struct RendererD3D12::Impl {
                                 std::chrono::duration<double>{vblank_schedule.NextSlot()})};
                         std::this_thread::sleep_until(slot);
                         const double submitted_at = PresentationTime();
+                        CountPresentCall(false);
                         const auto result = swapchain->Present(target_interval, 0);
                         vblank_schedule.Presented(submitted_at, output_hz, true,
                                                   bool(pending_generated));
@@ -648,6 +651,7 @@ struct RendererD3D12::Impl {
                     }
                     if (frame_pacing_enabled)
                         return PresentPaced(pacing_interval);
+                    CountPresentCall(false);
                     return swapchain->Present(1, 0);
                 });
         }
@@ -711,6 +715,7 @@ struct RendererD3D12::Impl {
         const auto result = Present::SubmitPaced(
             interval,
             [&](unsigned sync, bool nonblocking) {
+                CountPresentCall(false);
                 const auto status =
                     swapchain->Present(sync, nonblocking ? DXGI_PRESENT_DO_NOT_WAIT : 0);
                 accepted_pacing = nonblocking && status == S_OK;
@@ -719,6 +724,15 @@ struct RendererD3D12::Impl {
             DXGI_ERROR_WAS_STILL_DRAWING, DXGI_ERROR_INVALID_CALL);
         frame_pacing.Completed(accepted_pacing);
         return result;
+    }
+    void CountPresentCall(bool generated) {
+        auto& profile = context.Profile();
+        if (profile.Enabled()) {
+            if (generated)
+                ++profile.generated_present_calls;
+            else
+                ++profile.real_present_calls;
+        }
     }
     void RecordPresentation() {
         auto& profile = context.Profile();
@@ -733,9 +747,11 @@ struct RendererD3D12::Impl {
         previous_present_return = now;
         DXGI_FRAME_STATISTICS stats{};
         if (swapchain->GetFrameStatistics(&stats) != S_OK) {
+            profile.display_statistics.Unavailable();
             have_statistics = false; // Unsupported/occluded/disjoint: no invented display sample.
             return;
         }
+        profile.display_statistics.Observe(stats.PresentCount, stats.PresentRefreshCount);
         if (have_statistics && stats.PresentCount == previous_statistics.PresentCount)
             return;
         if (have_statistics && stats.PresentCount == previous_statistics.PresentCount + 1 &&
@@ -770,6 +786,7 @@ struct RendererD3D12::Impl {
         present_ticks[index] = context.Submit(FrameCount::ForcedSubmitPresent);
         rasterizer.NotifyFencesSubmitted();
         context.Acknowledge(present_ticks[index]);
+        CountPresentCall(true);
         Check(swapchain->Present(target_interval, 0), "Present generated frame", context.Device());
         Common::FpsOverlay::Presented();
         RecordPresentation();

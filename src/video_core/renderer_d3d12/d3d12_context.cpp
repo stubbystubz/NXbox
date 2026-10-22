@@ -472,6 +472,8 @@ void FrameProfile::BindRecordingThread(bool rebind) {
         transitions.clear();
         waits.clear();
         frames = fence_wall = output_presents = 0;
+        real_present_calls = generated_present_calls = 0;
+        display_statistics = {};
     }
     if (enabled && !owner.load()) {
         initial_cpu = ProfileCpuTime();
@@ -596,6 +598,8 @@ void FrameProfile::EndFrame(bool presented) {
         timing.cpu.fill(0);
         counts.fill(0);
         frames = fence_wall = output_presents = 0;
+        real_present_calls = generated_present_calls = 0;
+        display_statistics = {};
     }
     BindRecordingThread();
     Switch(timing.active);
@@ -801,6 +805,15 @@ void FrameProfile::EndFrame(bool presented) {
         line += fmt::format(" output_fps={:.2f} output_presents={}",
                             static_cast<double>(output_presents) * 10000000.0 / elapsed,
                             output_presents);
+        line += fmt::format(
+            " real_present_calls={} generated_present_calls={} displayed_fps={:.2f}"
+            " dxgi_present_delta={} dxgi_present_refresh_delta={} display_stats_valid={}"
+            " display_stats_samples={} display_stats_errors={}",
+            real_present_calls, generated_present_calls,
+            display_statistics.FramesPerSecond(static_cast<double>(elapsed) / 10000000.0),
+            display_statistics.presents, display_statistics.refreshes,
+            display_statistics.Valid() ? 1 : 0, display_statistics.samples,
+            display_statistics.errors);
         present_gaps.Clear();
         present_call_gaps.Clear();
         // Queue waits use the same exclusive clock, but must not rank as CPU work.
@@ -951,6 +964,8 @@ void FrameProfile::EndFrame(bool presented) {
     transitions.clear();
     waits.clear();
     frames = fence_wall = output_presents = 0;
+    real_present_calls = generated_present_calls = 0;
+    display_statistics.ClearWindow();
     initial_cpu = ProfileCpuTime();
     start_wall = ProfileWallTime();
     timing.Reset(start_wall);

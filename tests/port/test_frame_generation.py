@@ -310,6 +310,7 @@ int main() {
             source,
             flags=re.DOTALL,
         )
+        source = source.replace("                    CountPresentCall(false);\n", "")
         source = source.replace(
             """[&] {
                     if (frame_pacing_enabled)
@@ -327,6 +328,10 @@ int main() {
         self.assertEqual(source.count(recorder), 1)
         source = source.replace(recorder, "")
         source = source.replace("        RecordPresentation();", "")
+        source = source.replace(
+            "            context.Profile().display_statistics.Unavailable();", ""
+        )
+        source = source.replace("            have_statistics = false;", "")
         source = source.replace("UINT index =", "const UINT index =")
         # Normalize the independent output-size policy before freezing command order.
         source = source.replace(
@@ -476,8 +481,9 @@ struct Swapchain {
     std::array<ResourcePtr, 2>* buffers;
     unsigned index{};
     std::vector<int> displayed;
+    unsigned expected_interval{1};
     int Present(unsigned sync, unsigned flags) {
-        assert(sync == 1 && flags == 0);
+        assert(sync == expected_interval && flags == 0);
         displayed.push_back((*buffers)[index]->pixel);
         index ^= 1;
         return 0;
@@ -498,6 +504,7 @@ struct Presenter {
     Recorder* recorder{};
     unsigned Rtv(unsigned index) { return index; }
     void RecordPresentation() {}
+    void CountPresentCall(bool generated) { assert(generated); }
     Context context;
     std::array<ResourcePtr, 2> buffers;
     std::array<unsigned, 2> present_ticks{7, 8};
@@ -532,6 +539,13 @@ int main() {
     assert(presenter.buffers[1]->pixel == 20);
     swapchain.Present(1, 0);
     assert((swapchain.displayed == std::vector<int>{15, 20}));
+    // A 120 Hz display uses interval 2 for a distinct synthetic submission too.
+    presenter.target_interval = swapchain.expected_interval = 2;
+    index = swapchain.GetCurrentBackBufferIndex();
+    generated->pixel = 35;
+    presenter.PresentGenerated(generated, rasterizer, index);
+    assert((swapchain.displayed == std::vector<int>{15, 20, 35}));
+    assert(Common::FpsOverlay::displayed == 2);
 }
 """
         with tempfile.TemporaryDirectory() as directory:
