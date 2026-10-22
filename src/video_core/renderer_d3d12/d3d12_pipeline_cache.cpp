@@ -29,6 +29,7 @@
 
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/nxbox_seam_diagnostics.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "shader_recompiler/backend/hlsl/emit_hlsl.h"
@@ -666,7 +667,14 @@ void FillGraphicsState(Tegra::Engines::Maxwell3D& maxwell3d, Pso::GraphicsPsoSta
     s.logic_op = static_cast<u8>(Pso::LogicOp(static_cast<u32>(regs.logic_op.op)));
     s.independent_blend = !s.logic_enable;
     s.alpha_to_coverage = regs.anti_alias_alpha_control.alpha_to_coverage != 0;
-    s.conservative_raster = regs.conservative_raster_enable != 0;
+    s.conservative_raster =
+        regs.conservative_raster_enable != 0 &&
+        !(Nxbox::SeamDiagnostics::Mode() & Nxbox::SeamDiagnostics::NoConservativeRaster);
+    if (regs.conservative_raster_enable && !s.conservative_raster) {
+        static std::atomic_flag reported{};
+        if (!reported.test_and_set())
+            Diagnostic("D3D12_SEAM_DIAGNOSTICS suppressed guest conservative rasterization");
+    }
     s.smooth_lines = regs.line_anti_alias_enable != 0;
     s.depth_bounds = regs.zeta_enable && regs.depth_bounds_enable && !no_depth_test;
     for (size_t i = 0; i < Pso::kNumRenderTargets; ++i) {
@@ -1570,6 +1578,9 @@ IGraphicsPipeline* PipelineCache::CurrentGraphicsPipeline(const Pso::Framebuffer
             Pso::NormalizeGraphicsState(state);
         request = GraphicsPipelineKey{guest_hashes, state};
         u64 specialization = Pso::HashBytes(&regs.depth_mode, sizeof(regs.depth_mode));
+        const auto seam_mode = Nxbox::SeamDiagnostics::Mode();
+        if (seam_mode)
+            specialization = Pso::HashBytes(&seam_mode, sizeof(seam_mode), specialization);
         specialization =
             Pso::HashBytes(&regs.window_origin, sizeof(regs.window_origin), specialization);
         specialization = Pso::HashBytes(&regs.viewport_scale_offset_enabled,
@@ -2289,12 +2300,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     // RescalingPass bakes the scale into shader instructions. Never prewarm another
     // resolution's serialized HLSL/PSO under the same guest shader hash. Version 6
     // adds storage int64 atomics; switches also isolate serialized prewarm recipes.
+    // Bits 10-12 isolate seam diagnostics, including HLSL saved before emission.
     const auto resolution = Settings::values.resolution_setup.GetValue();
     const u32 emitter_identity = (resolution == Settings::ResolutionSetup::Res1X
                                       ? 6u
                                       : 7u + (static_cast<u32>(resolution) << 16)) |
                                  (!Int64AtomicsEnabled() ? 1u << 8 : 0u) |
-                                 (!NativeInt64AtomicsEnabled() ? 1u << 9 : 0u);
+                                 (!NativeInt64AtomicsEnabled() ? 1u << 9 : 0u) |
+                                 (Nxbox::SeamDiagnostics::Mode() << 10);
     const auto identity = DiskPipelineCache::QueryIdentity(
         context.Device(), {emitter_identity, 2, PsoNormalizeEnabled() ? 7u : 6u});
     if (!identity) {
@@ -2308,6 +2321,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     disk = std::make_unique<DiskPipelineCache>(
         Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir), title_id, *identity,
         context.Device());
+    if (const auto seam_mode = Nxbox::SeamDiagnostics::Mode(); seam_mode)
+        Diagnostic(fmt::format("D3D12_SEAM_DIAGNOSTICS mode={} precise_position={} "
+                               "no_conservative_raster={} draw_texture_triangle={}",
+                               seam_mode,
+                               (seam_mode & Nxbox::SeamDiagnostics::PrecisePosition) != 0,
+                               (seam_mode & Nxbox::SeamDiagnostics::NoConservativeRaster) != 0,
+                               (seam_mode & Nxbox::SeamDiagnostics::DrawTextureTriangle) != 0));
     Diagnostic(
         fmt::format("D3D12_PSO_CACHE path={} runtime_threads={} frame_budget={} explicit_async={}",
                     (Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) / "d3d12_cache" /
