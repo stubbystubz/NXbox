@@ -169,15 +169,18 @@ Estimates are the maintainer's guess, not a promise; they move as bugs are found
 | Super Mario 3D World + Bowser's Fury | **In-game** | On the native D3D12 renderer: menus, the World 1 map and level 1-1 draw lit at about 59 FPS with correct button icons. Open bugs: stutter the first time a new animation plays, and stray shadow streaks in some scenes | 2–4 weeks |
 | The Legend of Zelda: Breath of the Wild (1.0, 1.6 + DLC) | **In-game** | Loads a save and runs in the Shrine of Resurrection at about 12 FPS with Link drawn correctly; some terrain is still broken. Bound by the OpenGL translation on the GPU thread, so it moves to the native renderer next | 1–3 months |
 | Persona 5 Royal | **In-game** | Reaches the first playable area with audio; stutters on loads and has open bugs | 3–6 weeks |
-| Mario Kart 8 Deluxe | **In-game** | With firmware dumped from the user's own console installed, it gets past the character picker and starts a Grand Prix race at up to 60 FPS on the OpenGL path; track geometry is still broken and fps drops during the race | 4–8 weeks |
+| Mario Kart 8 Deluxe | **In-game** | NXbox 1.0.9 on the native D3D12 renderer: races run at about 30–37 FPS from the game; frame generation (on by default here) puts about 60 on the TV | 4–8 weeks |
 | Metroid Dread | **In-game** | NXbox 1.0.3: playable as Samus at 59–60 FPS; real-time cutscenes run at about 30 FPS | — |
 | The Legend of Zelda: Link's Awakening | **In-game** | NXbox 1.0.3: draws the screen (it was black before) and reaches gameplay at about 33 FPS | — |
 | Mario Tennis Aces | **In-game** | NXbox 1.0.3: reaches a match with the player under control at about 25 FPS, with a ~0.5 s hitch every ~8 s | — |
 | Kirby and the Forgotten Land | **In-game** | NXbox 1.0.3: reaches gameplay; 60 FPS at first, about 16 FPS in the heavier areas | — |
 | Hollow Knight: Silksong | **In-game** | Opens on the first try, runs the profile screen and intro at about 60 FPS and reaches gameplay at about 44 FPS | — |
 | Super Mario Odyssey | **In-game** | Opening cutscene at about 58 FPS; past the camera tutorial, Cap Kingdom gameplay runs at about 22 FPS | — |
-| Super Mario Bros. Wonder | **In-game** | NXbox 1.0.4: gets through the Bowser cutscene, which ran out of memory before, and keeps playing; gameplay runs at 30 FPS (the game targets 60), with a few-second freeze when many new effects compile at once | — |
-| Pokémon Legends: Arceus | **In-game** | The opening draws correctly at 30 FPS; the name keyboard works (Plus confirms) and the game reaches the Hisui beach at about 27 FPS | — |
+| Super Mario Bros. Wonder | **In-game** | NXbox 1.0.9: gameplay holds about 30 FPS (the game targets 60); the Wonder Seed after the Piranha Plants song in 1-2 can fail to appear | — |
+| Pokémon Legends: Arceus | **In-game** | The opening draws correctly at 30 FPS; since NXbox 1.0.9 the name keyboard shows up correctly, and the game reaches the Hisui beach at about 27 FPS | — |
+| The Legend of Zelda: Tears of the Kingdom | **In-game** | NXbox 1.0.9: the opening area runs at about 30 FPS (the game's own cap) using about 4.5 GB of the Xbox's 5 GB; it no longer closed during a 4-minute test | — |
+| Dragon Ball: Sparking! Zero | **In-game** | Loads saves since NXbox 1.0.9 with Nextendo on; the sky draws black | — |
+| Animal Crossing: New Horizons | **Boots** | Runs at 30 FPS but the screen stays black | — |
 | Pokémon Scarlet | **Boots** | NXbox 1.0.3: runs at 30 FPS but the screen stays gray | — |
 | Bayonetta | Not tested | Planned after Breath of the Wild | — |
 
