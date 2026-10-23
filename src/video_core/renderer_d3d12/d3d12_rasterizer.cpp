@@ -1392,7 +1392,15 @@ void RasterizerD3D12::PrepareDraw(bool is_indexed, Func&& draw) {
         const u64 source_offset = u64{slot.offset} + attribute.offset;
         const bool realign = (source_offset % alignment) || (slot.stride % alignment) ||
                              bytes != storage_bytes || attribute.swap_rb;
-        if (!realign && required <= available) {
+        // Smash Ultimate's vertex shaders read skinning data from storage buffers that share a
+        // host buffer with the vertex streams. Storage buffers bind as UAVs, and D3D12 cannot
+        // hold one buffer in VERTEX_AND_CONSTANT_BUFFER and UNORDERED_ACCESS in the same draw, so
+        // every such draw was skipped (fighter bodies and stage floors vanished). Bind a copy of
+        // the stream instead, through the padded-copy path below.
+        // NXBOX_D3D12_NO_VB_STORAGE_COPY=1 restores the direct bind.
+        static const bool vb_storage_copy = !BisectEnabled("NXBOX_D3D12_NO_VB_STORAGE_COPY");
+        const bool aliases_storage = vb_storage_copy && IsStorageBuffer(bindings, slot.resource);
+        if (!realign && required <= available && !aliases_storage) {
             vertex_views[i] = {slot.resource->handle->GetGPUVirtualAddress() + source_offset,
                                static_cast<UINT>(available), slot.stride};
             if (trace_vertex_bytes)
