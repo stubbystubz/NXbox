@@ -172,8 +172,8 @@ constexpr u32 SharedBufferBlockLinearBpp = 4;
 
 constexpr u32 SharedBufferBlockLinearWidth = 1280;
 constexpr u32 SharedBufferBlockLinearHeight = 768;
-constexpr u32 SharedBufferBlockLinearStride =
-    SharedBufferBlockLinearWidth * SharedBufferBlockLinearBpp;
+// NvGraphicBuffer stride is in pixels; bytes per pixel is applied by the presenter.
+constexpr u32 SharedBufferBlockLinearStride = SharedBufferBlockLinearWidth;
 
 constexpr u32 SharedBufferNumCaptureSlots = 3;
 constexpr u32 SharedBufferSlotsPerSession = 2;
