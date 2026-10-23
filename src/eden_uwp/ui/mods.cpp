@@ -583,16 +583,41 @@ bool PlaceFolder(const fs::path& from, const fs::path& to, std::string& error) {
     return MergeCopy(from, to, error);
 }
 
+// Moves only the romfs, exefs and cheats folders of `root` into `to`, so a Smash archive that
+// holds an ARCropolis mod and a LayeredFS part in the same folder keeps both.
+bool PlaceLayeredParts(const fs::path& root, const fs::path& to, std::string& error) {
+    std::error_code ec;
+    fs::remove_all(to, ec);
+    for (const fs::path& child : ChildDirectories(root)) {
+        if (IsModFolderName(child.filename().wstring()) &&
+            !PlaceFolder(child, to / child.filename(), error)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // ---- Save files ----
 
 std::string Hex16Upper(std::uint64_t value) {
     return fmt::format("{:016X}", value);
 }
 
-// A save mod is said to be one by its name or GameBanana category ("100% Save File", "Saves").
+// A save mod is filed under a save category on GameBanana ("Saves", "Save File"), or names
+// itself one ("100% Save File"). A bare "save" in the name ("Save Point Retexture") is not enough:
+// installing a save replaces the player's progress.
 bool LooksLikeSaveMod(const std::string& name, const std::string& category) {
-    const std::string text = Lower(name + " " + category);
-    return text.find("save") != std::string::npos;
+    if (Lower(category).find("save") != std::string::npos) {
+        return true;
+    }
+    const std::string lower = Lower(name);
+    for (const char* phrase : {"save file", "savefile", "save data", "savedata", "100% save",
+                               "completed save", "complete save", "save game", "savegame"}) {
+        if (lower.find(phrase) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Text that comes with a download but is not part of a save.
@@ -1501,6 +1526,15 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
                 fail("could not set up ARCropolis: " + error);
                 return;
             }
+            // The LayeredFS part (a Skyline plugin in romfs, say) goes first and alone: it may
+            // share a folder with the ARCropolis part, or sit inside it.
+            if (has_layered) {
+                if (!PlaceLayeredParts(layered_root, load_dir / Widen(folder), error)) {
+                    cleanup();
+                    fail("cannot place the mod: " + error);
+                    return;
+                }
+            }
             const fs::path mods = SdmcDir() / "ultimate" / "mods";
             std::error_code remove_error;
             fs::remove_all(mods / Widen("." + folder), remove_error);
@@ -1511,13 +1545,13 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
             }
             kind = "arc";
             where = "sdmc\\ultimate\\mods\\" + folder;
-            if (has_layered && fs::exists(layered_root, remove_error)) {
-                if (!PlaceFolder(layered_root, load_dir / Widen(folder), error)) {
-                    cleanup();
-                    fail("cannot place the mod: " + error);
-                    return;
-                }
+            if (has_layered) {
                 where += " + eden\\load\\" + title_id + "\\" + folder;
+            }
+            if (ChildDirectories(arc_root.parent_path()).size() > 0 &&
+                Lower(winrt::to_string(arc_root.parent_path().filename().wstring())) == "mods") {
+                Diagnostic("UI mods install " + std::to_string(entry->id) +
+                           ": only the first mod of a multi-mod archive was installed");
             }
         } else {
             fs::path root = layered_root;
@@ -1682,8 +1716,9 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
         }
         if (!CopySave(root, target, error)) {
             if (!backup.empty()) {
+                // Put the whole previous save back, readmes and pictures included.
                 std::string restore_error;
-                CopySave(backup, target, restore_error);
+                MergeCopy(backup, target, restore_error);
             }
             return false;
         }
