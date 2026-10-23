@@ -58,6 +58,13 @@ struct Candidate {
     std::filesystem::path path;
 };
 // Bounded, read-only discovery. Each loose/chunked NCA set is grouped by its direct parent.
+// Any ZIP would also match cheat and mod archives (library\cheats\titles.zip), so only ZIPs whose
+// own name or folder says firmware are suggested; any ZIP can still be picked by hand.
+inline bool LooksLikeFirmwareZip(const std::filesystem::path& folder, const std::string& name) {
+    return name.find("firmware") != std::string::npos ||
+           Lower(PathText(folder.filename())).find("firmware") != std::string::npos;
+}
+
 inline std::vector<Candidate> Scan(const FirmwareManager::Sources::IO& io,
                                    const std::vector<std::filesystem::path>& roots) {
     std::vector<Candidate> result;
@@ -81,7 +88,7 @@ inline std::vector<Candidate> Scan(const FirmwareManager::Sources::IO& io,
                 else if (!entry.directory && IsKeys(entry.path))
                     result.push_back({Row::Keys, entry.path});
                 else if (!entry.directory &&
-                         (ext == ".zip" || name == "rawnand.bin" || name == "rawnand.bin.00" ||
+                         ((ext == ".zip" && LooksLikeFirmwareZip(path, name)) || name == "rawnand.bin" || name == "rawnand.bin.00" ||
                           (Lower(PathText(path.filename())) == "emmc" && name == "00")))
                     result.push_back({Row::Firmware, entry.path});
                 else if (!entry.directory && (ext == ".nsp" || ext == ".xci" || ext == ".nsz"))

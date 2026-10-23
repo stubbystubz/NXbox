@@ -28,7 +28,7 @@ int main() {
       {"usb1/random",
        {file("usb1/random/Firmware.ZIP"), file("usb1/random/TITLE.KEYS"),
         file("usb1/random/._fake.nca"), file("usb1/random/not-keys.txt"),
-        file("usb1/random/unsupported.rar")}},
+        file("usb1/random/unsupported.rar"), file("usb1/random/titles.zip")}},
       {"usb2",
        {directory("usb2/backup"), directory("usb2/games"),
         directory("usb2/eMMC")}},
@@ -58,6 +58,7 @@ int main() {
   assert(has(Setup::Row::Keys, "local/eden/keys/prod.keys") == 1);
   assert(has(Setup::Row::Keys, "usb1/random/TITLE.KEYS") == 1);
   assert(has(Setup::Row::Firmware, "usb1/random/Firmware.ZIP") == 1);
+  assert(has(Setup::Row::Firmware, "usb1/random/titles.zip") == 0);
   assert(has(Setup::Row::Firmware, "usb2/backup/rawnand.bin") == 1);
   assert(has(Setup::Row::Firmware, "usb2/eMMC/00") == 1);
   assert(has(Setup::Row::Games, "usb2/games") == 1);
