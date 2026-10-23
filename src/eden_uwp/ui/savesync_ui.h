@@ -42,10 +42,13 @@ bool SyncEnabled();
 // LocalState\setup_done.txt: written when the first-run setup has been shown and answered.
 bool IsSetupDone(const std::filesystem::path& local_state);
 
-// First-run save-sync question, optional sign-in, then the button layout choice.
+// First-run save-sync question, optional sign-in, keys/firmware/games, then button layout.
 // Completed installs only see the layout choice when its setting is missing.
 // Writes setup_done.txt after choosing; returns true if the window closed meanwhile.
 bool RunFirstRunSetup(Renderer& renderer, const winrt::Windows::UI::Core::CoreWindow& window,
+                      Input& input, const std::filesystem::path& local_state);
+
+bool RunFirmwareSetup(Renderer& renderer, const winrt::Windows::UI::Core::CoreWindow& window,
                       Input& input, const std::filesystem::path& local_state);
 
 enum class SignInOutcome { SignedIn, Denied, Expired, Cancelled, Failed, NotConfigured };

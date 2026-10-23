@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <functional>
+#include <chrono>
+#include <winrt/Windows.Foundation.Collections.h>
+#include "eden_uwp/await_bounded.h"
 #include <span>
 #include <stdexcept>
 #include <windows.h>
@@ -81,19 +84,17 @@ void CopyTree(const Location& source, const Location& target, Progress& progress
 } // namespace
 std::vector<Root> Roots(const std::filesystem::path& local_state) {
     std::vector<Root> roots{{local_state, {}}};
-    for (const auto& games : ExternalGameFolders()) {
-        const auto path = games.parent_path();
-        auto label = std::wstring(winrt::to_hstring(Ftp::ExternalAlias(roots.size() - 1)));
-        try {
-            const auto folder = winrt::Windows::Storage::StorageFolder::GetFolderFromPathAsync(
-                                    path.parent_path().wstring())
-                                    .get();
-            const auto display = folder.DisplayName();
-            if (!display.empty())
-                label += L" · " + std::wstring(display);
-        } catch (...) {
-        }
-        roots.push_back({path, label});
+    try {
+        const auto drives = AwaitBounded(
+            winrt::Windows::Storage::KnownFolders::RemovableDevices().GetFoldersAsync(),
+            std::chrono::seconds(5));
+        if (drives)
+            for (const auto& drive : *drives) {
+                if (!drive.Path().empty())
+                    roots.push_back({std::filesystem::path(std::wstring(drive.Path())),
+                                     std::wstring(drive.DisplayName())});
+            }
+    } catch (const winrt::hresult_error&) { /* Console storage remains available without a drive. */
     }
     return roots;
 }

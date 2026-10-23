@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <cwchar>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -25,10 +27,12 @@
 
 #include "common/scope_exit.h"
 #include "eden_uwp/diagnostic.h"
+#include "eden_uwp/firmware.h"
 #include "eden_uwp/renderer_settings.h"
 #include "eden_uwp/save_sync.h"
 #include "eden_uwp/save_sync/qrcodegen.hpp"
 #include "eden_uwp/ui/anim.h"
+#include "eden_uwp/ui/files_screen.h"
 #include "eden_uwp/ui/strings.h"
 #include "eden_uwp/ui/text_entry.h"
 #include "eden_uwp/ui/theme.h"
@@ -986,6 +990,212 @@ bool RunButtonLayoutSetup(Renderer& renderer, const CoreWindow& window, Input& i
 
 } // namespace
 
+bool RunFirmwareSetup(Renderer& renderer, const CoreWindow& window, Input& input,
+                      const fs::path& local_state) {
+    Setup::State state;
+    state.phase = Setup::Phase::Scanning;
+    std::vector<Setup::Candidate> candidates;
+    auto scan = std::async(std::launch::async, [&] {
+        ScopedApartment apartment;
+        return ScanSetupCandidates(local_state);
+    });
+    std::future<bool> work;
+    std::atomic<size_t> done{0}, total{0};
+    std::atomic<bool> cancel{false};
+    Ftp::Server ftp;
+    std::unique_ptr<FilesScreen> picker;
+    std::array<size_t, 3> suggestion{};
+    int focus = 0;
+    fs::path selected;
+    Text result = Text::SetupReady;
+    std::wstring keys = winrt::to_hstring(SetupKeysStatus(local_state)).c_str();
+    std::wstring firmware = winrt::to_hstring(GetFirmwareStatus().version).c_str();
+    std::wstring games;
+    {
+        std::ifstream file(local_state / "games_folder.txt");
+        std::string line;
+        std::getline(file, line);
+        games = fs::u8path(line).wstring();
+    }
+    const auto closed = RunFrames(renderer, window, input, [&](Clock::time_point now) {
+        if (scan.valid() && scan.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                candidates = scan.get();
+                result = Text::SetupReady;
+            } catch (...) {
+                result = Text::SetupFailed;
+            }
+            state.Finish();
+        }
+        if (work.valid() && work.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            bool ok = false;
+            try {
+                ok = work.get();
+            } catch (...) {
+            }
+            result = ok ? Text::SetupSuccess
+                     : (focus == 1 && GetFirmwareStatus().conversion_required)
+                         ? Text::FirmwareConvertDump
+                         : Text::SetupFailed;
+            keys = winrt::to_hstring(SetupKeysStatus(local_state)).c_str();
+            firmware = winrt::to_hstring(GetFirmwareStatus().version).c_str();
+            if (ok && focus == 2)
+                games = selected.wstring();
+            state.Finish();
+        }
+        DrawBackground(renderer);
+        if (picker) {
+            picker->Tick(now);
+            if (picker->HandleInput(now)) {
+                const auto path = picker->TakePicked();
+                picker.reset();
+                if (path) {
+                    selected = *path;
+                    state.Confirm();
+                } else
+                    state.Back();
+                input.ConsumeUntilRelease();
+            } else {
+                picker->Draw(now, false);
+                DrawHints(renderer, picker->Hints());
+                return true;
+            }
+        }
+        const bool busy =
+            state.phase == Setup::Phase::Scanning || state.phase == Setup::Phase::Installing;
+        if (busy && input.Pressed(Button::B) && state.phase == Setup::Phase::Installing)
+            cancel = true;
+        if (!busy && state.phase != Setup::Phase::Confirm) {
+            if (input.Pressed(Button::B) && state.Continue())
+                return false;
+            if (input.Pressed(Button::Up))
+                focus = std::max(0, focus - 1);
+            if (input.Pressed(Button::Down))
+                focus = std::min(3, focus + 1);
+            if (focus < 3) {
+                std::vector<fs::path> found;
+                for (const auto& candidate : candidates)
+                    if (static_cast<int>(candidate.row) == focus)
+                        found.push_back(candidate.path);
+                auto& index = suggestion[static_cast<size_t>(focus)];
+                if (!found.empty()) {
+                    if (input.Pressed(Button::RightShoulder))
+                        index = (index + 1) % found.size();
+                    if (input.Pressed(Button::LeftShoulder))
+                        index = (index + found.size() - 1) % found.size();
+                    if (input.Pressed(Button::X)) {
+                        selected = found[index];
+                        state.Confirm();
+                    }
+                }
+            }
+            if (input.Pressed(Button::A)) {
+                if (focus == 3) {
+                    if (state.Continue())
+                        return false;
+                } else {
+                    state.Select();
+                    picker = std::make_unique<FilesScreen>(renderer, input, local_state, ftp);
+                    picker->PickFolder(focus == 0, focus == 1);
+                    input.ConsumeUntilRelease();
+                }
+            }
+        } else if (state.phase == Setup::Phase::Confirm) {
+            if (input.Pressed(Button::B))
+                state.Back();
+            else if (input.Pressed(Button::A)) {
+                state.Install();
+                cancel = false;
+                done = 0;
+                total = 0;
+                const int installing_row = focus;
+                work = std::async(std::launch::async, [&, installing_row] {
+                    ScopedApartment apartment;
+                    if (installing_row == 0)
+                        return InstallSetupKeys(selected);
+                    if (installing_row == 2) {
+                        const auto value = selected.u8string();
+                        std::ofstream file(local_state / "games_folder.txt", std::ios::trunc);
+                        file.write(reinterpret_cast<const char*>(value.data()),
+                                   static_cast<std::streamsize>(value.size()));
+                        file << '\n';
+                        return static_cast<bool>(file);
+                    }
+                    InstallFirmwareSource(local_state, selected,
+                                          [&](size_t count, size_t processed) {
+                                              total = count;
+                                              done = processed;
+                                              return cancel.load();
+                                          });
+                    return !GetFirmwareStatus().install_failed;
+                });
+            }
+        }
+        renderer.DrawString(Tr(Text::SetupTitle), Font::Heading, RectF(kMargin, 160, 1800, 230),
+                            Theme::kText);
+        constexpr Text labels[] = {Text::SetupKeys, Text::SetupFirmware, Text::SetupGames};
+        const std::wstring values[] = {keys, firmware, games};
+        for (int row_index = 0; row_index < 3; ++row_index) {
+            const float y = 270.0f + static_cast<float>(row_index) * 178.0f;
+            renderer.DrawString(Tr(labels[row_index]), Font::RowTitle,
+                                RectF(kMargin, y, 620, y + 50), Theme::kText);
+            renderer.DrawString(values[row_index].empty() ? Tr(Text::SetupMissing)
+                                                          : values[row_index],
+                                Font::MetaMono, RectF(650, y, 1410, y + 50), Theme::kTextSecondary);
+            DrawChoicePill(renderer, RectF(1480, y, 1800, y + 64), Tr(Text::SetupSelect), false,
+                           focus == row_index && !busy);
+            std::vector<fs::path> found;
+            for (const auto& candidate : candidates)
+                if (static_cast<int>(candidate.row) == row_index)
+                    found.push_back(candidate.path);
+            const auto index = suggestion[static_cast<size_t>(row_index)];
+            renderer.DrawString(
+                found.empty() ? Tr(busy             ? Text::SetupScanning
+                                   : row_index == 0 ? Text::SetupKeysPlacement
+                                   : row_index == 1 ? Text::SetupFirmwarePlacement
+                                                    : Text::SetupDefaultGames)
+                              : found[index].wstring() + L"  (" + std::to_wstring(index + 1) +
+                                    L"/" + std::to_wstring(found.size()) + L")",
+                Font::RowSub, RectF(kMargin, y + 66, 1430, y + 119), Theme::kTextSecondary);
+            if (!found.empty())
+                renderer.DrawString(Tr(Text::SetupSuggestion), Font::RowSub,
+                                    RectF(kMargin, y + 112, 1800, y + 156), Theme::kTextSecondary);
+        }
+        DrawChoicePill(renderer, RectF(kMargin, 825, 600, 889), Tr(Text::SetupContinue), true,
+                       focus == 3 && !busy);
+        renderer.DrawString(Tr(keys.find(L"prod.keys") == std::wstring::npos
+                                   ? Text::SetupWithoutKeys
+                               : firmware.empty() ? Text::SetupWithoutFirmware
+                               : games.empty()    ? Text::SetupDefaultGames
+                                                  : Text::SetupReady),
+                            Font::RowSub, RectF(650, 825, 1800, 900), Theme::kTextSecondary);
+        renderer.DrawString(Tr(busy
+                                   ? (state.phase == Setup::Phase::Scanning ? Text::SetupScanning
+                                                                            : Text::SetupInstalling)
+                                   : result),
+                            Font::RowSub, RectF(kMargin, 930, 1800, 985), Theme::kTextSecondary);
+        if (total)
+            DrawProgressBar(renderer, RectF(kMargin, 910, 1800, 920),
+                            static_cast<double>(done.load()) / static_cast<double>(total.load()));
+        if (state.phase == Setup::Phase::Confirm) {
+            DrawSheet(renderer, RectF(380, 300, 1540, 780));
+            renderer.DrawString(Tr(Text::SetupConfirm), Font::RowTitle, RectF(430, 350, 1490, 430),
+                                Theme::kText);
+            renderer.DrawString(selected.wstring(), Font::RowSub, RectF(430, 450, 1490, 570),
+                                Theme::kTextSecondary);
+            DrawChoicePill(renderer, RectF(430, 650, 1490, 714), Tr(Text::SetupInstall), true,
+                           true);
+        }
+        DrawHints(renderer, {{Theme::kButtonA, L"A", Tr(Text::HintSelect)},
+                             {Theme::kButtonB, L"B", Tr(Text::HintBack)}});
+        return true;
+    });
+    cancel = true;
+    if (work.valid())
+        work.wait();
+    return closed;
+}
+
 bool RunFirstRunSetup(Renderer& renderer, const CoreWindow& window, Input& input,
                       const fs::path& local_state) {
     Diagnostic("UI setup begin");
@@ -1040,6 +1250,8 @@ bool RunFirstRunSetup(Renderer& renderer, const CoreWindow& window, Input& input
             return true;
         }
     }
+    if (RunFirmwareSetup(renderer, window, input, local_state))
+        return true;
     if (RunButtonLayoutSetup(renderer, window, input, local_state))
         return true;
     std::ofstream(local_state / "setup_done.txt", std::ios::trunc) << "1\n";

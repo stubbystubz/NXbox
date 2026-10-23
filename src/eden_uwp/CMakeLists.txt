@@ -20,6 +20,7 @@ add_executable(eden-uwp WIN32
     ftp/ftp_server.cpp
     firmware.cpp
     firmware.h
+    setup_policy.h
     accounts.cpp
     accounts.h
     accounts_policy.h

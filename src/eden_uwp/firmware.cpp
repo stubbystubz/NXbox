@@ -15,6 +15,7 @@
 #include <winrt/Windows.Storage.h>
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
+#include "common/fs/path_util.h"
 #include "core/core.h"
 #include "core/crypto/aes_util.h"
 #include "core/crypto/key_manager.h"
@@ -24,8 +25,10 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "eden_uwp/await_bounded.h"
 #include "eden_uwp/diagnostic.h"
+#include "eden_uwp/file_manager.h"
 #include "frontend_common/firmware_files.h"
 #include "frontend_common/firmware_install.h"
+#include "frontend_common/firmware_manager.h"
 #include "frontend_common/firmware_sources.h"
 
 namespace EdenXbox {
@@ -170,7 +173,9 @@ FirmwareStatus GetFirmwareStatus() {
     return status;
 }
 
-void PrepareFirmware(const std::filesystem::path& local_state) {
+static void PrepareFirmware(const std::filesystem::path& local_state,
+                            const std::filesystem::path& selected,
+                            const std::function<bool(size_t, size_t)>& progress) {
     FirmwareStatus next;
     try {
         std::vector<winrt::Windows::Storage::StorageFolder> drives;
@@ -184,7 +189,8 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
         } catch (const winrt::hresult_error& error) {
             Diagnostic("FIRMWARE usb_scan_failed " + winrt::to_string(error.message()));
         }
-        CopyMissingKeys(local_state, drives);
+        if (selected.empty())
+            CopyMissingKeys(local_state, drives);
         // Filesystem-only setup avoids reserving guest memory just to inspect/install firmware.
         Core::Crypto::KeyManager::Instance().ReloadKeys();
         Core::System system;
@@ -215,7 +221,15 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
         next.searched_folders = FirmwareManager::FirmwareFolders(local_state, roots);
         for (const auto& folder : next.searched_folders)
             Diagnostic("FIRMWARE searched " + Common::FS::PathToUTF8String(folder));
-        const auto sources = Sources::Discover(io, next.searched_folders, roots);
+        auto sources =
+            selected.empty()
+                ? Sources::Discover(io, next.searched_folders, roots)
+                : Sources::Discover(
+                      io, {Common::FS::IsDir(selected) ? selected : selected.parent_path()}, {});
+        if (!selected.empty() && !Common::FS::IsDir(selected))
+            std::erase_if(sources, [&](const auto& item) { return item.path != selected; });
+        if (!selected.empty() && sources.empty())
+            next.install_failed = true;
         const auto record_path = local_state / "firmware_source.txt";
         auto records = Common::FS::ReadStringFromFile(record_path, Common::FS::FileType::TextFile);
         std::vector<std::filesystem::path> temporary_paths;
@@ -247,7 +261,7 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
             extraction_failed = false;
             try {
                 const auto fingerprint = "BEGIN\n" + Sources::Fingerprint(source) + "END\n";
-                if (!next.version.empty() && !source.parts.empty() &&
+                if (selected.empty() && !next.version.empty() && !source.parts.empty() &&
                     records.find(fingerprint) != std::string::npos) {
                     Diagnostic("FIRMWARE source_already_installed");
                     continue;
@@ -274,8 +288,7 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
                 std::vector<std::vector<std::filesystem::path>> candidates;
                 Sources::Extract(io, source, temporary, decrypt, &candidates);
                 for (const auto& files : candidates) {
-                    const auto version = FirmwareManager::VerifyFirmware(
-                        system, files, [](size_t, size_t) { return false; });
+                    const auto version = FirmwareManager::VerifyFirmware(system, files, progress);
                     if (version.empty()) {
                         extraction_failed = true;
                         next.install_failed = true;
@@ -302,10 +315,11 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
             }
             cleanup.DiscardExcept(best_temporary);
         }
+        if (!selected.empty() && !best_source)
+            next.install_failed = true;
         if (best_source) {
             Diagnostic("FIRMWARE install_begin count=" + std::to_string(best_files.size()));
-            const auto result = FirmwareManager::InstallFirmware(
-                system, best_files, [](size_t, size_t) { return false; });
+            const auto result = FirmwareManager::InstallFirmware(system, best_files, progress);
             next.version = FirmwareManager::InstalledVersion(system);
             next.install_failed = result != FirmwareManager::InstallResult::Success;
             if (!next.install_failed) {
@@ -340,5 +354,58 @@ void PrepareFirmware(const std::filesystem::path& local_state) {
     }
     const std::scoped_lock lock(status_mutex);
     status = std::move(next);
+}
+void PrepareFirmware(const std::filesystem::path& local_state) {
+    PrepareFirmware(local_state, {}, [](size_t, size_t) { return false; });
+}
+void InstallFirmwareSource(const std::filesystem::path& local_state,
+                           const std::filesystem::path& source,
+                           const std::function<bool(size_t, size_t)>& progress) {
+    PrepareFirmware(local_state, source, progress);
+}
+std::vector<Setup::Candidate> ScanSetupCandidates(const std::filesystem::path& local_state) {
+    std::vector<std::filesystem::path> roots;
+    for (const auto& root : Files::Roots(local_state))
+        roots.push_back(root.path);
+    auto io = FirmwareIO();
+    const auto list = io.list;
+    io.list = [list, local_state](const auto& directory) {
+        auto entries = list(directory);
+        if (directory == local_state)
+            std::erase_if(entries,
+                          [&](const auto& item) { return item.path == local_state / "eden"; });
+        return entries;
+    };
+    return Setup::Scan(io, roots);
+}
+bool InstallSetupKeys(const std::filesystem::path& source) {
+    if (!Setup::IsKeys(source))
+        return false;
+    Common::FS::CreateDirs(Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir));
+    const bool ok = FirmwareManager::InstallKeys(Common::FS::PathToUTF8String(source), "keys") ==
+                    FirmwareManager::KeyInstallResult::Success;
+    if (ok)
+        Core::Crypto::KeyManager::Instance().ReloadKeys();
+    return ok;
+}
+std::string SetupKeysStatus(const std::filesystem::path& local_state) {
+    std::string result;
+    for (const auto* name : {"prod.keys", "title.keys"})
+        if (Common::FS::Exists(local_state / "eden" / "keys" / name)) {
+            if (!result.empty())
+                result += " + ";
+            result += name;
+        }
+    if (result.find("prod.keys") != std::string::npos) {
+        for (u64 revision = 32; revision > 0; --revision) {
+            const auto key = Core::Crypto::KeyManager::Instance().GetKey(
+                Core::Crypto::S128KeyType::Master, revision - 1);
+            if (std::any_of(key.begin(), key.end(), [](auto byte) { return byte != 0; })) {
+                result += " (r" + std::to_string(revision - 1) + ")";
+                break;
+            }
+        }
+    }
+    return result;
 }
 } // namespace EdenXbox

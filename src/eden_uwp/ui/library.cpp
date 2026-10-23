@@ -52,6 +52,7 @@
 #include "eden_uwp/diagnostic.h"
 #include "eden_uwp/ui/art.h"
 #include "eden_uwp/usb_library.h"
+#include "eden_uwp/file_manager.h"
 #include "frontend_common/split_upload.h"
 
 namespace EdenXbox::Ui {
@@ -1307,6 +1308,37 @@ std::vector<GameEntry> LibraryScan::Scan() {
             } else if (extension == L".nsz") {
                 compressed.push_back(entry.path());
             }
+        }
+    }
+    {
+        std::ifstream selection(local_state_ / "games_folder.txt");
+        std::string path_text;
+        std::getline(selection, path_text);
+        if (!path_text.empty()) {
+            const auto selected_root = fs::u8path(path_text);
+            const auto walk = [&](auto&& self, const Files::Location& location,
+                                  unsigned depth) -> void {
+                try {
+                    for (const auto& entry : Files::List(location)) {
+                        const Files::Location child{location.root,
+                                                    Files::Join(location.relative, entry.name)};
+                        if (entry.directory) {
+                            if (depth < 8)
+                                self(self, child, depth + 1);
+                        } else {
+                            const auto path = Files::Resolve(child);
+                            const auto extension = Lowercase(path.extension().wstring());
+                            if (extension == L".nsp" || extension == L".xci")
+                                packages.push_back(path);
+                            else if (extension == L".nsz")
+                                compressed.push_back(path);
+                        }
+                    }
+                } catch (...) {
+                    Diagnostic("UI selected games folder unavailable");
+                }
+            };
+            walk(walk, Files::Location{{selected_root, {}}, {}}, 0);
         }
     }
     for (const auto& file : ListExternalGames()) {
