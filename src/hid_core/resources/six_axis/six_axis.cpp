@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdlib>
+#include <string_view>
+
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "core/core_timing.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
@@ -24,12 +28,37 @@ SixAxis::SixAxis(Core::HID::HIDCore& hid_core_, std::shared_ptr<NPad> npad_)
     }
 }
 
-SixAxis::~SixAxis() = default;
+SixAxis::~SixAxis() {
+    OnRelease();
+}
 
 void SixAxis::OnInit() {}
-void SixAxis::OnRelease() {}
+void SixAxis::OnRelease() {
+    for (auto& controller : controller_data) {
+        controller.sixaxis_fullkey.active_handles.clear();
+        controller.sixaxis_handheld.active_handles.clear();
+        controller.sixaxis_dual_left.active_handles.clear();
+        controller.sixaxis_dual_right.active_handles.clear();
+        controller.sixaxis_left.active_handles.clear();
+        controller.sixaxis_right.active_handles.clear();
+        controller.sixaxis_unknown.active_handles.clear();
+        controller.sixaxis_fullkey.diagnostics.clear();
+        controller.sixaxis_handheld.diagnostics.clear();
+        controller.sixaxis_dual_left.diagnostics.clear();
+        controller.sixaxis_dual_right.diagnostics.clear();
+        controller.sixaxis_left.diagnostics.clear();
+        controller.sixaxis_right.diagnostics.clear();
+        controller.sixaxis_unknown.diagnostics.clear();
+        controller.device->SetSixAxisSensorRequested(false);
+    }
+}
 
 void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
+    static const bool diagnostics_enabled = [] {
+        const char* value = std::getenv("NXBOX_MOTION_DIAG");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    const auto diagnostic_now = MotionDiagnostics::Clock::now();
     std::scoped_lock shared_lock{*shared_mutex};
 
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; ++aruid_index) {
@@ -80,8 +109,9 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
             sixaxis_left_lifo_state = {};
             sixaxis_right_lifo_state = {};
 
-            if (controller.sixaxis_sensor_enabled && Settings::values.motion_enabled.GetValue()) {
-                controller.sixaxis_at_rest = true;
+            controller.sixaxis_at_rest = true;
+            if (controller.device->IsSixAxisSensorRequested() &&
+                Settings::values.motion_enabled.GetValue()) {
                 for (std::size_t e = 0; e < motion_state.size(); ++e) {
                     controller.sixaxis_at_rest =
                         controller.sixaxis_at_rest && motion_state[e].is_at_rest;
@@ -89,7 +119,8 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
             }
 
             const auto set_motion_state = [&](Core::HID::SixAxisSensorState& state,
-                                              const Core::HID::ControllerMotion& hid_state) {
+                                              const Core::HID::ControllerMotion& hid_state,
+                                              const SixaxisParameters& parameters) {
                 using namespace std::literals::chrono_literals;
                 static constexpr Core::HID::SixAxisSensorState default_motion_state = {
                     .delta_time = std::chrono::nanoseconds(5ms).count(),
@@ -102,7 +133,7 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
                         },
                     .attribute = {1},
                 };
-                if (!controller.sixaxis_sensor_enabled) {
+                if (parameters.active_handles.empty()) {
                     state = default_motion_state;
                     return;
                 }
@@ -123,24 +154,30 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
                 ASSERT(false);
                 break;
             case Core::HID::NpadStyleIndex::Fullkey:
-                set_motion_state(sixaxis_fullkey_state, motion_state[0]);
+                set_motion_state(sixaxis_fullkey_state, motion_state[0],
+                                 controller.sixaxis_fullkey);
                 break;
             case Core::HID::NpadStyleIndex::Handheld:
-                set_motion_state(sixaxis_handheld_state, motion_state[0]);
+                set_motion_state(sixaxis_handheld_state, motion_state[0],
+                                 controller.sixaxis_handheld);
                 break;
             case Core::HID::NpadStyleIndex::JoyconDual:
-                set_motion_state(sixaxis_dual_left_state, motion_state[0]);
-                set_motion_state(sixaxis_dual_right_state, motion_state[1]);
+                set_motion_state(sixaxis_dual_left_state, motion_state[0],
+                                 controller.sixaxis_dual_left);
+                set_motion_state(sixaxis_dual_right_state, motion_state[1],
+                                 controller.sixaxis_dual_right);
                 break;
             case Core::HID::NpadStyleIndex::JoyconLeft:
-                set_motion_state(sixaxis_left_lifo_state, motion_state[0]);
+                set_motion_state(sixaxis_left_lifo_state, motion_state[0], controller.sixaxis_left);
                 break;
             case Core::HID::NpadStyleIndex::JoyconRight:
-                set_motion_state(sixaxis_right_lifo_state, motion_state[1]);
+                set_motion_state(sixaxis_right_lifo_state, motion_state[1],
+                                 controller.sixaxis_right);
                 break;
             case Core::HID::NpadStyleIndex::Pokeball:
                 using namespace std::literals::chrono_literals;
-                set_motion_state(sixaxis_fullkey_state, motion_state[0]);
+                set_motion_state(sixaxis_fullkey_state, motion_state[0],
+                                 controller.sixaxis_fullkey);
                 sixaxis_fullkey_state.delta_time = std::chrono::nanoseconds(15ms).count();
                 break;
             default:
@@ -172,6 +209,48 @@ void SixAxis::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
             sixaxis_dual_right_lifo.lifo.WriteNextEntry(sixaxis_dual_right_state);
             sixaxis_left_lifo.lifo.WriteNextEntry(sixaxis_left_lifo_state);
             sixaxis_right_lifo.lifo.WriteNextEntry(sixaxis_right_lifo_state);
+
+            if (diagnostics_enabled) {
+                const auto log_handle = [&](SixaxisParameters& parameters,
+                                            const Core::HID::SixAxisSensorState& sent_state) {
+                    for (auto& [handle_key, diagnostic] : parameters.diagnostics) {
+                        const bool sensor_active = parameters.active_handles.count(handle_key) != 0;
+                        const bool delivered = sensor_active &&
+                                               handle_key.first == controller_type &&
+                                               Settings::values.motion_enabled.GetValue();
+                        std::array<float, 9> attitude{};
+                        for (std::size_t row = 0; row < 3; ++row)
+                            for (std::size_t column = 0; column < 3; ++column)
+                                attitude[row * 3 + column] = sent_state.orientation[row][column];
+                        if (!diagnostic.Update(
+                                {sent_state.gyro[0], sent_state.gyro[1], sent_state.gyro[2]}, attitude,
+                                delivered, diagnostic_now))
+                            continue;
+                        LOG_WARNING(Service_HID,
+                                    "NXBOX_MOTION_DIAG npad={} style={} device={} sensor_active={} "
+                                    "delivered={} modifier_active={} l3_tapped_count={} "
+                                    "gyro_rad_s=({},{},{}) max_abs_gyro_rad_s=({},{},{}) "
+                                    "attitude_delta_rad={} max_abs_attitude_delta_rad={}",
+                                    static_cast<u32>(IndexToNpadIdType(i)),
+                                    static_cast<u32>(handle_key.first),
+                                    static_cast<u32>(handle_key.second), sensor_active, delivered,
+                                    controller.device->IsSyntheticMotionModifierActive(),
+                                    controller.device->GetSyntheticMotionTapCount(),
+                                    diagnostic.gyro_rad_s[0], diagnostic.gyro_rad_s[1],
+                                    diagnostic.gyro_rad_s[2], diagnostic.max_abs_gyro_rad_s[0],
+                                    diagnostic.max_abs_gyro_rad_s[1],
+                                    diagnostic.max_abs_gyro_rad_s[2], diagnostic.attitude_delta_rad,
+                                    diagnostic.max_attitude_delta_rad);
+                        diagnostic.NextWindow(diagnostic_now);
+                    }
+                };
+                log_handle(controller.sixaxis_fullkey, sixaxis_fullkey_state);
+                log_handle(controller.sixaxis_handheld, sixaxis_handheld_state);
+                log_handle(controller.sixaxis_dual_left, sixaxis_dual_left_state);
+                log_handle(controller.sixaxis_dual_right, sixaxis_dual_right_state);
+                log_handle(controller.sixaxis_left, sixaxis_left_lifo_state);
+                log_handle(controller.sixaxis_right, sixaxis_right_lifo_state);
+            }
         }
     }
 }
@@ -283,8 +362,25 @@ Result SixAxis::SetSixAxisEnabled(const Core::HID::SixAxisSensorHandle& sixaxis_
         return is_valid;
     }
 
+    std::scoped_lock sensor_lock{*shared_mutex};
+    auto& parameters = GetSixaxisState(sixaxis_handle);
+    auto& active_handles = parameters.active_handles;
+    const auto handle_key = std::pair{sixaxis_handle.npad_type, sixaxis_handle.device_index};
+    parameters.diagnostics.try_emplace(handle_key);
+    if (sixaxis_status) {
+        active_handles.insert(handle_key);
+    } else {
+        active_handles.erase(handle_key);
+    }
     auto& controller = GetControllerFromHandle(sixaxis_handle);
-    controller.sixaxis_sensor_enabled = sixaxis_status;
+    controller.device->SetSixAxisSensorRequested(
+        !controller.sixaxis_fullkey.active_handles.empty() ||
+        !controller.sixaxis_handheld.active_handles.empty() ||
+        !controller.sixaxis_dual_left.active_handles.empty() ||
+        !controller.sixaxis_dual_right.active_handles.empty() ||
+        !controller.sixaxis_left.active_handles.empty() ||
+        !controller.sixaxis_right.active_handles.empty() ||
+        !controller.sixaxis_unknown.active_handles.empty());
     return ResultSuccess;
 }
 

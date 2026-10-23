@@ -91,6 +91,7 @@ add_library(hid_core STATIC
     resources/six_axis/console_six_axis.h
     resources/six_axis/seven_six_axis.cpp
     resources/six_axis/seven_six_axis.h
+    resources/six_axis/motion_diagnostics.h
     resources/six_axis/six_axis.cpp
     resources/six_axis/six_axis.h
     resources/system_buttons/capture_button.cpp
