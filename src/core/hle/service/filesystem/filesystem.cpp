@@ -775,11 +775,12 @@ void FileSystemController::CreateFactories(FileSys::VfsFilesystem& vfs, bool ove
             }
         }
 
-        LOG_DEBUG(Service_FS, "Creating ExternalContentProvider with {} opened directories",
-                  external_dirs.size());
+        LOG_DEBUG(Service_FS,
+                  "Creating ExternalContentProvider with {} opened directories (applications={})",
+                  external_dirs.size(), Settings::values.external_content_index_applications);
 
         external_provider = std::make_unique<FileSys::ExternalContentProvider>(
-            std::move(external_dirs));
+            std::move(external_dirs), Settings::values.external_content_index_applications);
         system.RegisterContentProvider(FileSys::ContentProviderUnionSlot::External,
                                        external_provider.get());
 

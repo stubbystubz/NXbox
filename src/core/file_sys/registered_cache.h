@@ -290,8 +290,16 @@ private:
 
 class ExternalContentProvider : public ContentProvider {
 public:
-    explicit ExternalContentProvider(std::vector<VirtualDir> load_directories = {});
+    // index_applications: also index base Application titles (Program/Control/Meta/...) found in
+    // the containers, so the firmware home menu can list and launch them. Off by default: a game
+    // booted directly from its file only needs its updates and DLC from here.
+    explicit ExternalContentProvider(std::vector<VirtualDir> load_directories = {},
+                                     bool index_applications_ = false);
     ~ExternalContentProvider() override;
+
+    [[nodiscard]] bool IndexesApplications() const {
+        return index_applications;
+    }
 
     void AddDirectory(VirtualDir directory);
     void ClearDirectories();
@@ -315,6 +323,7 @@ private:
     void ProcessXCI(const VirtualFile& file);
 
     std::vector<VirtualDir> load_dirs;
+    bool index_applications = false;
     ::Common::unordered_map<std::tuple<u64, ContentRecordType, TitleType>, VirtualFile> entries;
     ::Common::unordered_map<u64, u32> versions;
     std::vector<ExternalUpdateEntry> multi_version_entries;

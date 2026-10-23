@@ -864,6 +864,10 @@ struct Values {
     Setting<bool> ext_content_from_game_dirs{linkage, true, "ext_content_from_game_dirs",
                                              Category::DataStorage};
     std::vector<std::string> external_content_dirs;
+    // Index base applications (not only updates/DLC) from external_content_dirs so the firmware
+    // home menu can list and launch them. Set by the frontend before the filesystem factories
+    // are created; not persisted.
+    bool external_content_index_applications = false;
 
     // Debugging
     bool record_frame_times;

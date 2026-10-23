@@ -242,11 +242,13 @@ bool ForEachContainerEntry(const std::shared_ptr<NSP>& nsp, bool only_content,
             u32 version = 0;
             std::string version_string;
 
-            if (title_type == TitleType::Update) {
+            if (title_type == TitleType::Update || title_type == TitleType::Application) {
                 if (const auto version_it = versions.find(title_id); version_it != versions.end()) {
                     version = version_it->second;
                 }
+            }
 
+            if (title_type == TitleType::Update) {
                 if (const auto version_str_it = version_strings.find(title_id);
                     version_str_it != version_strings.end()) {
                     version_string = version_str_it->second;
@@ -289,19 +291,33 @@ static void UpsertExternalVersionEntry(std::vector<ExternalUpdateEntry>& multi_v
 template <typename EntryMap, typename VersionMap>
 static bool AddExternalEntriesFromContainer(const std::shared_ptr<NSP>& nsp, EntryMap& entries,
                                             VersionMap& versions,
-                                            std::vector<ExternalUpdateEntry>& multi_version_entries) {
+                                            std::vector<ExternalUpdateEntry>& multi_version_entries,
+                                            bool index_applications) {
+    // Updates and DLC are always indexed. Base applications (Program/Control/Meta/Data/...)
+    // are only indexed on request: the firmware home menu lists and launches games through
+    // the content provider union, so it needs them; a game booted directly from its file
+    // does not, and keeping them out leaves that path untouched.
     return ForEachContainerEntry(
-        nsp, true, std::nullopt,
-        [&entries, &versions,
-         &multi_version_entries](TitleType title_type, ContentRecordType content_type, u64 title_id,
-                                 const VirtualFile& file, u32 version,
-                                 const std::string& version_string) {
+        nsp, !index_applications, std::nullopt,
+        [&entries, &versions, &multi_version_entries,
+         index_applications](TitleType title_type, ContentRecordType content_type, u64 title_id,
+                             const VirtualFile& file, u32 version,
+                             const std::string& version_string) {
+            if (title_type != TitleType::Update && title_type != TitleType::AOC &&
+                !(index_applications && title_type == TitleType::Application)) {
+                return;
+            }
+
             entries[{title_id, content_type, title_type}] = file;
 
             if (title_type == TitleType::Update) {
                 versions[title_id] = version;
                 UpsertExternalVersionEntry(multi_version_entries, title_id, version, version_string,
                                            content_type, file);
+            } else if (title_type == TitleType::Application) {
+                // Base title ids never collide with update ids (bit 0x800), so this only
+                // answers GetEntryVersion for the base when no update is present.
+                versions.emplace(title_id, version);
             }
         });
 }
@@ -1369,8 +1385,9 @@ VirtualFile ManualContentProvider::GetEntryForVersion(u64 title_id, ContentRecor
     return nullptr;
 }
 
-ExternalContentProvider::ExternalContentProvider(std::vector<VirtualDir> load_directories)
-    : load_dirs(std::move(load_directories)) {
+ExternalContentProvider::ExternalContentProvider(std::vector<VirtualDir> load_directories,
+                                                 bool index_applications_)
+    : load_dirs(std::move(load_directories)), index_applications(index_applications_) {
     ExternalContentProvider::Refresh();
 }
 
@@ -1435,7 +1452,8 @@ void ExternalContentProvider::ProcessNSP(const VirtualFile& file) {
     }
 
     LOG_DEBUG(Service_FS, "Processing NSP file: {}", file->GetName());
-    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries);
+    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries,
+                                    index_applications);
 }
 
 void ExternalContentProvider::ProcessXCI(const VirtualFile& file) {
@@ -1444,7 +1462,8 @@ void ExternalContentProvider::ProcessXCI(const VirtualFile& file) {
         return;
     }
 
-    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries);
+    AddExternalEntriesFromContainer(nsp, entries, versions, multi_version_entries,
+                                    index_applications);
 }
 
 bool ExternalContentProvider::HasEntry(u64 title_id, ContentRecordType type) const {
@@ -1475,6 +1494,14 @@ VirtualFile ExternalContentProvider::GetEntryRaw(u64 title_id, ContentRecordType
     // Try to find in Update entries
     {
         const auto it = entries.find({title_id, type, TitleType::Update});
+        if (it != entries.end()) {
+            return it->second;
+        }
+    }
+
+    // Base applications are only present when the provider was asked to index them.
+    if (index_applications) {
+        const auto it = entries.find({title_id, type, TitleType::Application});
         if (it != entries.end()) {
             return it->second;
         }
