@@ -45,8 +45,9 @@ VirtualFile RomFSFactory::OpenCurrentProcess(u64 current_process_title_id) const
     }
 
     const auto type = ContentRecordType::Program;
-    // ExternalContentProvider deliberately indexes only updates/DLC. A frontend
-    // without a game-list provider cannot recover the base NCA from that union.
+    // ExternalContentProvider indexes only updates/DLC unless the home menu asked for base
+    // titles too. A frontend without a game-list provider cannot recover the base NCA from
+    // that union, so prefer the NCA the loader opened.
     std::shared_ptr<const NCA> nca = loaded_nca;
     if (!nca || nca->GetTitleId() != current_process_title_id) {
         nca = content_provider.GetEntry(current_process_title_id, type);

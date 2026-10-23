@@ -881,6 +881,13 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
     memory_stage("initialized");
     system.ApplySettings();
     system.RegisterExitCallback([&] { guest_exited.store(true, std::memory_order_release); });
+    // The firmware home menu starts games in-process (am IApplicationCreator); the window system
+    // reports each switch of the foreground application. Logged so a launch from the home screen
+    // is visible in the diagnostic file; per-title settings and shader cache stay those of the
+    // session that booted the menu.
+    system.RegisterApplicationChangedCallback([](u64 program_id) {
+        Diagnostic(fmt::format("APPLICATION_CHANGED title={:016X}", program_id));
+    });
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     // Updates and DLC are read in place from the game folders (Eden's external content
@@ -906,6 +913,15 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
             for (const auto& dir : dirs) {
                 Diagnostic("CONTENT_DIR " + dir);
             }
+        }
+        // The firmware home menu lists games through ns (ListApplicationRecord) and launches them
+        // through am (IApplicationCreator), both of which look the base Program/Control NCAs up
+        // in the content provider union. Only the home-menu session indexes the base games from
+        // the game folders; a game booted from its file keeps the old updates/DLC-only index, so
+        // the loader and PatchManager see exactly what they saw before.
+        Settings::values.external_content_index_applications = boot_home_menu;
+        if (boot_home_menu) {
+            Diagnostic("CONTENT_INDEX applications=1 (firmware home menu)");
         }
         // NXBOX_DISABLE_DLC=<title id in hex> (LocalState\nxbox_env.txt) runs a game without its
         // DLC, to tell a DLC problem from an update problem.
