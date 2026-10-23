@@ -2,6 +2,7 @@
 #pragma once
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include "eden_uwp/ftp/ftp_server.h"
 #include "eden_uwp/ui/anim.h"
 #include "eden_uwp/ui/input.h"
@@ -22,6 +23,9 @@ public:
     void Draw(Clock::time_point now, bool navigation_focused);
     std::vector<Hint> Hints() const;
     bool Busy() const;
+    void PickFolder(bool keys = false, bool firmware = false);
+    bool Picking() const;
+    std::optional<std::filesystem::path> TakePicked();
 
 private:
     struct Impl;

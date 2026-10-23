@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <vector>
+#include "common/nxbox_seam_diagnostics.h"
 #include "shader_recompiler/backend/hlsl/emit_hlsl.h"
 
 #include "shader_recompiler/frontend/ir/modifiers.h"
@@ -61,6 +62,45 @@ void Vertex() {
   const auto second = f.Emit(bindings);
   Require(text == second, "Emission must preserve the IR");
   std::ofstream("hlsl_vertex.hlsl") << text;
+}
+void SeamPositionOutput() {
+    for (const auto stage : {Stage::VertexB, Stage::Geometry}) {
+        Fixture f{stage};
+        f.program.output_topology = OutputTopology::TriangleStrip;
+        f.program.output_vertices = 3;
+        f.program.invocations = 1;
+        f.program.info.stores.Set(IR::Attribute::PositionY);
+        f.Add(IR::Opcode::SetAttribute,
+              {IR::Value{IR::Attribute::PositionY}, IR::Value{0.25f}, IR::Value{0u}});
+        if (stage == Stage::Geometry) {
+            f.Add(IR::Opcode::EmitVertex, {IR::Value{0u}});
+            f.Add(IR::Opcode::EmitVertex, {IR::Value{0u}});
+        }
+        RuntimeInfo runtime{};
+        runtime.input_topology = InputTopology::Triangles;
+        runtime.y_negate = true;
+        runtime.convert_depth_mode = true;
+        Bindings bindings;
+        const auto text = f.Emit(bindings, {}, runtime);
+        const auto output_start = text.find("struct Output {");
+        const auto output_end = text.find("};", output_start);
+        const auto output = text.substr(output_start, output_end - output_start);
+        const bool precise =
+            (Nxbox::SeamDiagnostics::Mode() & Nxbox::SeamDiagnostics::PrecisePosition) != 0;
+        Require((output.find("precise float4 position") != output.npos) == precise,
+                "Position precision must follow the diagnostic mode");
+        const auto input_start = text.find("struct Input {");
+        Require(text.substr(input_start, output_start - input_start).find("precise") == text.npos,
+                "Do not qualify rasterizer inputs as precise");
+        const auto target = stage == Stage::Geometry ? "nx_vertex" : "output";
+        Contains(text, std::string(target) + ".position.y = -" + target + ".position.y;");
+        Contains(text, std::string(target) + ".position.z = (" + target + ".position.z + " +
+                           target + ".position.w) * 0.5f;");
+        if (stage == Stage::Geometry) {
+            Require(text.find("output.position.y = -") == text.npos,
+                    "Repeated GS emission must transform copies, not the guest output");
+        }
+    }
 }
 void DirectClipDistances() {
   // Direct stores leave used_clip_distances at zero; the output must still
@@ -1047,6 +1087,10 @@ void ResolutionMasks() {
 }
 int main(int argc, char **argv) {
   try {
+      if (argc > 1 && std::string_view{argv[1]} == "seam-position") {
+          SeamPositionOutput();
+          return 0;
+      }
     // `hlsl-ir-tests point-sprite-descriptors` runs only the point sprite and descriptor checks.
     if (argc > 1 && std::string_view{argv[1]} == "point-sprite-descriptors") {
       PointSpriteCoordinate();
@@ -1054,6 +1098,7 @@ int main(int argc, char **argv) {
       return 0;
     }
     ResolutionMasks();
+    SeamPositionOutput();
     GroupedDeclarations();
     SingleUseInlining();
       Vertex();

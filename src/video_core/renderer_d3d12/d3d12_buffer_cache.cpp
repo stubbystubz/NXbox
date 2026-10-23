@@ -394,7 +394,8 @@ void BufferCacheRuntime::BindQuadIndexBuffer(Maxwell::PrimitiveTopology topology
                                              u32 count) {
     // Quads are drawn as indexed triangle lists; indices already include the first vertex.
     static constexpr u32 quad_list[6] = {0, 1, 2, 0, 2, 3};
-    static constexpr u32 strip_list[6] = {0, 1, 2, 2, 1, 3};
+    // Match the indexed converter and Vulkan: same diagonal and front-face winding.
+    static constexpr u32 strip_list[6] = {0, 3, 1, 0, 2, 3};
     const bool strip = topology == Maxwell::PrimitiveTopology::QuadStrip;
     const u32 quads = strip ? (count < 4 ? 0 : (count - 2) / 2) : count / 4;
     auto& geometry = bindings.geometry;

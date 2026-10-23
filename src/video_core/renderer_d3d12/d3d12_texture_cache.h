@@ -208,6 +208,9 @@ public:
     FormatInfo HostFormat() const {
         return host_format;
     }
+    bool AstcBcDiagnosticEnabled() const;
+    void TraceAstcBc(std::string_view event, std::string_view detail = {}) const;
+    void NoteAstcBcUse(bool render_target);
     std::string_view upload_reason{"initial_or_recreated"};
     u64 allocation_tick{};
 
@@ -222,6 +225,9 @@ private:
     TextureCacheRuntime* runtime{};
     ResourcePtr resource;
     FormatInfo host_format{};
+    bool astc_bc_candidate{};
+    bool astc_bc_rt{};
+    bool astc_bc_copy_dst{};
 };
 class ImageView : public VideoCommon::ImageViewBase {
 public:
@@ -249,6 +255,7 @@ public:
             result.view_format = static_cast<u32>(description.Format);
         return result;
     }
+    void NoteAstcBcUse(bool render_target) const;
     void LogUnsupported(std::string_view condition) const;
     const D3D12_SHADER_RESOURCE_VIEW_DESC& Description() const {
         return description;
@@ -265,6 +272,9 @@ public:
     }
 
 private:
+    bool astc_bc_diag{};
+    mutable bool astc_bc_rt_bound{};
+    mutable bool astc_bc_copy_dst{};
     bool is_rescaled{};
     u32 buffer_size{};
     u32 sample_count{1};

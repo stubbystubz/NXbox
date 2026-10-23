@@ -452,6 +452,7 @@ private:
         AdoptScan();
         if (!scan_ && !(files_ && files_->Busy()) && ftp_changes_ != ftp_.Changes()) {
             ftp_changes_ = ftp_.Changes();
+            firmware_status_ = GetFirmwareStatus();
             StartScan();
         }
         if (files_)
@@ -774,6 +775,8 @@ private:
         update_focused_ = false;
         renderer_open_ = false;
         tab_ = tab;
+        if (tab_ == Tab::Files)
+            scan_.reset(); // Release key readers before a manual installation can reload keys.
         if (tab_ == Tab::Files && !files_)
             files_ = std::make_unique<FilesScreen>(renderer_, input_, local_state_, ftp_);
         layer_ = Layer::Nav;
@@ -1190,6 +1193,18 @@ private:
                 official_interface_ = !official_interface_;
             } else if (firmware_status_.home_available)
                 Toast(Tr(Text::ResolutionSaveFailed), now);
+            return;
+        }
+        if (SelectedSetting() == Setting::FirmwareSetup) {
+            if (return_home_) {
+                return_home_->store(true);
+                return;
+            }
+            const InputTransition transition(input_);
+            scan_.reset();
+            closed_ = RunFirmwareSetup(renderer_, window_, input_, local_state_);
+            firmware_status_ = GetFirmwareStatus();
+            StartScan();
             return;
         }
         if (SelectedSetting() == Setting::SystemMenu) {
@@ -1927,6 +1942,8 @@ private:
               Tr(Text::SettingsMultiplayerHint)},
              {Tr(Text::InternetArtwork), Tr(internet_art_ ? Text::NextendoOn : Text::NextendoOff),
               Theme::kTextSecondary, Tr(Text::InternetArtworkHint)},
+             {Tr(Text::SetupTitle), Tr(Text::SetupSelect), Theme::kTextSecondary,
+              Tr(Text::SetupReady)},
              {Tr(Text::SystemMenuTitle), Tr(Text::SystemMenuBoot), Theme::kTextSecondary,
               Tr(Text::SystemMenuHint)},
              {Tr(Text::OfficialSwitchInterface),
@@ -1962,8 +1979,10 @@ private:
               Tr(Text::MaxPlayersHint)},
              {Tr(Text::ResolutionTitle), Tr(resolution_label), Theme::kTextSecondary,
               Tr(Text::ResolutionMemoryHint)},
-             {Tr(Text::UpscalerTitle), Tr(upscaler_mode_ == "temporal" ? Text::UpscalerTemporal :
-                    upscaler_mode_ == "fsr1" ? Text::UpscalerFsr : Text::UpscalerBilinear),
+             {Tr(Text::UpscalerTitle),
+              Tr(upscaler_mode_ == "temporal" ? Text::UpscalerTemporal
+                 : upscaler_mode_ == "fsr1"   ? Text::UpscalerFsr
+                                              : Text::UpscalerBilinear),
               Theme::kTextSecondary, Tr(Text::UpscalerHint)},
              {Tr(Text::FrameGenerationTitle),
               Tr(frame_generation_ == 5   ? Text::FrameGenerationDefault

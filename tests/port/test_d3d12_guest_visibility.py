@@ -218,6 +218,7 @@ void Diagnostic(const std::string& v) {
 #include "video_core/renderer_d3d12/d3d12_context.h"
 using D3D12::FramePhase;
 using D3D12::FrameCount;
+namespace Present = D3D12::Present;
 struct Timing {
     std::array<u64,static_cast<size_t>(FramePhase::Count)> cpu{}; u64 last=10000000; int active=0;
     void Reset(u64 v) { last=v; }
@@ -235,6 +236,11 @@ struct FrameProfile {
     std::atomic<u64> gpu_busy{};
     u64 TakeRecorderCpu() { return 0; }
     u64 recorder_waits{}, recorder_wait_ns{};
+    double native_fps{};
+    u64 output_presents{}, real_present_calls{}, generated_present_calls{};
+    Present::DisplayStatistics display_statistics;
+    Present::FrameGenerationEvents frame_generation;
+    bool frame_generation_gated{true};
     std::unordered_map<u64,u64> transitions;
     std::unordered_map<std::string_view,std::pair<u64,u64>> waits;
     D3D12::Present::PresentGapSamples present_gaps, present_call_gaps;

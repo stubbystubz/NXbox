@@ -1980,7 +1980,7 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
                 auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info,
                                                                mapped_span, unswizzled));
                 std::vector<u8> converted(image.converted_size_bytes);
-                ConvertImage(unswizzled, image.info, converted, copies);
+                ConvertImage(unswizzled, image.info, converted, copies, image.astc_uncompressed);
                 runtime.NxboxCompareAstcUpload(image, converted, copies);
             }
         }
@@ -1992,7 +1992,8 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     if (True(image.flags & ImageFlagBits::Converted)) {
         unswizzle_data_buffer.resize_destructive(image.unswizzled_size_bytes);
         auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, unswizzle_data_buffer));
-        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies);
+        ConvertImage(unswizzle_data_buffer, image.info, mapped_span, copies,
+                     image.astc_uncompressed);
         image.UploadMemory(staging, copies);
     } else {
         const auto copies = FixSmallVectorADL(UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span));
@@ -2226,13 +2227,14 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
         release_input = runtime.ReleaseDecodeInput();
     }
     auto func = [out_size, copies, release_input, info = image.info,
+                 astc_uncompressed = image.astc_uncompressed,
                  input = std::move(local_unswizzle_data_buffer),
                  async_decode = decode_ptr]() mutable {
         NxboxWait::Add(NxboxWait::Counter::DecodeStarted);
         async_decode->decoded_data.resize_destructive(out_size);
         async_decode->output_memory.Set(async_decode->decoded_data.capacity());
         std::span copies_span{copies.data(), copies.size()};
-        ConvertImage(input, info, async_decode->decoded_data, copies_span);
+        ConvertImage(input, info, async_decode->decoded_data, copies_span, astc_uncompressed);
 
         // Release compressed input before publishing completion so the GPU thread
         // can allocate upload staging without overlapping this input allocation.
@@ -3049,7 +3051,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     if ((IsPixelFormatASTC(image.info.format) &&
          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
         True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+        tentative_size = image.astc_uncompressed
+                             ? image.converted_size_bytes
+                             : TranscodedAstcSize(tentative_size, image.info.format);
     }
     total_used_memory += Common::AlignUp(tentative_size, 1024);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
@@ -3245,7 +3249,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if ((IsPixelFormatASTC(image.info.format) &&
          True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
         True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
+        tentative_size = image.astc_uncompressed
+                             ? image.converted_size_bytes
+                             : TranscodedAstcSize(tentative_size, image.info.format);
     }
     total_used_memory -= Common::AlignUp(tentative_size, 1024);
     const GPUVAddr gpu_addr = image.gpu_addr;

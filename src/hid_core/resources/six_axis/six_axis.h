@@ -3,10 +3,15 @@
 
 #pragma once
 
+#include <map>
+#include <set>
+#include <utility>
+
 #include "common/common_types.h"
 #include "hid_core/hid_types.h"
 #include "hid_core/resources/controller_base.h"
 #include "hid_core/resources/ring_lifo.h"
+#include "hid_core/resources/six_axis/motion_diagnostics.h"
 
 namespace Core::HID {
 class EmulatedController;
@@ -61,6 +66,10 @@ private:
     static constexpr std::size_t NPAD_COUNT = 10;
 
     struct SixaxisParameters {
+        std::set<std::pair<Core::HID::NpadStyleIndex, Core::HID::DeviceIndex>> active_handles;
+        // Keep stopped handles until release so diagnostics also report sensor_active=0.
+        std::map<std::pair<Core::HID::NpadStyleIndex, Core::HID::DeviceIndex>, MotionDiagnostics>
+            diagnostics;
         bool is_fusion_enabled{true};
         bool unaltered_passthrough{false};
         Core::HID::SixAxisSensorFusionParameters fusion{};
@@ -75,7 +84,6 @@ private:
 
         // Motion parameters
         bool sixaxis_at_rest{true};
-        bool sixaxis_sensor_enabled{true};
         SixaxisParameters sixaxis_fullkey{};
         SixaxisParameters sixaxis_handheld{};
         SixaxisParameters sixaxis_dual_left{};

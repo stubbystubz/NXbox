@@ -93,13 +93,13 @@ public:
                 player.buttons[i] = parameters.Serialize();
             }
             // Both motion mappings use this player's sensor, including styles selected by
-            // AutoStyle. Keep HID's standard gyro deadband so its automatic bias estimate cannot
-            // drift at rest.
+            // AutoStyle. The threshold is an absolute rate in turns/s, not a multiplier:
+            // 1 would filter out even full-stick aim (0.5 turns/s). Keep the standard deadband.
             Common::ParamPackage motion{{"engine", "nxbox"},
                                         {"port", std::to_string(slot)},
                                         {"pad", "0"},
                                         {"motion", "0"},
-                                        {"threshold", "1"}};
+                                        {"threshold", "0.007"}};
             for (auto& mapping : player.motions)
                 mapping = motion.Serialize();
             for (int i = 0; i < 2; ++i) {
@@ -117,6 +117,10 @@ public:
         button_layout = layout;
     }
 
+    void SetProgramId(std::uint64_t value) {
+        program_id = value;
+    }
+
     void SetMaxPlayers(int value) {
         max_players = ClampMaxPlayers(value);
     }
@@ -126,8 +130,10 @@ public:
         for (std::size_t slot = 0; slot < 4; ++slot) {
             auto& controller = *hid.GetEmulatedControllerByIndex(slot);
             const bool present = devices[slot].has_value();
-            if (devices[slot] != previous_devices[slot])
+            if (devices[slot] != previous_devices[slot]) {
                 stick_motions[slot] = {};
+                view_gestures[slot] = {};
+            }
             if (present || slot == 0)
                 AutoStyle(controller, hid.GetSupportedStyleTag(), slot);
             const bool allowed =
@@ -146,13 +152,26 @@ public:
                     controller.Connect();
             }
             const auto reading = ReadGamepad(devices[slot]);
-            PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot));
+            const bool sensor_requested =
+                slot == 0 && (controller.IsSixAxisSensorRequested() ||
+                              hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)
+                                  ->IsSixAxisSensorRequested());
+            PollPlayer(slot, reading, suppress_guest && PlayerOneControls(slot),
+                       sensor_requested && allowed && (present || slot == 0) &&
+                           Settings::values.motion_enabled.GetValue());
+            controller.SetSyntheticMotionGesture(stick_motions[slot].IsModifierActive(),
+                                                 stick_motions[slot].TapCount());
+            if (slot == 0) {
+                hid.GetEmulatedController(Core::HID::NpadIdType::Handheld)
+                    ->SetSyntheticMotionGesture(stick_motions[slot].IsModifierActive(),
+                                                stick_motions[slot].TapCount());
+            }
         }
         previous_devices = devices;
     }
 
     void PollPlayer(std::size_t slot, const winrt::Windows::Gaming::Input::GamepadReading& reading,
-                    bool suppress_guest) {
+                    bool suppress_guest, bool sensor_requested) {
         using namespace winrt::Windows::Gaming::Input;
         const PadIdentifier pad{.port = slot};
         const bool primary = PlayerOneControls(slot);
@@ -177,11 +196,29 @@ public:
             !suppress_guest) {
             Recording::toggles.fetch_add(1);
         }
-        const auto motion = stick_motions[slot].Update(
+        const bool minus_pressed = view_gestures[slot].Update(
             view, static_cast<float>(reading.RightThumbstickX),
             static_cast<float>(reading.RightThumbstickY), now, suppress_guest || combo_blocked);
         if (primary && view && right_click)
-            stick_motions[slot].CancelTap();
+            view_gestures[slot].CancelTap();
+        const bool modifier =
+            (reading.Buttons & GamepadButtons::LeftThumbstick) != GamepadButtons::None ||
+            (keys & (1u << Settings::NativeButton::LStick)) != 0;
+        const auto key_axis = [keys](int positive, int negative, double value) {
+            if (keys & (1u << positive))
+                return 1.0f;
+            if (keys & (1u << negative))
+                return -1.0f;
+            return static_cast<float>(value);
+        };
+        // Remote/keyboard stick keys drive motion like a pad's sticks (player 1 without a pad).
+        const auto motion = stick_motions[slot].Update(
+            sensor_requested, modifier,
+            key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX),
+            key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY),
+            key_axis(KeyRightStickRight, KeyRightStickLeft, reading.RightThumbstickX),
+            key_axis(KeyRightStickUp, KeyRightStickDown, reading.RightThumbstickY), now,
+            suppress_guest || combo_blocked);
         BasicMotion sensors{};
         sensors.accel_x = motion.accel[0];
         sensors.accel_y = motion.accel[1];
@@ -218,9 +255,10 @@ public:
             pressed = pressed || (physical_keys & (1u << physical)) != 0 ||
                       (scripted_keys & (1u << i)) != 0;
             if (i == Settings::NativeButton::Minus)
-                pressed = motion.minus_pressed;
-            if (i == Settings::NativeButton::RStick &&
-                (motion.suppress_right_stick || (primary && record_shortcut.consume_stick)))
+                pressed = minus_pressed;
+            if (i == Settings::NativeButton::LStick)
+                pressed = motion.guest_l3;
+            if (i == Settings::NativeButton::RStick && primary && record_shortcut.consume_stick)
                 pressed = false;
             if (combo_blocked &&
                 (i == Settings::NativeButton::Minus || i == Settings::NativeButton::Plus)) {
@@ -233,21 +271,20 @@ public:
                 SetAxis(pad, i, 0.0f);
             return;
         }
-        const auto key_axis = [keys](int positive, int negative, double value) {
-            if (keys & (1u << positive))
-                return 1.0f;
-            if (keys & (1u << negative))
-                return -1.0f;
-            return static_cast<float>(value);
-        };
-        SetAxis(pad, 0, key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX));
-        SetAxis(pad, 1, key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY));
+        SetAxis(pad, 0,
+                motion.suppress_sticks
+                    ? 0.0f
+                    : key_axis(KeyLeftStickRight, KeyLeftStickLeft, reading.LeftThumbstickX));
+        SetAxis(pad, 1,
+                motion.suppress_sticks
+                    ? 0.0f
+                    : key_axis(KeyLeftStickUp, KeyLeftStickDown, reading.LeftThumbstickY));
         SetAxis(pad, 2,
-                motion.suppress_right_stick
+                motion.suppress_sticks
                     ? 0.0f
                     : key_axis(KeyRightStickRight, KeyRightStickLeft, reading.RightThumbstickX));
         SetAxis(pad, 3,
-                motion.suppress_right_stick
+                motion.suppress_sticks
                     ? 0.0f
                     : key_axis(KeyRightStickUp, KeyRightStickDown, reading.RightThumbstickY));
     }
@@ -309,7 +346,9 @@ private:
     ButtonLayout button_layout = ButtonLayout::Name;
     GamepadSlots<winrt::Windows::Gaming::Input::Gamepad> previous_devices;
     int max_players = 4;
+    std::uint64_t program_id = 0;
     std::array<StickMotion, 4> stick_motions;
+    std::array<ViewGesture, 4> view_gestures;
     HomeComboState home_combo;
     HomeComboAction home_combo_action{};
     HomeButtonEdge home_edge;
@@ -335,7 +374,7 @@ private:
             const char* value = std::getenv("NXBOX_PAD_STYLE");
             return std::string(value != nullptr ? value : "");
         }();
-        auto choice = ChoosePadStyle(raw);
+        auto choice = ChoosePadStyle(raw, PrefersJoycons(program_id));
         if (forced == "dual" && (raw & (1u << 2)))
             choice = PadChoice::JoyDual;
         else if (forced == "handheld" && (raw & (1u << 1)))

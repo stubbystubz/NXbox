@@ -992,6 +992,7 @@ void RunGame(MesaWindow& window, const std::string& bundled_path, const std::ato
         u64 title_id = 0;
         if (loader && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
             title_id) {
+            gamepad->SetProgramId(title_id);
             const auto local_state = std::filesystem::path(winrt::to_string(
                 winrt::Windows::Storage::ApplicationData::Current().LocalFolder().Path()));
             const auto title = fmt::format("{:016X}", title_id);

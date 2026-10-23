@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <winrt/Windows.Foundation.h>
 #include "eden_uwp/file_manager.h"
+#include "eden_uwp/firmware.h"
 #include "eden_uwp/ui/files_screen.h"
 #include "eden_uwp/ui/strings.h"
 #include "eden_uwp/ui/text_entry.h"
@@ -23,6 +24,16 @@ struct FilesScreen::Impl {
     int root = 0, row = 0, action = 0;
     bool pane = false, menu = false, deleting = false, overwrite = false;
     bool destination = false, moving = false, creating = false;
+    bool picking = false, pick_keys = false, pick_firmware = false, install_confirm = false;
+    std::optional<std::filesystem::path> picked;
+    bool Installable() const {
+        if (entries.empty() || FtpSelected())
+            return false;
+        const auto& entry = entries.at(row);
+        return entry.directory ||
+               Setup::Lower(std::filesystem::path(entry.name).extension().string()) == ".zip" ||
+               Setup::IsKeys(std::filesystem::path(entry.name));
+    }
     Files::Location source;
     unsigned source_root = 0;
     bool source_directory = false, target_directory = false;
@@ -35,6 +46,7 @@ struct FilesScreen::Impl {
     Text message = Text::FilesReady;
     struct Result {
         bool ok = true, changed = false, clash = false, directory = false;
+        bool installed = false;
         Ui::Text failure = Ui::Text::FilesFailed;
         std::optional<std::vector<Files::Root>> roots;
         std::optional<std::vector<Files::Entry>> entries;
@@ -163,7 +175,11 @@ struct FilesScreen::Impl {
                 Files::SortEntries(entries, sort);
                 row = std::clamp(row, 0, std::max(0, static_cast<int>(entries.size()) - 1));
             }
-            message = cancelled   ? Text::FilesCancelled
+            message = result.installed
+                          ? (result.ok                                 ? Text::SetupSuccess
+                             : GetFirmwareStatus().conversion_required ? Text::FirmwareConvertDump
+                                                                       : Text::SetupFailed)
+                      : cancelled ? Text::FilesCancelled
                       : result.ok ? Text::FilesReady
                                   : result.failure;
             if (preparing) {
@@ -185,6 +201,31 @@ struct FilesScreen::Impl {
         if (Busy()) {
             if (input.Pressed(Button::B))
                 progress.cancel = true;
+            return false;
+        }
+        if (install_confirm) {
+            if (input.Pressed(Button::B))
+                install_confirm = false;
+            else if (input.Pressed(Button::A)) {
+                install_confirm = false;
+                const auto path = Files::Resolve(Selected());
+                Start([this, path] {
+                    Result result;
+                    result.installed = true;
+                    result.changed = true;
+                    if (Setup::IsKeys(path))
+                        result.ok = InstallSetupKeys(path);
+                    else {
+                        InstallFirmwareSource(local, path, [this](size_t total, size_t done) {
+                            progress.total = total;
+                            progress.done = done;
+                            return progress.cancel.load();
+                        });
+                        result.ok = !GetFirmwareStatus().install_failed;
+                    }
+                    return result;
+                });
+            }
             return false;
         }
         if (keyboard) {
@@ -232,10 +273,12 @@ struct FilesScreen::Impl {
             if (input.Pressed(Button::Up))
                 action = std::max(entries.empty() ? 4 : 0, action - 1);
             if (input.Pressed(Button::Down))
-                action = std::min(4, action + 1);
+                action = std::min(Installable() ? 5 : 4, action + 1);
             if (input.Pressed(Button::A)) {
                 menu = false;
-                if (action == 4) {
+                if (action == 5) {
+                    install_confirm = true;
+                } else if (action == 4) {
                     creating = true;
                     keyboard = std::make_unique<TextEntry>(Tr(Text::FilesNewFolder), L"");
                 } else if (!entries.empty()) {
@@ -259,6 +302,10 @@ struct FilesScreen::Impl {
             return false;
         }
         if (input.Pressed(Button::B)) {
+            if (picking && !pane) {
+                picking = false;
+                return true;
+            }
             if (pane && !relative.empty()) {
                 relative = std::filesystem::path(relative).parent_path().generic_wstring();
                 Browse();
@@ -283,9 +330,9 @@ struct FilesScreen::Impl {
         if (!pane) {
             if (root == 0 && input.Pressed(Button::Up) && !destination)
                 return true;
-            const auto next =
-                std::clamp(root + delta, 0,
-                           std::max(0, static_cast<int>(roots.size()) - (destination ? 1 : 0)));
+            const auto next = std::clamp(
+                root + delta, 0,
+                std::max(0, static_cast<int>(roots.size()) - ((destination || picking) ? 1 : 0)));
             if (next != root) {
                 root = next;
                 relative.clear();
@@ -313,13 +360,32 @@ struct FilesScreen::Impl {
                         ftp.Stop();
                     return result;
                 });
+            } else if (picking && !entries.empty() && !entries[row].directory &&
+                       ((pick_keys && Setup::IsKeys(std::filesystem::path(entries[row].name))) ||
+                        (pick_firmware &&
+                         Setup::Lower(
+                             std::filesystem::path(entries[row].name).extension().string()) ==
+                             ".zip"))) {
+                picked = Files::Resolve(Selected());
+                picking = false;
+                return true;
             } else if (!entries.empty() && entries[row].directory) {
                 relative = Files::Join(relative, entries[row].name);
                 Browse();
             }
         }
         if (input.Pressed(Button::X) && pane && !FtpSelected() && !Busy()) {
-            if (destination)
+            if (picking) {
+                if (pick_keys && !entries.empty() &&
+                    Setup::IsKeys(std::filesystem::path(entries[row].name)))
+                    picked = Files::Resolve(Selected());
+                else if (!pick_keys)
+                    picked = Files::Resolve(Here());
+                if (picked) {
+                    picking = false;
+                    return true;
+                }
+            } else if (destination)
                 PrepareTransfer();
             else {
                 menu = true;
@@ -339,22 +405,23 @@ struct FilesScreen::Impl {
             return {};
         if (Busy())
             return {{Theme::kButtonB, L"B", Tr(Text::HintCancel)}};
-        if (deleting || overwrite || menu)
+        if (deleting || overwrite || menu || install_confirm)
             return {{Theme::kButtonA, L"A", Tr(Text::HintSelect)},
                     {Theme::kButtonB, L"B", Tr(Text::HintBack)}};
-        return {
-            {Theme::kButtonA, L"A", Tr(Text::HintSelect)},
-            {Theme::kButtonB, L"B", Tr(Text::HintBack)},
-            {Theme::kButtonX, L"X", Tr(destination ? Text::FilesUseFolder : Text::FilesActions)},
-            {Theme::kButtonY, L"Y", Tr(Text::FilesSort)},
-            {Theme::kTextSecondary, L"LB/RB", Tr(Text::FilesPage)}};
+        return {{Theme::kButtonA, L"A", Tr(Text::HintSelect)},
+                {Theme::kButtonB, L"B", Tr(Text::HintBack)},
+                {Theme::kButtonX, L"X",
+                 Tr((destination || picking) ? Text::FilesUseFolder : Text::FilesActions)},
+                {Theme::kButtonY, L"Y", Tr(Text::FilesSort)},
+                {Theme::kTextSecondary, L"LB/RB", Tr(Text::FilesPage)}};
     }
     void DrawText(const std::wstring& text, Font font, float x, float y, float right,
                   D2D1_COLOR_F color = Theme::kText) {
         renderer.DrawString(text, font, RectF(x, y, right, y + 56.0f), color);
     }
     void Draw(Clock::time_point now, bool nav) {
-        DrawText(Tr(Ui::Text::NavFiles), Font::Heading, kScreenMargin + 28, 210, 1800);
+        DrawText(Tr(picking ? Ui::Text::SetupChooseFolder : Ui::Text::NavFiles), Font::Heading,
+                 kScreenMargin + 28, 210, 1800);
         const int count = static_cast<int>(roots.size()) + 1;
         const int first = std::max(0, root - 6);
         for (int i = first; i < std::min(count, first + 7); ++i) {
@@ -442,16 +509,28 @@ struct FilesScreen::Impl {
             DrawProgressBar(renderer, RectF(580, 902, 1810, 912),
                             static_cast<double>(progress.done.load()) / progress.total.load());
         }
+        if (install_confirm) {
+            DrawSheet(renderer, RectF(540, 240, 1490, 880));
+            DrawText(Tr(Text::SetupConfirm), Font::RowTitle, 610, 310, 1420);
+            DrawText(Selected().relative, Font::RowSub, 610, 410, 1420);
+            DrawChoicePill(renderer, RectF(610, 650, 1420, 714), Tr(Text::SetupInstall), true,
+                           true);
+        }
         if (menu || deleting || overwrite) {
             DrawSheet(renderer, RectF(540, 240, 1490, 880));
             if (menu) {
                 constexpr Ui::Text actions[] = {Ui::Text::FilesCopy, Ui::Text::FilesMove,
                                                 Ui::Text::FilesRename, Ui::Text::FilesDelete,
                                                 Ui::Text::FilesNewFolder};
-                for (int i = 0; i < 5; ++i) {
-                    const float y = 310.0f + i * 100.0f;
-                    DrawChoicePill(renderer, RectF(610, y, 1420, y + 64), Tr(actions[i]), false,
-                                   action == i);
+                for (int i = 0; i < (Installable() ? 6 : 5); ++i) {
+                    const float y = 280.0f + static_cast<float>(i) * 95.0f;
+                    DrawChoicePill(renderer, RectF(610, y, 1420, y + 64),
+                                   Tr(i == 5
+                                          ? (Setup::IsKeys(std::filesystem::path(entries[row].name))
+                                                 ? Text::SetupInstallKeys
+                                                 : Text::SetupInstallFirmware)
+                                          : actions[i]),
+                                   false, action == i);
                 }
             } else {
                 DrawText(
@@ -517,5 +596,19 @@ std::vector<Hint> FilesScreen::Hints() const {
 }
 bool FilesScreen::Busy() const {
     return impl_->Busy();
+}
+void FilesScreen::PickFolder(bool keys, bool firmware) {
+    impl_->pick_firmware = firmware;
+    impl_->picking = true;
+    impl_->pick_keys = keys;
+    impl_->picked.reset();
+}
+bool FilesScreen::Picking() const {
+    return impl_->picking;
+}
+std::optional<std::filesystem::path> FilesScreen::TakePicked() {
+    auto result = impl_->picked;
+    impl_->picked.reset();
+    return result;
 }
 } // namespace EdenXbox::Ui

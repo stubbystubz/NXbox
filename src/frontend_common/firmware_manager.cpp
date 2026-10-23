@@ -3,6 +3,8 @@
 
 #include "firmware_manager.h"
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 #include <common/fs/fs_paths.h>
 
 #include "common/fs/fs.h"
@@ -59,7 +61,11 @@ FirmwareManager::InstallKeys(std::string location, std::string extension) {
         return ErrorFailedCopy;
     }
 #else
-    if (!location.ends_with(extension)) {
+    auto normalized_extension = std::filesystem::path(location).extension().string();
+    std::transform(normalized_extension.begin(), normalized_extension.end(),
+                   normalized_extension.begin(),
+                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    if (normalized_extension != "." + extension) {
         return ErrorWrongFilename;
     }
 
@@ -91,8 +97,18 @@ FirmwareManager::InstallKeys(std::string location, std::string extension) {
         return ErrorWrongFilename;
     }
 
+    Common::FS::CreateDirs(keys_dir);
     for (const auto &key_file : source_key_files) {
-        std::filesystem::path destination_key_file = keys_dir / key_file.filename();
+        auto destination_name = key_file.filename().string();
+        auto conventional_name = destination_name;
+        std::transform(conventional_name.begin(), conventional_name.end(),
+                       conventional_name.begin(),
+                       [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        if (conventional_name == "prod.keys" || conventional_name == "title.keys")
+            destination_name = conventional_name;
+        const auto destination_key_file = keys_dir / destination_name;
+        if (key_file.lexically_normal() == destination_key_file.lexically_normal())
+            continue;
         if (!std::filesystem::copy_file(key_file,
                                         destination_key_file,
                                         std::filesystem::copy_options::overwrite_existing)) {

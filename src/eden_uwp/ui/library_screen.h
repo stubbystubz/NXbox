@@ -17,7 +17,7 @@ namespace EdenXbox::Ui {
 // included, before it returns.
 //
 // The first time (LocalState\setup_done.txt missing) it asks whether to sync saves with
-// SwitchSaveSync before the library shows.
+// SwitchSaveSync, then offers keys, firmware and a games folder before the library shows.
 //
 // Returns the absolute path (UTF-8) of the game the player launched, or an empty string when the
 // player left with B or the screen could not be shown. When a game was launched and `chosen` is
