@@ -12,6 +12,31 @@ enum class Language {
 
 // Every text the UI shows. English must define every key; other languages may omit keys.
 enum class Text {
+    SetupKeysPlacement,
+    SetupFirmwarePlacement,
+
+    SetupTitle,
+    SetupKeys,
+    SetupFirmware,
+    SetupGames,
+    SetupSelect,
+    SetupContinue,
+    SetupMissing,
+    SetupReady,
+    SetupScanning,
+    SetupInstalling,
+    SetupSuccess,
+    SetupFailed,
+    SetupSuggestion,
+    SetupInstall,
+    SetupConfirm,
+    SetupInstallKeys,
+    SetupInstallFirmware,
+    SetupWithoutKeys,
+    SetupWithoutFirmware,
+    SetupDefaultGames,
+    SetupChooseFolder,
+
     ErrorTitle,
     ErrorDismiss,
     ErrorScroll,

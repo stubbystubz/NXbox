@@ -12,6 +12,7 @@ enum class Setting {
     Nextendo,
     Multiplayer,
     InternetArt,
+    FirmwareSetup,
     SystemMenu,
     OfficialInterface,
     ProfilePicture,
@@ -51,9 +52,9 @@ inline constexpr std::array<SettingsCategory, 6> kSettingsCategories{{
      {Setting::ProfilePicture, Setting::Accounts, Setting::Moru, Setting::SaveSync},
      4},
     {Text::SettingsSystem,
-     {Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox, Setting::RecordVideo,
-      Setting::ConsoleLanguage},
-     5},
+     {Setting::FirmwareSetup, Setting::SystemMenu, Setting::OfficialInterface, Setting::BackToNXbox,
+      Setting::RecordVideo, Setting::ConsoleLanguage},
+     6},
     {Text::SettingsAbout, {Setting::Version, Setting::Credits}, 2},
 }};
 // Index 0 is "automatic"; index n is Settings::Language n - 1.
