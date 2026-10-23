@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#undef NDEBUG // The checks below must run in Release test builds too.
 #include "eden_uwp/setup_policy.h"
 #include <cassert>
 #include <map>
