@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <ctime>
 #include <cwctype>
 #include <deque>
 #include <fstream>
@@ -40,9 +41,12 @@
 #include <winrt/Windows.Web.Http.h>
 
 #include "common/fs/path_util.h"
+#include "common/common_types.h"
 #include "common/settings.h"
+#include "common/uuid.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "eden_uwp/diagnostic.h"
 #include "eden_uwp/ui/mod_archive.h"
 #include "eden_uwp/ui/mods_paths.h"
@@ -485,6 +489,253 @@ bool IsLaterRarVolume(const std::string& file_name) {
     return first == std::string::npos || digits.substr(first) != "1";
 }
 
+// ---- Super Smash Bros. Ultimate (ARCropolis) ----
+
+// Smash Ultimate keeps its data in one data.arc, so its mods are not LayeredFS mods: they are
+// ARCropolis folders (sd:/ultimate/mods/<mod>/fighter/...), loaded by the ARCropolis plugin of
+// Skyline. Skyline is an exefs mod (main.npdm + subsdk9); the plugin is read from rom:/skyline/plugins,
+// so on Eden it goes in a LayeredFS romfs.
+constexpr std::string_view kSmashTitle = "01006A800016E000";
+constexpr const char* kSkylineUrl =
+    "https://github.com/skyline-dev/skyline/releases/download/beta/skyline.zip";
+constexpr const char* kArcropolisUrl =
+    "https://github.com/Raytwo/ARCropolis/releases/download/v4.1.1/release.zip";
+constexpr std::wstring_view kSkylineFolder = L"Skyline";
+constexpr std::wstring_view kArcropolisFolder = L"ARCropolis";
+
+std::wstring LowerW(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](wchar_t letter) { return static_cast<wchar_t>(std::towlower(letter)); });
+    return text;
+}
+
+// Top-level folders of data.arc that ARCropolis mods replace.
+bool IsArcFolderName(const std::wstring& name) {
+    static const std::set<std::wstring> names = {
+        L"fighter", L"ui",     L"sound",  L"stream;", L"effect", L"stage",  L"camera",
+        L"item",    L"assist", L"prebuilt;", L"param", L"boss",  L"enemy",  L"render",
+        L"spirits", L"common", L"standard", L"finger", L"miihat", L"pokemon"};
+    return names.count(LowerW(name)) != 0;
+}
+
+std::vector<fs::path> ChildDirectories(const fs::path& directory) {
+    std::vector<fs::path> children;
+    std::error_code ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code type_error;
+        if (it->is_directory(type_error)) {
+            children.push_back(it->path());
+        }
+    }
+    std::sort(children.begin(), children.end());
+    return children;
+}
+
+// The shallowest folder holding a data.arc folder (fighter, ui, sound...), outside any romfs or
+// exefs: "<mod>/fighter", "ultimate/mods/<mod>/fighter" and a bare "fighter" all work.
+bool FindArcRoot(const fs::path& root, fs::path& found) {
+    std::deque<std::pair<fs::path, int>> queue;
+    queue.emplace_back(root, 0);
+    while (!queue.empty()) {
+        const auto [directory, depth] = queue.front();
+        queue.pop_front();
+        const std::vector<fs::path> children = ChildDirectories(directory);
+        for (const fs::path& child : children) {
+            if (IsArcFolderName(child.filename().wstring())) {
+                found = directory;
+                return true;
+            }
+        }
+        if (depth < kMaxSearchDepth) {
+            for (const fs::path& child : children) {
+                const std::wstring name = LowerW(child.filename().wstring());
+                if (name != L"romfs" && name != L"exefs" && name != L"atmosphere") {
+                    queue.emplace_back(child, depth + 1);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Copies `from` into `to`, merging with what is there and replacing files of the same name.
+bool MergeCopy(const fs::path& from, const fs::path& to, std::string& error) {
+    std::error_code ec;
+    fs::create_directories(to, ec);
+    fs::copy(from, to, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+}
+
+// Moves `from` to `to` (replacing it), copying when a rename is not possible.
+bool PlaceFolder(const fs::path& from, const fs::path& to, std::string& error) {
+    std::error_code ec;
+    fs::remove_all(to, ec);
+    fs::create_directories(to.parent_path(), ec);
+    ec.clear();
+    fs::rename(from, to, ec);
+    if (!ec) {
+        return true;
+    }
+    return MergeCopy(from, to, error);
+}
+
+// ---- Save files ----
+
+std::string Hex16Upper(std::uint64_t value) {
+    return fmt::format("{:016X}", value);
+}
+
+// A save mod is said to be one by its name or GameBanana category ("100% Save File", "Saves").
+bool LooksLikeSaveMod(const std::string& name, const std::string& category) {
+    const std::string text = Lower(name + " " + category);
+    return text.find("save") != std::string::npos;
+}
+
+// Text that comes with a download but is not part of a save.
+bool IsSaveNoise(const std::wstring& name) {
+    const std::wstring lower = LowerW(name);
+    if (lower.starts_with(L"readme") || lower.starts_with(L"read me") ||
+        lower.starts_with(L"__macosx") || lower == L".ds_store" || lower == L"desktop.ini") {
+        return true;
+    }
+    for (const wchar_t* extension : {L".txt", L".md", L".url", L".html", L".htm", L".nfo",
+                                     L".jpg", L".jpeg", L".png", L".webp", L".gif"}) {
+        if (lower.ends_with(extension)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::set<std::wstring> EntryNames(const fs::path& directory) {
+    std::set<std::wstring> names;
+    std::error_code ec;
+    for (fs::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::wstring name = it->path().filename().wstring();
+        if (!IsSaveNoise(name)) {
+            names.insert(LowerW(name));
+        }
+    }
+    return names;
+}
+
+// The folder of the download that is the save. With a save already on the console, it is the
+// folder whose entries match the save's own entries best (so "Game/user - date/save_data" and a
+// bare "save_data" both land right); otherwise single wrapper folders are stripped.
+bool FindSaveRoot(const fs::path& unpacked, const std::set<std::wstring>& current,
+                  fs::path& found) {
+    std::size_t best = 0;
+    std::deque<std::pair<fs::path, int>> queue;
+    queue.emplace_back(unpacked, 0);
+    while (!queue.empty()) {
+        const auto [directory, depth] = queue.front();
+        queue.pop_front();
+        std::size_t score = 0;
+        for (const std::wstring& name : EntryNames(directory)) {
+            score += current.count(name);
+        }
+        if (score > best) {
+            best = score;
+            found = directory;
+        }
+        if (depth < kMaxSearchDepth) {
+            for (const fs::path& child : ChildDirectories(directory)) {
+                queue.emplace_back(child, depth + 1);
+            }
+        }
+    }
+    if (best > 0) {
+        return true;
+    }
+    static const std::set<std::wstring> save_folders = {L"save_data", L"savedata", L"save",
+                                                        L"saves", L"data"};
+    fs::path directory = unpacked;
+    for (int depth = 0; depth < kMaxSearchDepth; ++depth) {
+        const std::set<std::wstring> names = EntryNames(directory);
+        const std::vector<fs::path> children = ChildDirectories(directory);
+        if (names.size() != 1 || children.size() != 1 ||
+            save_folders.count(LowerW(children.front().filename().wstring())) != 0) {
+            break;
+        }
+        directory = children.front();
+    }
+    if (EntryNames(directory).empty()) {
+        return false;
+    }
+    found = directory;
+    return true;
+}
+
+// Copies the save into `destination`, leaving out readmes and pictures at its top level.
+bool CopySave(const fs::path& from, const fs::path& destination, std::string& error) {
+    std::error_code ec;
+    fs::create_directories(destination, ec);
+    for (fs::directory_iterator it(from, ec), end; !ec && it != end; it.increment(ec)) {
+        if (IsSaveNoise(it->path().filename().wstring())) {
+            continue;
+        }
+        std::error_code copy_error;
+        fs::copy(it->path(), destination / it->path().filename(),
+                 fs::copy_options::recursive | fs::copy_options::overwrite_existing, copy_error);
+        if (copy_error) {
+            error = copy_error.message();
+            return false;
+        }
+    }
+    if (ec) {
+        error = ec.message();
+        return false;
+    }
+    return true;
+}
+
+bool DirectoryHasEntries(const fs::path& directory) {
+    std::error_code ec;
+    return fs::is_directory(directory, ec) && !fs::is_empty(directory, ec);
+}
+
+// Eden's save folder of `title` for one user (savedata_factory.cpp GetFullPath): the "future"
+// account/<uuid>/<title & ~0xFF>/0 when it exists, else 0000000000000000/<user>/<title>.
+fs::path UserSaveDir(const fs::path& nand, std::uint64_t title, const Common::UUID& uuid) {
+    const fs::path root = nand / "user" / "save";
+    const fs::path future =
+        root / "account" / uuid.RawString() / Hex16Upper(title & ~0xFFull) / "0";
+    std::error_code ec;
+    if (fs::exists(future, ec)) {
+        return future;
+    }
+    const u128 id = uuid.AsU128();
+    return root / "0000000000000000" / (Hex16Upper(id[1]) + Hex16Upper(id[0])) / Hex16Upper(title);
+}
+
+// The save to replace: the one user that already has a save of the game, else the user Eden
+// boots games as. Empty when there are no profiles.
+fs::path CurrentSaveDir(std::uint64_t title) {
+    const fs::path nand = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+    const Service::Account::ProfileManager manager;
+    std::vector<fs::path> with_save;
+    for (const auto& uuid : manager.GetAllUsers()) {
+        if (!uuid.IsInvalid()) {
+            const fs::path directory = UserSaveDir(nand, title, uuid);
+            if (DirectoryHasEntries(directory)) {
+                with_save.push_back(directory);
+            }
+        }
+    }
+    if (with_save.size() == 1) {
+        return with_save.front();
+    }
+    const Common::UUID last = manager.GetLastOpenedUser();
+    if (last.IsInvalid()) {
+        return {};
+    }
+    return UserSaveDir(nand, title, last);
+}
+
 // Prefix match on the words of a category name, so "ui" does not match "build".
 bool CategoryMatches(const std::string& category, const std::vector<const char*>& words) {
     const std::string lower = Lower(category);
@@ -602,6 +853,7 @@ struct InstalledRecord {
     std::string category;
     std::string thumb_url;
     std::int64_t likes = 0;
+    std::string kind = "load"; // "load": eden\load; "arc": sdmc\ultimate\mods; "save"
 };
 
 struct Queue {
@@ -739,6 +991,10 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
                 record.category = StringAt(item, L"category");
                 record.thumb_url = StringAt(item, L"thumb");
                 record.likes = static_cast<std::int64_t>(NumberAt(item, L"likes", 0.0));
+                record.kind = StringAt(item, L"kind");
+                if (record.kind.empty()) {
+                    record.kind = "load";
+                }
                 if (record.id != 0 && !record.folder.empty()) {
                     installed.push_back(std::move(record));
                 }
@@ -778,6 +1034,8 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
                     L"thumb", JsonValue::CreateStringValue(winrt::to_hstring(record.thumb_url)));
                 item.SetNamedValue(
                     L"likes", JsonValue::CreateNumberValue(static_cast<double>(record.likes)));
+                item.SetNamedValue(L"kind",
+                                   JsonValue::CreateStringValue(winrt::to_hstring(record.kind)));
                 list.Append(item);
             }
             root.SetNamedValue(L"installed", list);
@@ -1226,31 +1484,69 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
             fail(unpack_error);
             return;
         }
-        fs::path root;
-        if (!FindModRoot(unpacked, root)) {
-            // Many 60 fps / resolution mods are only .pchtxt or .ips patches with no folder
-            // around them; Eden loads those from the mod's exefs folder.
-            root = work / "loose";
-            if (!GatherLoosePatches(unpacked, root / "exefs")) {
+        const std::string folder = SanitizeFolderName(entry->name, entry->id);
+        const fs::path load_dir = local_state / "eden" / "load" / Widen(title_id);
+        const bool smash = title_id == kSmashTitle;
+        std::string kind = "load";
+        std::string where;
+        std::string error;
+        fs::path layered_root;
+        fs::path arc_root;
+        const bool has_layered = FindModRoot(unpacked, layered_root);
+        const bool has_arc = smash && FindArcRoot(unpacked, arc_root);
+        if (has_arc) {
+            // ARCropolis mod, maybe with a Skyline plugin of its own in a romfs beside it.
+            if (!EnsureArcropolis(error)) {
                 cleanup();
-                fail("the archive has no romfs, exefs or cheats folder");
+                fail("could not set up ARCropolis: " + error);
                 return;
             }
-        }
-        const std::string folder = SanitizeFolderName(entry->name, entry->id);
-        const fs::path destination =
-            local_state / "eden" / "load" / Widen(title_id) / Widen(folder);
-        fs::remove_all(destination, ec);
-        fs::create_directories(destination.parent_path(), ec);
-        fs::rename(root, destination, ec);
-        if (ec) {
-            // Another volume or a locked folder: copy instead.
-            ec.clear();
-            fs::copy(root, destination, fs::copy_options::recursive | fs::copy_options::overwrite_existing,
-                     ec);
-            if (ec) {
+            const fs::path mods = SdmcDir() / "ultimate" / "mods";
+            std::error_code remove_error;
+            fs::remove_all(mods / Widen("." + folder), remove_error);
+            if (!PlaceFolder(arc_root, mods / Widen(folder), error)) {
                 cleanup();
-                fail("cannot place the mod: " + ec.message());
+                fail("cannot place the ARCropolis mod: " + error);
+                return;
+            }
+            kind = "arc";
+            where = "sdmc\\ultimate\\mods\\" + folder;
+            if (has_layered && fs::exists(layered_root, remove_error)) {
+                if (!PlaceFolder(layered_root, load_dir / Widen(folder), error)) {
+                    cleanup();
+                    fail("cannot place the mod: " + error);
+                    return;
+                }
+                where += " + eden\\load\\" + title_id + "\\" + folder;
+            }
+        } else {
+            fs::path root = layered_root;
+            bool found = has_layered;
+            if (!found) {
+                // Many 60 fps / resolution mods are only .pchtxt or .ips patches with no folder
+                // around them; Eden loads those from the mod's exefs folder.
+                root = work / "loose";
+                found = GatherLoosePatches(unpacked, root / "exefs");
+            }
+            if (found) {
+                if (!PlaceFolder(root, load_dir / Widen(folder), error)) {
+                    cleanup();
+                    fail("cannot place the mod: " + error);
+                    return;
+                }
+                where = "eden\\load\\" + title_id + "\\" + folder;
+            } else if (LooksLikeSaveMod(entry->name, entry->category)) {
+                if (!InstallSave(unpacked, where, error)) {
+                    cleanup();
+                    fail("cannot install the save: " + error);
+                    return;
+                }
+                kind = "save";
+            } else {
+                cleanup();
+                fail(smash ? "the archive has no ARCropolis (fighter, ui, sound...), romfs or "
+                             "exefs folder"
+                           : "the archive has no romfs, exefs or cheats folder");
                 return;
             }
         }
@@ -1264,13 +1560,137 @@ struct ModStore::Impl : std::enable_shared_from_this<ModStore::Impl> {
                                            }),
                             installed.end());
             installed.push_back({entry->id, entry->name, folder, entry->author, entry->category,
-                                 entry->thumb_url, entry->likes});
+                                 entry->thumb_url, entry->likes, kind});
             disabled.erase(folder);
             SaveRecordFileLocked();
         }
         entry->state.store(static_cast<int>(ModState::Installed));
-        Diagnostic(fmt::format("UI mods install {} ok -> eden\\load\\{}\\{}", entry->id, title_id,
-                               folder));
+        Diagnostic(fmt::format("UI mods install {} ok ({}) -> {}", entry->id, kind, where));
+    }
+
+    static fs::path SdmcDir() {
+        return Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir);
+    }
+
+    // Skyline (exefs) and the ARCropolis plugin (romfs) as Eden mods of Smash Ultimate, and
+    // ARCropolis' own resources on the SD card. Downloaded once, the first time a Smash mod
+    // needs them.
+    bool EnsureArcropolis(std::string& error) {
+        const fs::path load_dir = local_state / "eden" / "load" / Widen(std::string(kSmashTitle));
+        const fs::path skyline = load_dir / kSkylineFolder;
+        const fs::path arcropolis = load_dir / kArcropolisFolder;
+        const fs::path sdmc = SdmcDir();
+        std::error_code ec;
+        const bool have_skyline = fs::exists(skyline / "exefs" / "subsdk9", ec) &&
+                                  fs::exists(skyline / "exefs" / "main.npdm", ec);
+        const bool have_arcropolis =
+            fs::exists(arcropolis / "romfs" / "skyline" / "plugins" / "libarcropolis.nro", ec) &&
+            fs::exists(sdmc / "ultimate" / "arcropolis", ec);
+        if (have_skyline && have_arcropolis) {
+            return true;
+        }
+        const fs::path work = local_state / "mods_tmp" / "arcropolis";
+        fs::remove_all(work, ec);
+        fs::create_directories(work, ec);
+        const auto fetch = [&](const char* url, const std::string& name, fs::path& out) {
+            const fs::path archive = work / Widen(name + ".zip");
+            std::string problem = HttpDownload(
+                url, archive, 0, [](std::uint64_t, std::uint64_t) {}, cancel);
+            if (problem.empty()) {
+                out = work / Widen(name);
+                problem = ExtractModArchive(archive, out, cancel, kMaxArchiveBytes);
+            }
+            if (!problem.empty()) {
+                error = name + ": " + problem;
+                return false;
+            }
+            return true;
+        };
+        bool ok = true;
+        fs::path unpacked;
+        if (!have_skyline) {
+            ok = fetch(kSkylineUrl, "skyline", unpacked);
+            if (ok && !fs::exists(unpacked / "exefs" / "subsdk9", ec)) {
+                error = "skyline: the download has no exefs\\subsdk9";
+                ok = false;
+            }
+            ok = ok && PlaceFolder(unpacked / "exefs", skyline / "exefs", error);
+            if (ok) {
+                Diagnostic("UI mods ARCropolis: Skyline installed");
+            }
+        }
+        if (ok && !have_arcropolis) {
+            ok = fetch(kArcropolisUrl, "arcropolis", unpacked);
+            const fs::path romfs =
+                unpacked / "atmosphere" / "contents" / Widen(std::string(kSmashTitle)) / "romfs";
+            if (ok && !fs::exists(romfs / "skyline" / "plugins" / "libarcropolis.nro", ec)) {
+                error = "arcropolis: the download has no libarcropolis.nro";
+                ok = false;
+            }
+            ok = ok && PlaceFolder(romfs, arcropolis / "romfs", error);
+            if (ok && fs::exists(unpacked / "ultimate", ec)) {
+                ok = MergeCopy(unpacked / "ultimate", sdmc / "ultimate", error);
+            }
+            if (ok) {
+                fs::create_directories(sdmc / "ultimate" / "mods", ec);
+                Diagnostic("UI mods ARCropolis: plugin installed");
+            }
+        }
+        fs::remove_all(work, ec);
+        return ok;
+    }
+
+    // Replaces the game's save with the one in `unpacked`, after copying the current save to
+    // LocalState\mods_save_backup\<TITLEID>\<time>.
+    bool InstallSave(const fs::path& unpacked, std::string& where, std::string& error) {
+        char* parse_end = nullptr;
+        const std::uint64_t title = std::strtoull(title_id.c_str(), &parse_end, 16);
+        if (parse_end == title_id.c_str() || title == 0) {
+            error = "unknown title id";
+            return false;
+        }
+        fs::path target;
+        try {
+            target = CurrentSaveDir(title);
+        } catch (const std::exception& problem) {
+            error = std::string("cannot read the profiles: ") + problem.what();
+            return false;
+        }
+        if (target.empty()) {
+            error = "there is no profile yet; boot the game once first";
+            return false;
+        }
+        const std::set<std::wstring> current = EntryNames(target);
+        fs::path root;
+        if (!FindSaveRoot(unpacked, current, root)) {
+            error = "the download has no save files";
+            return false;
+        }
+        std::error_code ec;
+        fs::path backup;
+        if (DirectoryHasEntries(target)) {
+            backup = local_state / "mods_save_backup" / Widen(title_id) /
+                     Widen(std::to_string(static_cast<long long>(std::time(nullptr))));
+            if (!MergeCopy(target, backup, error)) {
+                error = "cannot back up the current save: " + error;
+                return false;
+            }
+            for (fs::directory_iterator it(target, ec), end; !ec && it != end; it.increment(ec)) {
+                std::error_code remove_error;
+                fs::remove_all(it->path(), remove_error);
+            }
+        }
+        if (!CopySave(root, target, error)) {
+            if (!backup.empty()) {
+                std::string restore_error;
+                CopySave(backup, target, restore_error);
+            }
+            return false;
+        }
+        where = Common::FS::PathToUTF8String(target) +
+                (backup.empty() ? std::string(" (no previous save)")
+                                : " (backup in " + Common::FS::PathToUTF8String(backup) + ")");
+        return true;
     }
 };
 
@@ -1457,10 +1877,30 @@ bool ModStore::ToggleEnabled(const std::shared_ptr<ModEntry>& entry) {
     if (entry->State() != ModState::Installed || entry->folder.empty()) {
         return true;
     }
+    std::string kind = "load";
+    for (const InstalledRecord& record : impl_->installed) {
+        if (record.id == entry->id) {
+            kind = record.kind;
+        }
+    }
+    if (kind == "save") {
+        return true; // a save is not something Eden turns on and off
+    }
     bool enabled = true;
     if (impl_->disabled.erase(entry->folder) == 0) {
         impl_->disabled.insert(entry->folder);
         enabled = false;
+    }
+    if (kind == "arc") {
+        // ARCropolis skips mod folders whose name starts with a dot.
+        const fs::path mods = Impl::SdmcDir() / "ultimate" / "mods";
+        const fs::path on = mods / Widen(entry->folder);
+        const fs::path off = mods / Widen("." + entry->folder);
+        std::error_code ec;
+        fs::rename(enabled ? off : on, enabled ? on : off, ec);
+        if (ec) {
+            Diagnostic("UI mods ARCropolis rename failed " + ec.message());
+        }
     }
     impl_->SaveRecordFileLocked();
     Diagnostic(fmt::format("UI mods {} {}", entry->folder, enabled ? "on" : "off"));
