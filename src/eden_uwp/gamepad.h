@@ -117,6 +117,10 @@ public:
         button_layout = layout;
     }
 
+    void SetProgramId(std::uint64_t value) {
+        program_id = value;
+    }
+
     void SetMaxPlayers(int value) {
         max_players = ClampMaxPlayers(value);
     }
@@ -342,6 +346,7 @@ private:
     ButtonLayout button_layout = ButtonLayout::Name;
     GamepadSlots<winrt::Windows::Gaming::Input::Gamepad> previous_devices;
     int max_players = 4;
+    std::uint64_t program_id = 0;
     std::array<StickMotion, 4> stick_motions;
     std::array<ViewGesture, 4> view_gestures;
     HomeComboState home_combo;
@@ -369,7 +374,7 @@ private:
             const char* value = std::getenv("NXBOX_PAD_STYLE");
             return std::string(value != nullptr ? value : "");
         }();
-        auto choice = ChoosePadStyle(raw);
+        auto choice = ChoosePadStyle(raw, PrefersJoycons(program_id));
         if (forced == "dual" && (raw & (1u << 2)))
             choice = PadChoice::JoyDual;
         else if (forced == "handheld" && (raw & (1u << 1)))

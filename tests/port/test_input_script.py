@@ -27,6 +27,10 @@ int main() {
     assert(ChoosePadStyle(0x6) == PadChoice::JoyDual);
     assert(ChoosePadStyle(0x2) == PadChoice::Handheld);
     assert(ChoosePadStyle(0x38) == PadChoice::None);
+    assert(ChoosePadStyle(0x7, PrefersJoycons(0x010003F003A34000ULL)) == PadChoice::JoyDual);
+    assert(ChoosePadStyle(0x7, PrefersJoycons(0x0100187003A36000ULL)) == PadChoice::JoyDual);
+    assert(ChoosePadStyle(0x3, true) == PadChoice::Pro);
+    assert(ChoosePadStyle(0x7, PrefersJoycons(0x0100000000010000ULL)) == PadChoice::Pro);
 }
 """
 
